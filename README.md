@@ -44,7 +44,7 @@ crates/
 ## Development
 
 ```bash
-# Prerequisites: Rust 1.85+, just
+# Prerequisites: Rust 1.90+, just
 
 # Build
 cargo build

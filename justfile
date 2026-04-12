@@ -27,7 +27,7 @@ cov-open:
 
 # MSRV check
 msrv:
-    cargo +1.85 check --all-targets
+    cargo +1.90 check --all-targets
 
 # Clean build artifacts
 clean:
