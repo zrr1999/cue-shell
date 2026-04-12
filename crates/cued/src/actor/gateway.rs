@@ -153,6 +153,18 @@ async fn handle_client(
         guard.insert(client_id, resp_tx);
     }
 
+    // Auto-subscribe to default channels.
+    for channel in ["jobs", "output:*"] {
+        let _ = sys
+            .event_bus
+            .send(EventBusMsg::Subscribe {
+                client_id,
+                channel: channel.to_string(),
+                sender: evt_tx.clone(),
+            })
+            .await;
+    }
+
     // Split stream.
     let (read_half, write_half) = stream.split();
     let read_half = tokio::io::BufReader::new(read_half);

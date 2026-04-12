@@ -180,6 +180,18 @@ impl AppState {
                         OkPayload::Pong {} => {
                             tracing::debug!("pong received");
                         }
+                        OkPayload::Output { id: _, data, truncated } => {
+                            if truncated {
+                                self.main_view.update(MainViewMsg::AppendOutput {
+                                    data: format!("{data}\n--- (truncated) ---"),
+                                });
+                            } else {
+                                self.main_view
+                                    .update(MainViewMsg::AppendOutput { data });
+                            }
+                            self.main_view
+                                .update(MainViewMsg::SetLatestStatus(CardStatus::Success));
+                        }
                         _ => {
                             // Other Ok variants — show as text.
                             let text = format!("{ok:?}");
