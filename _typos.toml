@@ -10,6 +10,7 @@ extend-ignore-re = [
 cued = "cued"
 cron = "cron"
 tui = "tui"
+ratatui = "ratatui"
 
 [files]
-extend-exclude = ["docs/design/research/"]
+extend-exclude = ["docs/research/"]

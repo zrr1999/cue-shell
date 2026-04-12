@@ -29,7 +29,7 @@
 
 **冒号后空格可选**：`:run cargo build` 和 `:run  cargo build` 都合法（trim）。
 
-> 完整的前缀选择调研与评分见 [research/syntax-decisions.md](./research/syntax-decisions.md)。
+> 完整的前缀选择调研与评分见 [research/syntax-decisions.md](../research/syntax-decisions.md)。
 
 ---
 
@@ -185,7 +185,7 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 | `daily`/`hourly`/... | 0 | `<preset> <cmd...>` |
 | 其他 | 扫描 `do` | `<free-schedule> do <cmd...>` |
 
-> 完整的 cron 语法设计过程与备选方案对比见 [research/syntax-decisions.md](./research/syntax-decisions.md)。
+> 完整的 cron 语法设计过程与备选方案对比见 [research/syntax-decisions.md](../research/syntax-decisions.md)。
 
 ### 3.5 通用命令
 
@@ -299,24 +299,104 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 ---
 
-## 六、链式语法
+## 六、模式参数 `()` 语法
+
+> v2 新增：用括号分离内建配置与被执行命令的参数，消除歧义。
 
 ```
-:run cargo fmt ~> cargo build -> cargo test || cargo clippy
+:run(retry=3, timeout=30s) cargo test --release
+:ask(model=gpt-4) explain this error
+:cron(scope=S0@a3f1) every 5m cargo clippy
+:spawn(kind=cli, role=executor) copilot-cli
 ```
 
-| 算子 | 语义 | exit code 分隔符 |
-|------|------|----------------|
-| `->` | 串行，前者成功才继续 | `;` |
-| `~>` | 串行，忽略前者结果继续 | `;` |
-| `\|\|` | 并行，同时发射 | `,` |
-| `\|\|?` | 并行，任一成功即可 | `,` |
+- `()` 紧跟命令名 = 模式参数（执行行为配置）
+- `()` 出现在其他位置 = chain 分组括号
+- Tokenizer 根据**位置规则**消歧（前一个 token 是 Command → 模式参数）
+- 模式参数可在 `config.toml` 中设置默认值，调用时覆盖
 
-Exit code 聚合示例：`[0; 0; 0, 1]`
+### 支持模式参数的命令
+
+| 命令 | 可用参数 |
+|------|---------|
+| `:run()` | `retry`, `timeout`, `shell`, `env`, `scope` |
+| `:ask()` | `model`, `temperature`, `max_tokens`, `agent` |
+| `:cron()` | `label`, `scope` |
+| `:spawn()` | `kind`, `role`, `inherit_scope`, `depth_limit` |
+| `:scope new()` | `profile` |
+
+其他命令只有位置/标志参数，无 `()` 语法。
 
 ---
 
-## 七、命令速查表
+## 七、操作符（两层模型）
+
+### Pipeline（Job 内部的进程管道）
+
+Pipeline 连接 **进程**，运行在同一个 Job 内部，类似 bash 的 `|`：
+
+| 操作符 | 语义 | 说明 |
+|--------|------|------|
+| `\|>` | stdout 管道 | 前者 stdout → 后者 stdin |
+| `\|&>` | stdout+stderr 管道 | 前者 stdout+stderr → 后者 stdin |
+| `\|!>` | stderr 管道 | 前者仅 stderr → 后者 stdin |
+
+### Chain（Job 间的编排）
+
+Chain 连接 **Job**，由 Scheduler 调度执行：
+
+| 操作符 | 语义 | 说明 |
+|--------|------|------|
+| `->` | 串行-成功继续 | 前者 exit 0 才执行后者 |
+| `~>` | 串行-忽略结果 | 无论前者结果都执行后者 |
+| `\|\|` | 并行-全部 | 同时发射所有分支 |
+| `\|\|?` | 并行-竞速 | 任一成功即视为成功 |
+
+### 优先级
+
+```
+pipe (1, 最高) > parallel (2) > serial (3, 最低)
+```
+
+### 解析示例
+
+```
+a |> b -> c || d ~> e
+= (a |> b) -> (c || d) ~> e
+= Job1(a|>b) -> (Job2(c) || Job3(d)) ~> Job4(e)
+
+cargo build |> grep error -> cargo test || cargo clippy
+= Job1(cargo build |> grep error) -> (Job2(cargo test) || Job3(cargo clippy))
+```
+
+### 关键语义
+
+- Pipeline (`|>`) = **Job 内部**，共享同一 scope
+- Chain (`->` `||`) = **Job 之间**，Scheduler 调度
+- `(a -> b) |> c` **非法** — chain 输出不能作为管道输入
+- `()` 在 chain 层面用于分组：`(a || b) -> c`
+
+### Exit code 聚合
+
+```
+[0; 0; 0, 1]
+ ^   ^   ^^^
+ │   │   └── 并行步骤（逗号分隔）
+ │   └────── 串行步骤（分号分隔）
+ └────────── 串行步骤
+
+Pipeline 内退出码 = 最后一个进程的退出码
+```
+
+### 重试
+
+- `:run(retry=3) cargo test` → 失败时自动重试，最多 3 次
+- 重试成功 → ChainAborted 的后续步骤自动重启
+- `:retry J3` → 手动重试（触发后续 chain 步骤继续）
+
+---
+
+## 八、命令速查表
 
 ```
 ┌── Job ────────────────────────────────────┐
@@ -329,12 +409,18 @@ Exit code 聚合示例：`[0; 0; 0, 1]`
 │ :kill <id>     终止 job                    │
 │ :cancel <id>   取消排队 job                │
 │ :fg <id>       前台（pty）                 │
+│ :retry <id>    重试 failed job             │
+│ :log [id]      查看 job 历史日志           │
+│ :pause <id>    暂停 cron/agent             │
+│ :resume <id>   恢复 cron/agent             │
 ├── Scope ──────────────────────────────────┤
 │ :scope list    列出 scope                  │
 │ :scope new     创建 scope                  │
 │ :scope env     查看 scope env              │
 │ :scope fork    派生 scope（delta）          │
 │ :scope close   归档 scope                  │
+│ :scopes        列出所有 scope（简写）       │
+│ :cd <path>     修改默认 scope 的 cwd       │
 ├── Agent ──────────────────────────────────┤
 │ :ask <prompt>  用户→Planner                │
 │ :spawn <plan>  Planner→Executor            │
@@ -353,10 +439,10 @@ Exit code 聚合示例：`[0; 0; 0, 1]`
 │ :env           查看 env                    │
 │ :env set K=V   设置 env                    │
 │ :help [cmd]    帮助                        │
-│ :config [sub]  查看配置                    │
-│ :exit          退出                        │
+│ :config [sub]  查看/修改配置               │
+│ :clear         清空 REPL 区域              │
+│ :quit          退出 TUI                    │
 └───────────────────────────────────────────┘
 
-总计：25 个内建命令（含 scope/cron 子命令）
-        + 3 个新增（:probe, :confirm, :escalate）
+总计：28+ 内建命令（含 scope/cron 子命令）
 ```
