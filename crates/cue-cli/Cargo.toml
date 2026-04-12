@@ -12,6 +12,11 @@ name = "cue"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
 cue-core = { path = "../cue-core" }
+cue-tui = { path = "../cue-tui" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
