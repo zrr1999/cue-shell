@@ -133,6 +133,7 @@ dependencies = [
  "anyhow",
  "bpaf",
  "cue-core",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

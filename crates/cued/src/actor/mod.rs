@@ -77,6 +77,12 @@ pub enum ProcessMgrMsg {
     },
     /// Kill a running job.
     KillJob { job_id: cue_core::JobId },
+    /// Read the tail of a running job's output ring buffer.
+    GetOutput {
+        job_id: cue_core::JobId,
+        tail_bytes: usize,
+        reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+    },
     /// Graceful shutdown.
     Shutdown,
 }

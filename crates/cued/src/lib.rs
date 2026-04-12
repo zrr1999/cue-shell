@@ -5,4 +5,6 @@
 pub mod actor;
 pub mod dirs;
 pub mod parser;
+pub mod pty;
+pub mod ring_buffer;
 pub mod storage;
