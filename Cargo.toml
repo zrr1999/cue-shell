@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/cue-cli",
+  "crates/cue-core",
+  "crates/cue-tui",
+  "crates/cued",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+repository = "https://github.com/zrr1999/cue-shell"
+license = "MIT"
+
+[workspace.dependencies]
+# Error handling
+anyhow = "1"
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# TUI
+# ratatui = "0.29"
+# crossterm = "0.28"
+
+# CLI
+# clap = { version = "4", features = ["derive"] }
+
+# IPC
+# interprocess = "2"
+
+# Logging
+# tracing = "0.1"
+# tracing-subscriber = "0.3"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.test]
+opt-level = 1

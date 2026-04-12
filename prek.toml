@@ -1,0 +1,58 @@
+[[repos]]
+repo = "https://github.com/pre-commit/pre-commit-hooks"
+rev = "v6.0.0"
+hooks = [
+  { id = "check-added-large-files" },
+  { id = "check-case-conflict" },
+  { id = "check-executables-have-shebangs" },
+  { id = "check-yaml" },
+  { id = "check-json" },
+  { id = "check-merge-conflict" },
+  { id = "destroyed-symlinks" },
+  { id = "end-of-file-fixer" },
+  { id = "mixed-line-ending" },
+  { id = "trailing-whitespace" },
+]
+
+[[repos]]
+repo = "https://github.com/tombi-toml/tombi-pre-commit"
+rev = "v0.7.27"
+hooks = [
+  { id = "tombi-format", exclude = "^Cargo\\.lock$" },
+  { id = "tombi-lint" },
+]
+
+[[repos]]
+repo = "https://github.com/crate-ci/typos"
+rev = "v1.33.1"
+hooks = [
+  { id = "typos", args = ["--force-exclude"] },
+]
+
+[[repos]]
+repo = "https://github.com/zrr1999/zendev"
+rev = "e2a5243899467d0df1cb1ab0ddcb18f3ef33d97b"
+hooks = [
+  { id = "zendev-commit-msg" },
+]
+
+[[repos]]
+repo = "local"
+hooks = [
+  {
+    id = "cargo-fmt",
+    name = "cargo-fmt",
+    entry = "cargo fmt --all --",
+    language = "system",
+    types = ["rust"],
+    pass_filenames = false
+  },
+  {
+    id = "cargo-clippy",
+    name = "cargo-clippy",
+    entry = "cargo clippy --all-targets -- -D warnings",
+    language = "system",
+    types = ["rust"],
+    pass_filenames = false
+  },
+]

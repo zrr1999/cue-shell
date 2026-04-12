@@ -1,0 +1,17 @@
+[package]
+name = "cue-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "CLI entry point for cue-shell: command parsing, mode dispatch"
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cue"
+path = "src/main.rs"
+
+[dependencies]
+cue-core = { path = "../cue-core" }
+
+[dev-dependencies]

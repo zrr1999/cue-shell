@@ -1,0 +1,12 @@
+[package]
+name = "cue-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Core types and logic for cue-shell: Job, Session, Scope, Chain"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]

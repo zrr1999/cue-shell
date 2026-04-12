@@ -1,0 +1,25 @@
+# Build artifacts
+/target
+/dist
+.venv/
+.learnings/
+
+# Rust
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.cursor/
+*.iml
+
+# Coverage
+lcov.info
+*.profraw
+*.profdata

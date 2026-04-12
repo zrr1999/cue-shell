@@ -1,0 +1,13 @@
+[package]
+name = "cue-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "TUI frontend for cue-shell: mode switching, command input, job display"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+cue-core = { path = "../cue-core" }
+
+[dev-dependencies]
