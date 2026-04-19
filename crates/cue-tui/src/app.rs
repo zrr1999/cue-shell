@@ -739,9 +739,9 @@ impl AppState {
 
     fn sync_sidebar_items(&mut self) {
         let items = match self.mode {
-            Mode::Job => self.jobs.iter().map(job_sidebar_item).collect(),
-            Mode::Agent => self.agents.iter().map(agent_sidebar_item).collect(),
-            Mode::Cron => self.crons.iter().map(cron_sidebar_item).collect(),
+            Mode::Job => self.jobs.iter().rev().map(job_sidebar_item).collect(),
+            Mode::Agent => self.agents.iter().rev().map(agent_sidebar_item).collect(),
+            Mode::Cron => self.crons.iter().rev().map(cron_sidebar_item).collect(),
         };
         self.sidebar.update(SidebarMsg::SetItems(items));
         self.refresh_overview();
@@ -1865,10 +1865,18 @@ impl AppState {
         self.set_focus(FocusArea::MainView);
     }
 
+    /// Convert a sidebar display row (newest-first) to the underlying vec index (oldest-first).
+    fn sidebar_row_to_index(&self, row: usize, len: usize) -> Option<usize> {
+        len.checked_sub(1)?.checked_sub(row)
+    }
+
     fn activate_sidebar_row(&mut self, row: usize) {
         match self.mode {
             Mode::Job => {
-                let Some(job) = self.jobs.get(row) else {
+                let Some(idx) = self.sidebar_row_to_index(row, self.jobs.len()) else {
+                    return;
+                };
+                let Some(job) = self.jobs.get(idx) else {
                     return;
                 };
                 let command = if matches!(job.status, JobStatus::Running)
@@ -1882,8 +1890,16 @@ impl AppState {
                 };
                 self.update(AppMsg::Submit(command));
             }
-            Mode::Agent => self.open_agent_row(row),
-            Mode::Cron => self.open_cron_row(row),
+            Mode::Agent => {
+                if let Some(idx) = self.sidebar_row_to_index(row, self.agents.len()) {
+                    self.open_agent_row(idx);
+                }
+            }
+            Mode::Cron => {
+                if let Some(idx) = self.sidebar_row_to_index(row, self.crons.len()) {
+                    self.open_cron_row(idx);
+                }
+            }
         }
     }
 
