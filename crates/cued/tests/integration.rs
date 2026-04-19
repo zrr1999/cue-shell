@@ -1589,3 +1589,100 @@ async fn test_err_command_returns_output_for_pty_job() {
     .await
     .expect("test timed out");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_scopes_returns_scope_list() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("scopes-list");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":scopes".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+
+        match resp {
+            ResponsePayload::Ok(OkPayload::ScopeList(scopes)) => {
+                assert!(
+                    !scopes.is_empty(),
+                    "expected at least one scope, got empty list"
+                );
+                for scope in &scopes {
+                    assert!(!scope.hash.is_empty(), "scope hash should not be empty");
+                }
+            }
+            other => panic!("expected ScopeList response, got {other:?}"),
+        }
+
+        let resp2 = roundtrip(
+            &mut stream,
+            2,
+            RequestPayload::Eval {
+                input: ":scope list".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(
+            matches!(resp2, ResponsePayload::Ok(OkPayload::ScopeList(_))),
+            "`:scope list` should also return ScopeList, got {resp2:?}"
+        );
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_config_show_returns_backend_info() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("config-show");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":config".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+
+        match resp {
+            ResponsePayload::Ok(OkPayload::EvalText { text }) => {
+                assert!(
+                    text.contains("default_backend"),
+                    "expected 'default_backend' in config output, got: {text:?}"
+                );
+            }
+            other => panic!("expected EvalText config response, got {other:?}"),
+        }
+
+        let resp2 = roundtrip(
+            &mut stream,
+            2,
+            RequestPayload::Eval {
+                input: ":config show".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(
+            matches!(resp2, ResponsePayload::Ok(OkPayload::EvalText { .. })),
+            "`:config show` should return EvalText, got {resp2:?}"
+        );
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
