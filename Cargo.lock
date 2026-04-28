@@ -303,6 +303,7 @@ name = "cue-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cue-client",
  "cue-core",
  "cue-tui",
  "serde",
@@ -327,6 +328,7 @@ dependencies = [
 name = "cue-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "blake3",
  "serde",
  "serde_json",

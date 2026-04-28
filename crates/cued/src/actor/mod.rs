@@ -222,6 +222,7 @@ pub struct ActorSystem {
     pub process_mgr: mpsc::Sender<ProcessMgrMsg>,
     pub scope_store: mpsc::Sender<ScopeStoreMsg>,
     pub event_bus: mpsc::Sender<EventBusMsg>,
+    pub config: crate::config::Config,
 }
 
 impl ActorSystem {
@@ -241,6 +242,7 @@ pub async fn spawn_all(
     socket_path: std::path::PathBuf,
     scope_db: rusqlite::Connection,
     scheduler_db: rusqlite::Connection,
+    config: crate::config::Config,
 ) -> Result<ActorSystem> {
     // Create channels.
     let (gw_tx, gw_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
@@ -255,6 +257,7 @@ pub async fn spawn_all(
         process_mgr: pm_tx,
         scope_store: ss_tx,
         event_bus: eb_tx,
+        config,
     };
 
     // Spawn actors.

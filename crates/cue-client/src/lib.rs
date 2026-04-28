@@ -1,10 +1,16 @@
 //! Shared client connection stack for cue-shell frontends.
 
 mod client;
+mod config_paths;
 mod reconnect;
+mod ssh_config;
 
 pub use client::{
-    ClientReader, ClientWriter, CuedClient, WriterHandle, default_socket_path, spawn_writer_task,
+    ClientReader, ClientWriter, CuedClient, WriterHandle, WriterSendError, default_socket_path,
+    spawn_writer_task,
+};
+pub use config_paths::{
+    client_config_path, config_dir, home_dir, legacy_config_path, read_config_source,
 };
 pub use reconnect::{
     ClientConnector, ConnectionEvent, DEFAULT_RECONNECT_DELAY, ReconnectCmd,
@@ -13,3 +19,4 @@ pub use reconnect::{
     spawn_connection_manager_controllable_with_delay, spawn_connection_manager_with_delay,
     spawn_socket_manager, spawn_socket_manager_with_delay,
 };
+pub use ssh_config::detected_ssh_hosts;

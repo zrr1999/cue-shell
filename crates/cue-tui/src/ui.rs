@@ -143,6 +143,9 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     if state.job_picker_open() {
         render_job_picker(frame, state, area);
     }
+    if state.target_settings_open() {
+        render_target_settings_modal(frame, state, area);
+    }
 }
 
 fn render_footer(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -260,6 +263,30 @@ fn render_job_picker(frame: &mut Frame, state: &AppState, area: Rect) {
         })
         .collect();
     frame.render_widget(List::new(rows), inner);
+}
+
+fn render_target_settings_modal(frame: &mut Frame, state: &AppState, area: Rect) {
+    let popup = centered_rect(area, 82, 78);
+    frame.render_widget(Clear, popup);
+    let footer = if state.target_settings_can_save() {
+        " Enter save   Ctrl+R reload   Esc close "
+    } else {
+        " Ctrl+R reload   Esc close "
+    };
+
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Targets ")
+        .title_bottom(Line::from(footer).alignment(Alignment::Center));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(state.target_settings_content().unwrap_or_default())
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White)),
+        inner,
+    );
 }
 
 fn job_status_icon(status: &JobStatus) -> &'static str {

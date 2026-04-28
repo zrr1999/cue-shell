@@ -416,16 +416,29 @@ pub fn encode_message(msg: &Message) -> Result<Vec<u8>, serde_json::Error> {
 
 /// Serde helper for Vec<u8> ↔ base64 string (for binary data in JSON).
 mod serde_bytes_base64 {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(data: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::Serialize;
-        // For JSON, encode as array of numbers (more debuggable than base64 for small payloads)
-        data.serialize(serializer)
+        base64::engine::general_purpose::STANDARD
+            .encode(data)
+            .serialize(serializer)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        Vec::<u8>::deserialize(deserializer)
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum EncodedBytes {
+            Base64(String),
+            LegacyArray(Vec<u8>),
+        }
+
+        match EncodedBytes::deserialize(deserializer)? {
+            EncodedBytes::Base64(text) => base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .map_err(serde::de::Error::custom),
+            EncodedBytes::LegacyArray(bytes) => Ok(bytes),
+        }
     }
 }
 
@@ -487,5 +500,28 @@ mod tests {
             ResponsePayload::ack(),
             ResponsePayload::Ok(OkPayload::Ack {})
         ));
+    }
+
+    #[test]
+    fn binary_payloads_serialize_as_base64_strings() {
+        let msg = Message::Event {
+            payload: EventPayload::FgOutput {
+                data: vec![0, 1, 2, 0xfe, 0xff],
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"AAEC/v8=\""));
+    }
+
+    #[test]
+    fn binary_payloads_accept_legacy_arrays() {
+        let json = r#"{"type":"event","payload":{"FgOutput":{"data":[65,66,67]}}}"#;
+        let decoded: Message = serde_json::from_str(json).unwrap();
+        match decoded {
+            Message::Event {
+                payload: EventPayload::FgOutput { data },
+            } => assert_eq!(data, b"ABC"),
+            _ => panic!("wrong variant"),
+        }
     }
 }

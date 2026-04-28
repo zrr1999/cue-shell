@@ -1,13 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use cue_tui::client::default_socket_path;
+use cue_client::{
+    client_config_path, default_socket_path, detected_ssh_hosts, legacy_config_path,
+    read_config_source,
+};
 use serde::Deserialize;
-
-const APP_DIR: &str = "cue-shell";
-const CLIENT_CONFIG_FILE: &str = "client.toml";
-const LEGACY_CONFIG_FILE: &str = "config.toml";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
@@ -17,14 +16,13 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let config_dir = config_dir();
-        let client_path = config_dir.join(CLIENT_CONFIG_FILE);
-        let legacy_path = config_dir.join(LEGACY_CONFIG_FILE);
+        let client_path = client_config_path();
+        let legacy_path = legacy_config_path();
         Self::load_from_sources(
-            read_source(&client_path)?
+            read_config_source(&client_path)?
                 .as_deref()
                 .map(|text| (client_path.as_path(), text)),
-            read_source(&legacy_path)?
+            read_config_source(&legacy_path)?
                 .as_deref()
                 .map(|text| (legacy_path.as_path(), text)),
         )
@@ -51,6 +49,14 @@ impl Config {
     }
 
     pub fn resolve_transport(&self, socket_override: Option<PathBuf>) -> Result<ResolvedTransport> {
+        self.resolve_transport_with_detected(socket_override, detected_ssh_hosts())
+    }
+
+    fn resolve_transport_with_detected(
+        &self,
+        socket_override: Option<PathBuf>,
+        detected_hosts: BTreeSet<String>,
+    ) -> Result<ResolvedTransport> {
         if let Some(socket_path) = socket_override {
             return Ok(ResolvedTransport::Unix {
                 profile_name: "env:CUE_SOCKET".into(),
@@ -58,7 +64,7 @@ impl Config {
             });
         }
 
-        let (profile_name, profile) = self.transport.default_profile()?;
+        let (profile_name, profile) = self.transport.default_profile(&detected_hosts)?;
         Ok(match profile {
             TransportProfile::Unix(profile) => ResolvedTransport::Unix {
                 profile_name,
@@ -78,6 +84,8 @@ impl Config {
 pub struct TransportConfig {
     #[serde(default = "default_profile_name")]
     pub default_profile: String,
+    #[serde(default = "default_auto_detect_ssh")]
+    pub auto_detect_ssh: bool,
     #[serde(default = "default_profiles")]
     pub profiles: BTreeMap<String, TransportProfile>,
 }
@@ -86,6 +94,7 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             default_profile: default_profile_name(),
+            auto_detect_ssh: default_auto_detect_ssh(),
             profiles: default_profiles(),
         }
     }
@@ -96,18 +105,53 @@ impl TransportConfig {
         if self.default_profile.is_empty() {
             self.default_profile = default_profile_name();
         }
-        if self.profiles.is_empty() {
-            self.profiles = default_profiles();
-        }
     }
 
-    fn default_profile(&self) -> Result<(String, TransportProfile)> {
+    fn default_profile(
+        &self,
+        detected_hosts: &BTreeSet<String>,
+    ) -> Result<(String, TransportProfile)> {
+        let profiles = self.merged_profiles(detected_hosts);
         let profile_name = self.default_profile.as_str();
-        let profile =
-            self.profiles.get(profile_name).cloned().ok_or_else(|| {
-                anyhow::anyhow!("unknown client transport profile `{profile_name}`")
-            })?;
+        let profile = profiles
+            .get(profile_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown client transport profile `{profile_name}`"))?;
         Ok((profile_name.to_string(), profile))
+    }
+
+    fn merged_profiles(
+        &self,
+        detected_hosts: &BTreeSet<String>,
+    ) -> BTreeMap<String, TransportProfile> {
+        let mut profiles = self.profiles.clone();
+
+        match profiles.get("local") {
+            Some(TransportProfile::Unix(_)) => {}
+            _ => {
+                profiles.insert(
+                    "local".into(),
+                    TransportProfile::Unix(UnixProfile::default()),
+                );
+            }
+        }
+
+        if self.auto_detect_ssh {
+            for host in detected_hosts {
+                if host == "local" {
+                    continue;
+                }
+                profiles.entry(host.clone()).or_insert_with(|| {
+                    TransportProfile::Ssh(SshProfile {
+                        destination: host.clone(),
+                        gateway_command: default_gateway_command(),
+                        start_command: default_start_command(),
+                    })
+                });
+            }
+        }
+
+        profiles
     }
 }
 
@@ -151,6 +195,10 @@ fn default_profile_name() -> String {
     "local".into()
 }
 
+fn default_auto_detect_ssh() -> bool {
+    true
+}
+
 fn default_gateway_command() -> String {
     "cued gateway --stdio".into()
 }
@@ -164,31 +212,6 @@ fn default_profiles() -> BTreeMap<String, TransportProfile> {
         "local".into(),
         TransportProfile::Unix(UnixProfile::default()),
     )])
-}
-
-fn read_source(path: &Path) -> Result<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
-    Ok(Some(text))
-}
-
-fn config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(dir).join(APP_DIR)
-    } else {
-        home_dir().join(".config").join(APP_DIR)
-    }
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::current_dir())
-        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 #[cfg(test)]
@@ -307,5 +330,92 @@ socket = "/legacy.sock"
                 socket_path: PathBuf::from("/legacy.sock"),
             }
         );
+    }
+
+    #[test]
+    fn detected_ssh_hosts_extend_profiles_without_removing_local() {
+        let config = Config::load_from_sources(
+            Some((
+                Path::new("client.toml"),
+                r#"
+[transport]
+default_profile = "remote"
+
+[transport.profiles.remote]
+transport = "ssh"
+destination = "configured-devbox"
+"#,
+            )),
+            None,
+        )
+        .expect("load config");
+
+        let profiles = config
+            .transport
+            .merged_profiles(&BTreeSet::from(["devbox".into(), "remote".into()]));
+
+        assert!(matches!(
+            profiles.get("local"),
+            Some(TransportProfile::Unix(_))
+        ));
+        assert!(matches!(
+            profiles.get("devbox"),
+            Some(TransportProfile::Ssh(SshProfile { destination, .. })) if destination == "devbox"
+        ));
+        assert!(matches!(
+            profiles.get("remote"),
+            Some(TransportProfile::Ssh(SshProfile { destination, .. })) if destination == "configured-devbox"
+        ));
+    }
+
+    #[test]
+    fn default_profile_can_resolve_detected_ssh_host() {
+        let config = Config::load_from_sources(
+            Some((
+                Path::new("client.toml"),
+                r#"
+[transport]
+default_profile = "devbox"
+"#,
+            )),
+            None,
+        )
+        .expect("load config");
+
+        let transport = config
+            .resolve_transport_with_detected(None, BTreeSet::from(["devbox".into()]))
+            .expect("resolve transport");
+
+        assert_eq!(
+            transport,
+            ResolvedTransport::Ssh {
+                profile_name: "devbox".into(),
+                destination: "devbox".into(),
+                gateway_command: "cued gateway --stdio".into(),
+                start_command: "cued start".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn auto_detect_ssh_can_be_disabled() {
+        let config = Config::load_from_sources(
+            Some((
+                Path::new("client.toml"),
+                r#"
+[transport]
+auto_detect_ssh = false
+"#,
+            )),
+            None,
+        )
+        .expect("load config");
+
+        let profiles = config
+            .transport
+            .merged_profiles(&BTreeSet::from(["devbox".into()]));
+
+        assert!(profiles.contains_key("local"));
+        assert!(!profiles.contains_key("devbox"));
     }
 }

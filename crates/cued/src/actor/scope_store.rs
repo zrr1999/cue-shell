@@ -24,11 +24,12 @@ use cue_core::ipc::EventPayload;
 /// Initialises a root scope from the current process environment.
 pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: ActorSystem) {
     tokio::spawn(async move {
-        let (mut cache, mut current_head, restored) = match load_initial_scope(&conn) {
+        let db = storage::shared_connection(conn);
+        let (mut cache, mut current_head, restored) = match load_initial_scope(&db).await {
             Ok(initial) => initial,
             Err(e) => {
                 error!("scope_store: failed to load initial scope: {e}");
-                let (cache, head, _) = create_and_persist_root_scope(&conn);
+                let (cache, head, _) = create_and_persist_root_scope(&db).await;
                 (cache, head, false)
             }
         };
@@ -50,7 +51,11 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
                     let scope = if let Some(s) = cache.get(&hash) {
                         Some(s.clone())
                     } else {
-                        match storage::get_scope(&conn, &hash) {
+                        match storage::with_connection(&db, move |conn| {
+                            storage::get_scope(conn, &hash)
+                        })
+                        .await
+                        {
                             Ok(Some(s)) => {
                                 cache.insert(s.hash, s.clone());
                                 Some(s)
@@ -73,14 +78,25 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
                 ScopeStoreMsg::CreateRoot { snapshot, reply } => {
                     let scope = Scope::root(snapshot);
                     let hash = scope.hash;
-                    if let Err(e) = storage::insert_scope(&conn, &scope) {
+                    let scope_for_db = scope.clone();
+                    if let Err(e) = storage::with_connection(&db, move |conn| {
+                        storage::insert_scope(conn, &scope_for_db)
+                    })
+                    .await
+                    {
                         error!("scope_store: persist root failed: {e}");
                     }
                     cache.insert(hash, scope);
 
                     let old_hash = current_head;
                     current_head = hash;
-                    let _ = storage::set_head(&conn, &current_head);
+                    if let Err(error) = storage::with_connection(&db, move |conn| {
+                        storage::set_head(conn, &current_head)
+                    })
+                    .await
+                    {
+                        error!("scope_store: persist head failed: {error}");
+                    }
 
                     let _ = sys
                         .event_bus
@@ -115,14 +131,25 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
 
                     let child = Scope::fork(current_head, parent_snap, delta);
                     let child_hash = child.hash;
-                    if let Err(e) = storage::insert_scope(&conn, &child) {
+                    let child_for_db = child.clone();
+                    if let Err(e) = storage::with_connection(&db, move |conn| {
+                        storage::insert_scope(conn, &child_for_db)
+                    })
+                    .await
+                    {
                         error!("scope_store: persist fork failed: {e}");
                     }
                     cache.insert(child_hash, child);
 
                     let old_hash = current_head;
                     current_head = child_hash;
-                    let _ = storage::set_head(&conn, &current_head);
+                    if let Err(error) = storage::with_connection(&db, move |conn| {
+                        storage::set_head(conn, &current_head)
+                    })
+                    .await
+                    {
+                        error!("scope_store: persist head failed: {error}");
+                    }
 
                     let _ = sys
                         .event_bus
@@ -142,7 +169,11 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
                     let parent_scope = if let Some(scope) = cache.get(&base) {
                         Some(scope.clone())
                     } else {
-                        match storage::get_scope(&conn, &base) {
+                        match storage::with_connection(&db, move |conn| {
+                            storage::get_scope(conn, &base)
+                        })
+                        .await
+                        {
                             Ok(Some(scope)) => {
                                 cache.insert(scope.hash, scope.clone());
                                 Some(scope)
@@ -168,7 +199,12 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
 
                     let child = Scope::fork(parent.hash, parent_snap, delta);
                     let child_hash = child.hash;
-                    if let Err(e) = storage::insert_scope(&conn, &child) {
+                    let child_for_db = child.clone();
+                    if let Err(e) = storage::with_connection(&db, move |conn| {
+                        storage::insert_scope(conn, &child_for_db)
+                    })
+                    .await
+                    {
                         error!("scope_store: persist derived scope failed: {e}");
                     }
                     cache.insert(child_hash, child);
@@ -205,9 +241,13 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
     });
 }
 
-fn load_initial_scope(conn: &Connection) -> Result<(HashMap<ScopeHash, Scope>, ScopeHash, bool)> {
-    if let Some(head) = storage::get_head(conn)? {
-        if let Some(scope) = storage::get_scope(conn, &head)? {
+async fn load_initial_scope(
+    db: &storage::SharedConnection,
+) -> Result<(HashMap<ScopeHash, Scope>, ScopeHash, bool)> {
+    if let Some(head) = storage::with_connection(db, storage::get_head).await? {
+        if let Some(scope) =
+            storage::with_connection(db, move |conn| storage::get_scope(conn, &head)).await?
+        {
             let mut cache = HashMap::new();
             cache.insert(scope.hash, scope);
             return Ok((cache, head, true));
@@ -215,12 +255,12 @@ fn load_initial_scope(conn: &Connection) -> Result<(HashMap<ScopeHash, Scope>, S
         error!(%head, "scope_store: persisted head is missing; recreating root");
     }
 
-    let (cache, head, restored) = create_and_persist_root_scope(conn);
+    let (cache, head, restored) = create_and_persist_root_scope(db).await;
     Ok((cache, head, restored))
 }
 
-fn create_and_persist_root_scope(
-    conn: &Connection,
+async fn create_and_persist_root_scope(
+    db: &storage::SharedConnection,
 ) -> (HashMap<ScopeHash, Scope>, ScopeHash, bool) {
     let mut cache = HashMap::new();
 
@@ -230,10 +270,14 @@ fn create_and_persist_root_scope(
     let root = Scope::root(snapshot);
     let head = root.hash;
 
-    if let Err(e) = storage::insert_scope(conn, &root) {
-        error!("scope_store: failed to persist root scope: {e}");
-    }
-    if let Err(e) = storage::set_head(conn, &head) {
+    let root_for_db = root.clone();
+    if let Err(e) = storage::with_connection(db, move |conn| {
+        storage::insert_scope(conn, &root_for_db)?;
+        storage::set_head(conn, &head)?;
+        Ok(())
+    })
+    .await
+    {
         error!("scope_store: failed to set initial head: {e}");
     }
     cache.insert(root.hash, root);
@@ -262,7 +306,9 @@ mod tests {
         storage::insert_scope(&conn, &scope).unwrap();
         storage::set_head(&conn, &scope.hash).unwrap();
 
-        let (cache, head, restored) = load_initial_scope(&conn).unwrap();
+        let db = storage::shared_connection(conn);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (cache, head, restored) = rt.block_on(load_initial_scope(&db)).unwrap();
 
         assert!(restored);
         assert_eq!(head, scope.hash);

@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -114,27 +116,56 @@ impl ClientWriter {
 /// which owns the actual [`ClientWriter`].
 #[derive(Clone)]
 pub struct WriterHandle {
-    tx: mpsc::Sender<RequestPayload>,
+    tx: mpsc::Sender<OutboundRequest>,
+    next_id: Arc<AtomicU32>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterSendError {
+    Full,
+    Closed,
+}
+
+impl std::fmt::Display for WriterSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => f.write_str("writer queue is full"),
+            Self::Closed => f.write_str("writer task is closed"),
+        }
+    }
+}
+
+impl std::error::Error for WriterSendError {}
 
 impl WriterHandle {
     /// Enqueue a request payload to be sent to the daemon (non-blocking).
     ///
     /// Returns `Ok(())` if the message was enqueued, or `Err` if the
     /// writer task has exited or the channel is full.
-    pub fn try_send(
-        &self,
-        payload: RequestPayload,
-    ) -> Result<(), mpsc::error::TrySendError<RequestPayload>> {
-        self.tx.try_send(payload)
+    pub fn try_send(&self, payload: RequestPayload) -> Result<u32, WriterSendError> {
+        let request = self.next_request(payload);
+        let id = request.id;
+        self.tx.try_send(request).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => WriterSendError::Full,
+            mpsc::error::TrySendError::Closed(_) => WriterSendError::Closed,
+        })?;
+        Ok(id)
     }
 
     /// Enqueue a request asynchronously, waiting for buffer space if needed.
-    pub fn send(&self, payload: RequestPayload) {
+    pub fn send(&self, payload: RequestPayload) -> u32 {
+        let request = self.next_request(payload);
+        let id = request.id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(payload).await;
+            let _ = tx.send(request).await;
         });
+        id
+    }
+
+    fn next_request(&self, payload: RequestPayload) -> OutboundRequest {
+        let id = next_atomic_request_id(&self.next_id);
+        OutboundRequest { id, payload }
     }
 }
 
@@ -144,17 +175,18 @@ impl WriterHandle {
 ///
 /// The task exits when all [`WriterHandle`] clones are dropped.
 pub fn spawn_writer_task(mut writer: ClientWriter) -> WriterHandle {
-    let (tx, mut rx) = mpsc::channel::<RequestPayload>(64);
+    let next_id = Arc::new(AtomicU32::new(writer.next_id));
+    let (tx, mut rx) = mpsc::channel::<OutboundRequest>(64);
     tokio::spawn(async move {
-        while let Some(payload) = rx.recv().await {
-            if let Err(error) = writer.send(payload).await {
+        while let Some(request) = rx.recv().await {
+            if let Err(error) = writer.send_with_id(request.id, request.payload).await {
                 tracing::error!(%error, "writer task send error");
                 break;
             }
         }
         tracing::debug!("writer task exiting");
     });
-    WriterHandle { tx }
+    WriterHandle { tx, next_id }
 }
 
 const APP_DIR: &str = "cue-shell";
@@ -205,10 +237,72 @@ where
     W: AsyncWrite + Unpin,
 {
     let id = *next_id;
-    *next_id += 1;
+    *next_id = next_request_id(*next_id);
 
+    send_request_with_id(stream, id, payload).await?;
+    Ok(id)
+}
+
+async fn send_request_with_id<W>(stream: &mut W, id: u32, payload: RequestPayload) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let msg = Message::Request { id, payload };
     let buf = encode_message(&msg).context("encode request")?;
     stream.write_all(&buf).await.context("write to socket")?;
-    Ok(id)
+    Ok(())
+}
+
+struct OutboundRequest {
+    id: u32,
+    payload: RequestPayload,
+}
+
+impl ClientWriter {
+    async fn send_with_id(&mut self, id: u32, payload: RequestPayload) -> Result<u32> {
+        send_request_with_id(&mut self.stream, id, payload).await?;
+        self.next_id = self.next_id.max(next_request_id(id));
+        Ok(id)
+    }
+}
+
+fn next_request_id(current: u32) -> u32 {
+    match current {
+        u32::MAX => 1,
+        _ => current + 1,
+    }
+}
+
+fn next_atomic_request_id(next_id: &AtomicU32) -> u32 {
+    loop {
+        let current = next_id.load(Ordering::Relaxed);
+        let next = next_request_id(current);
+        if next_id
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return current;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_ids_wrap_without_using_zero() {
+        assert_eq!(next_request_id(1), 2);
+        assert_eq!(next_request_id(u32::MAX - 1), u32::MAX);
+        assert_eq!(next_request_id(u32::MAX), 1);
+    }
+
+    #[test]
+    fn atomic_request_ids_follow_same_wrap_policy() {
+        let next_id = AtomicU32::new(u32::MAX);
+        assert_eq!(next_atomic_request_id(&next_id), u32::MAX);
+        assert_eq!(next_id.load(Ordering::Relaxed), 1);
+        assert_eq!(next_atomic_request_id(&next_id), 1);
+        assert_eq!(next_id.load(Ordering::Relaxed), 2);
+    }
 }

@@ -3,7 +3,7 @@
 //! Central state machine: all mutations flow through [`AppState::update`]
 //! which pattern-matches on [`AppMsg`] and delegates to components.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
@@ -32,8 +32,8 @@ use crate::component::main_view::{Card, CardStatus, MainView, MainViewMsg, chain
 use crate::component::sidebar::{OverviewCounts, Sidebar, SidebarItem, SidebarMsg};
 use crate::component::status_bar::{StatusBar, StatusBarMsg};
 use crate::target_config::{
-    TargetSettingsSnapshot, connector_for_profile, display_path, load_target_settings,
-    save_default_profile,
+    TargetProfileSource, TargetSettingsSnapshot, connector_for_profile, display_path,
+    load_target_settings, save_default_profile,
 };
 
 // ── Focus ──
@@ -71,8 +71,6 @@ impl MouseMode {
         }
     }
 }
-
-const TARGETS_PREVIEW_KEY: &str = "targets";
 
 // ── App-level message ──
 
@@ -368,7 +366,8 @@ pub struct AppState {
     display_subscriptions: Vec<String>,
     job_picker: Option<JobPickerState>,
     target_settings: Option<TargetSettingsState>,
-    pending_submissions: VecDeque<PendingSubmission>,
+    target_settings_error: Option<String>,
+    pending_submissions: BTreeMap<u32, PendingSubmission>,
     session_profile_name: Option<String>,
 
     // UI state
@@ -405,7 +404,8 @@ impl AppState {
             display_subscriptions: Vec::new(),
             job_picker: None,
             target_settings: None,
-            pending_submissions: VecDeque::new(),
+            target_settings_error: None,
+            pending_submissions: BTreeMap::new(),
             session_profile_name: None,
             mode: Mode::default(),
             show_sidebar: None,
@@ -489,9 +489,39 @@ impl AppState {
         self.active_display_tab.is_some()
     }
 
+    pub fn target_settings_open(&self) -> bool {
+        self.target_settings.is_some() || self.target_settings_error.is_some()
+    }
+
+    pub fn target_settings_can_save(&self) -> bool {
+        self.target_settings.is_some()
+    }
+
     pub fn footer_text(&self) -> String {
         if self.job_picker_open() {
             return "Kill picker: Enter kill  •  Esc close".to_string();
+        }
+
+        if self.target_settings_open() {
+            let reconnect_hint = if self
+                .target_settings
+                .as_ref()
+                .and_then(|s| s.pending_reconnect_profile.as_ref())
+                .is_some()
+            {
+                "  •  R reconnect now"
+            } else {
+                ""
+            };
+            let primary_action = if self.target_settings_can_save() {
+                "Enter save default  •  "
+            } else {
+                ""
+            };
+            return format!(
+                "Targets: Up/Down/Home/End select  •  {primary_action}Ctrl+R reload  •  \
+                 Esc/Ctrl+T close  •  Ctrl+Y copy  •  Shift+Tab mode{reconnect_hint}"
+            );
         }
 
         match self.focus {
@@ -513,23 +543,7 @@ impl AppState {
                 "Sidebar: Click row to open  •  Agent rows enter fg  •  Up/Down move  •  Enter open  •  Shift+Tab mode  •  Ctrl+B toggle".to_string()
             }
             FocusArea::MainView => {
-                if self.targets_preview_active() {
-                    let reconnect_hint = if self
-                        .target_settings
-                        .as_ref()
-                        .and_then(|s| s.pending_reconnect_profile.as_ref())
-                        .is_some()
-                    {
-                        "  •  R reconnect now"
-                    } else {
-                        ""
-                    };
-                    format!(
-                        "Targets: Up/Down/Home/End select  •  Enter save default  •  \
-                         Ctrl+R reload  •  Esc/Ctrl+T close  •  Ctrl+Y copy  •  \
-                         Shift+Tab mode{reconnect_hint}"
-                    )
-                } else if self.display_pane_has_target() {
+                if self.display_pane_has_target() {
                     "Display: Click tab to switch  •  × closes tab  •  Ctrl+Y copy active tab  •  Shift+Tab mode  •  Ctrl+L clears when idle".to_string()
                 } else {
                     "Command log: Click cards to inspect  •  Ctrl+Y copy latest record  •  Shift+Tab mode  •  :out/:err snapshot  •  :tail follows live output".to_string()
@@ -606,6 +620,15 @@ impl AppState {
             });
         }
 
+        if self.target_settings_open()
+            && let Some(content) = self.render_target_settings_content()
+        {
+            return Some(CopyTarget {
+                label: "targets".into(),
+                content,
+            });
+        }
+
         if let Some(tab) = self
             .active_display_tab
             .and_then(|index| self.display_tabs.get(index))
@@ -644,6 +667,10 @@ impl AppState {
             .filter(|job| matches!(job.status, JobStatus::Running))
             .map(|job| (job.id.clone(), job.label.clone(), job.status.clone()))
             .collect()
+    }
+
+    pub fn target_settings_content(&self) -> Option<String> {
+        self.render_target_settings_content()
     }
 
     fn fg_application_cursor(&self) -> bool {
@@ -1037,7 +1064,7 @@ impl AppState {
         }
         self.display_tabs.clear();
         self.active_display_tab = None;
-        self.target_settings = None;
+        self.close_target_settings();
     }
 
     fn activate_display_tab(&mut self, index: usize) {
@@ -1047,32 +1074,17 @@ impl AppState {
     }
 
     fn close_display_tab(&mut self, index: usize) {
-        let closing_targets = self.display_tabs.get(index).is_some_and(|tab| {
-            matches!(
-                &tab.target,
-                DisplayTarget::Preview { key, .. } if key == TARGETS_PREVIEW_KEY
-            )
-        });
         if self.display_tabs.get(index).is_none() {
             return;
         }
         self.display_tabs.remove(index);
         self.sync_display_subscriptions();
-        if closing_targets {
-            self.target_settings = None;
-        }
 
         self.active_display_tab = match self.display_tabs.is_empty() {
             true => None,
             false if index >= self.display_tabs.len() => Some(self.display_tabs.len() - 1),
             false => Some(index),
         };
-    }
-
-    fn close_active_display_tab(&mut self) {
-        if let Some(index) = self.active_display_tab {
-            self.close_display_tab(index);
-        }
     }
 
     fn display_tab_bar_rect(&self, display_area: Rect) -> Option<Rect> {
@@ -1085,16 +1097,6 @@ impl AppState {
             display_area.width.saturating_sub(2),
             1,
         ))
-    }
-
-    fn display_content_rect(&self, display_area: Rect) -> Rect {
-        let inner = inner_rect(display_area);
-        if self.display_pane_has_target() {
-            let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
-            chunks[1]
-        } else {
-            inner
-        }
     }
 
     fn display_tab_hit(&self, display_area: Rect, point: Rect) -> Option<DisplayTabHit> {
@@ -1154,6 +1156,7 @@ impl AppState {
     }
 
     fn open_job_picker(&mut self) {
+        self.close_target_settings();
         let items = self.job_picker_items();
         self.job_picker = Some(JobPickerState {
             selected: items.len().checked_sub(1),
@@ -1161,13 +1164,18 @@ impl AppState {
     }
 
     fn open_target_settings(&mut self) {
-        if self.targets_preview_active() {
-            self.close_active_display_tab();
-            self.set_focus(FocusArea::MainView);
+        if self.target_settings_open() {
+            self.close_target_settings();
             return;
         }
+        self.close_job_picker();
         self.load_target_settings(None);
         self.set_focus(FocusArea::MainView);
+    }
+
+    fn close_target_settings(&mut self) {
+        self.target_settings = None;
+        self.target_settings_error = None;
     }
 
     fn load_target_settings(&mut self, notice: Option<String>) {
@@ -1185,27 +1193,20 @@ impl AppState {
                     state.select_profile_name(profile_name);
                 }
                 self.target_settings = Some(state);
-                self.refresh_target_settings_tab();
+                self.target_settings_error = None;
             }
             Err(error) => {
                 self.target_settings = None;
-                self.open_preview_display(
-                    TARGETS_PREVIEW_KEY.into(),
-                    "targets".into(),
-                    format!("failed to load target settings: {error}"),
-                );
+                self.target_settings_error =
+                    Some(format!("failed to load target settings: {error}"));
             }
         }
     }
 
-    fn refresh_target_settings_tab(&mut self) {
-        let Some(content) = self.render_target_settings_content() else {
-            return;
-        };
-        self.open_preview_display(TARGETS_PREVIEW_KEY.into(), "targets".into(), content);
-    }
-
     fn render_target_settings_content(&self) -> Option<String> {
+        if let Some(error) = &self.target_settings_error {
+            return Some(error.clone());
+        }
         self.render_target_settings_view().map(|view| view.content)
     }
 
@@ -1215,15 +1216,25 @@ impl AppState {
             .map(|state| format_target_settings_view(state, self.session_profile_name.as_deref()))
     }
 
-    fn targets_preview_active(&self) -> bool {
-        self.active_display_tab
-            .and_then(|index| self.display_tabs.get(index))
-            .is_some_and(|tab| {
-                matches!(
-                    &tab.target,
-                    DisplayTarget::Preview { key, .. } if key == TARGETS_PREVIEW_KEY
-                )
-            })
+    fn target_settings_popup_rect(&self) -> Rect {
+        centered_rect(
+            Rect::new(0, 0, self.terminal_width, self.terminal_height),
+            82,
+            78,
+        )
+    }
+
+    fn target_settings_content_rect(&self) -> Option<Rect> {
+        if !self.target_settings_open() {
+            return None;
+        }
+        let popup = self.target_settings_popup_rect();
+        Some(Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        ))
     }
 
     fn move_target_selection(&mut self, delta: isize) {
@@ -1231,7 +1242,6 @@ impl AppState {
             return;
         };
         target_settings.move_selection(delta);
-        self.refresh_target_settings_tab();
     }
 
     fn move_target_selection_to_edge(&mut self, last: bool) {
@@ -1243,7 +1253,6 @@ impl AppState {
         } else {
             target_settings.select_first();
         }
-        self.refresh_target_settings_tab();
     }
 
     fn reload_target_settings(&mut self) {
@@ -1256,14 +1265,10 @@ impl AppState {
             return;
         };
         target_settings.select_index(index);
-        self.refresh_target_settings_tab();
     }
 
-    fn target_settings_profile_hit(&self, display_area: Rect, point: Rect) -> Option<usize> {
-        if !self.targets_preview_active() {
-            return None;
-        }
-        let content_area = self.display_content_rect(display_area);
+    fn target_settings_profile_hit(&self, point: Rect) -> Option<usize> {
+        let content_area = self.target_settings_content_rect()?;
         if !contains(content_area, point) {
             return None;
         }
@@ -1288,37 +1293,61 @@ impl AppState {
                 state.notice = Some(format!(
                     "`{profile_name}` is already the default target for the next launch"
                 ));
+                state.pending_reconnect_profile = None;
             }
-            self.refresh_target_settings_tab();
             return;
         }
 
         match save_default_profile(&profile_name, &snapshot) {
             Ok(snapshot) => {
                 let source = display_path(&snapshot.source_path);
+                let selected_profile = snapshot.profiles.iter().find(|p| p.name == profile_name);
+                let can_live_reconnect = self.reconnect_tx.is_some()
+                    && selected_profile.is_some_and(target_profile_supports_live_reconnect);
                 let notice = if self.session_profile_name.as_deref() == Some(profile_name.as_str())
                 {
                     format!(
                         "saved default profile `{profile_name}` to {source}; current session already uses it"
                     )
                 } else if let Some(current_session) = self.session_profile_name.as_deref() {
+                    if selected_profile.is_some_and(target_profile_is_ssh) {
+                        format!(
+                            "saved default profile `{profile_name}` to {source}; current session still uses `{current_session}`. SSH applies after restart/reconnect because live reconnect is unsupported"
+                        )
+                    } else if can_live_reconnect {
+                        format!(
+                            "saved default profile `{profile_name}` to {source}; current session still uses `{current_session}`. Press R to reconnect now"
+                        )
+                    } else {
+                        format!(
+                            "saved default profile `{profile_name}` to {source}; current session still uses `{current_session}` until reconnect/restart"
+                        )
+                    }
+                } else if selected_profile.is_some_and(target_profile_is_ssh) {
                     format!(
-                        "saved default profile `{profile_name}` to {source}; current session still uses `{current_session}` until reconnect/restart"
+                        "saved default profile `{profile_name}` to {source}; SSH applies on the next restart/reconnect because live reconnect is unsupported"
                     )
                 } else {
                     format!(
                         "saved default profile `{profile_name}` to {source}; reconnect/restart cue to apply"
                     )
                 };
-                self.target_settings = Some(TargetSettingsState::with_notice(snapshot, notice));
+                let mut next_state = TargetSettingsState::with_notice(snapshot, notice);
+                if can_live_reconnect
+                    && self.session_profile_name.as_deref() != Some(profile_name.as_str())
+                {
+                    next_state.pending_reconnect_profile = Some(profile_name.clone());
+                }
+                self.target_settings = Some(next_state);
+                self.target_settings_error = None;
             }
             Err(error) => {
                 if let Some(state) = self.target_settings.as_mut() {
                     state.notice = Some(format!("save failed: {error}"));
+                    state.pending_reconnect_profile = None;
                 }
             }
         }
-        self.refresh_target_settings_tab();
     }
 
     /// Dispatch a live `SwitchTarget` command to the connection manager for
@@ -1339,7 +1368,6 @@ impl AppState {
                     state.notice = Some(format!("reconnect failed: {error}"));
                     state.pending_reconnect_profile = None;
                 }
-                self.refresh_target_settings_tab();
                 return;
             }
         };
@@ -1350,7 +1378,6 @@ impl AppState {
                     state.notice = Some("reconnect command could not be sent; try again".into());
                     state.pending_reconnect_profile = None;
                 }
-                self.refresh_target_settings_tab();
                 return;
             }
             self.pending_reconnect_profile_name = Some(profile_name.clone());
@@ -1358,7 +1385,6 @@ impl AppState {
                 state.notice = Some(format!("reconnecting to `{profile_name}`…"));
                 state.pending_reconnect_profile = None;
             }
-            self.refresh_target_settings_tab();
         }
     }
 
@@ -1400,9 +1426,8 @@ impl AppState {
             return false;
         };
         match writer.try_send(payload) {
-            Ok(()) => {
-                self.pending_submissions
-                    .push_back(PendingSubmission::silent());
+            Ok(request_id) => {
+                self.track_pending_submission(request_id, PendingSubmission::silent());
                 true
             }
             Err(error) => {
@@ -1422,9 +1447,8 @@ impl AppState {
             return false;
         };
         match writer.try_send(payload) {
-            Ok(()) => {
-                self.pending_submissions
-                    .push_back(PendingSubmission::session(agent_id));
+            Ok(request_id) => {
+                self.track_pending_submission(request_id, PendingSubmission::session(agent_id));
                 true
             }
             Err(error) => {
@@ -1466,8 +1490,12 @@ impl AppState {
         }
     }
 
-    fn next_pending_submission(&mut self) -> Option<PendingSubmission> {
-        self.pending_submissions.pop_front()
+    fn track_pending_submission(&mut self, request_id: u32, pending: PendingSubmission) {
+        self.pending_submissions.insert(request_id, pending);
+    }
+
+    fn take_pending_submission(&mut self, request_id: u32) -> Option<PendingSubmission> {
+        self.pending_submissions.remove(&request_id)
     }
 
     fn start_fg_session(&mut self, id: String, card_index: Option<usize>) {
@@ -1592,17 +1620,18 @@ impl AppState {
             return;
         };
 
-        if let Err(error) = writer.try_send(payload) {
-            self.append_agent_session_message(
-                &agent_id,
-                "system",
-                &transport_error(error.to_string()),
-            );
-            return;
-        }
-
-        self.pending_submissions
-            .push_back(PendingSubmission::session(agent_id));
+        let request_id = match writer.try_send(payload) {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                self.append_agent_session_message(
+                    &agent_id,
+                    "system",
+                    &transport_error(error.to_string()),
+                );
+                return;
+            }
+        };
+        self.track_pending_submission(request_id, PendingSubmission::session(agent_id));
         self.refresh_clear_action();
     }
 
@@ -1635,7 +1664,8 @@ impl AppState {
     }
 
     fn fail_pending_submissions(&mut self, message: &str) {
-        while let Some(pending) = self.pending_submissions.pop_front() {
+        let pending = std::mem::take(&mut self.pending_submissions);
+        for (_, pending) in pending {
             if pending.silent {
                 if let Some(agent_id) = pending.session_target {
                     self.append_agent_session_message(&agent_id, "system", message);
@@ -2096,17 +2126,20 @@ impl AppState {
                         input: text.clone(),
                         mode: self.mode,
                     };
-                    if let Err(e) = writer.try_send(payload) {
-                        tracing::warn!("failed to send command: {e}");
-                        self.show_submission_result(
-                            &pending,
-                            format!("Error [transport]: failed to send command: {e}"),
-                            CardStatus::Error,
-                            None,
-                        );
-                    } else {
-                        self.pending_submissions.push_back(pending);
-                        self.refresh_clear_action();
+                    match writer.try_send(payload) {
+                        Ok(request_id) => {
+                            self.track_pending_submission(request_id, pending);
+                            self.refresh_clear_action();
+                        }
+                        Err(e) => {
+                            tracing::warn!("failed to send command: {e}");
+                            self.show_submission_result(
+                                &pending,
+                                format!("Error [transport]: failed to send command: {e}"),
+                                CardStatus::Error,
+                                None,
+                            );
+                        }
                     }
                 } else {
                     self.show_submission_result(
@@ -2157,12 +2190,11 @@ impl AppState {
                     if let Some(state) = self.target_settings.as_mut() {
                         state.notice = Some(format!("connected to `{profile}`"));
                     }
-                    self.refresh_target_settings_tab();
                 }
             }
 
-            AppMsg::Response { id: _, payload } => {
-                let pending = self.next_pending_submission();
+            AppMsg::Response { id, payload } => {
+                let pending = self.take_pending_submission(id);
                 self.refresh_clear_action();
 
                 match payload {
@@ -2697,7 +2729,7 @@ impl AppState {
                     if key.code == KeyCode::Char('r')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && self.focus == FocusArea::MainView
-                        && self.targets_preview_active()
+                        && self.target_settings_open()
                     {
                         self.reload_target_settings();
                         return;
@@ -2717,13 +2749,10 @@ impl AppState {
                     }
                 }
 
-                if self.focus == FocusArea::MainView
-                    && self.targets_preview_active()
-                    && key.kind == KeyEventKind::Press
-                {
+                if self.target_settings_open() && key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Esc => {
-                            self.close_active_display_tab();
+                            self.close_target_settings();
                             return;
                         }
                         KeyCode::Up => {
@@ -2748,17 +2777,13 @@ impl AppState {
                         }
                         // Live reconnect: [R] when a pending reconnect profile exists.
                         KeyCode::Char('r') | KeyCode::Char('R')
-                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                && self.target_settings.as_ref().is_some_and(|settings| {
+                                    settings.pending_reconnect_profile.is_some()
+                                }) =>
                         {
-                            if self
-                                .target_settings
-                                .as_ref()
-                                .and_then(|s| s.pending_reconnect_profile.as_ref())
-                                .is_some()
-                            {
-                                self.trigger_reconnect_now();
-                                return;
-                            }
+                            self.trigger_reconnect_now();
+                            return;
                         }
                         _ => {}
                     }
@@ -2809,6 +2834,29 @@ impl AppState {
                     return;
                 }
 
+                if self.target_settings_open() {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        let popup = self.target_settings_popup_rect();
+                        if !contains(popup, point) {
+                            self.close_target_settings();
+                            return;
+                        }
+                        if let Some(index) = self.target_settings_profile_hit(point) {
+                            self.set_focus(FocusArea::MainView);
+                            let already_selected = self
+                                .target_settings
+                                .as_ref()
+                                .is_some_and(|state| state.selected == index);
+                            if already_selected {
+                                self.save_selected_target_profile();
+                            } else {
+                                self.select_target_profile(index);
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     if contains(regions.header, point) {
                         if let Some(msg) = self.status_bar.action_at(regions.header, point.x) {
@@ -2841,19 +2889,6 @@ impl AppState {
                         match hit {
                             DisplayTabHit::Activate(index) => self.activate_display_tab(index),
                             DisplayTabHit::Close(index) => self.close_display_tab(index),
-                        }
-                        return;
-                    }
-                    if let Some(index) = self.target_settings_profile_hit(regions.display, point) {
-                        self.set_focus(FocusArea::MainView);
-                        let already_selected = self
-                            .target_settings
-                            .as_ref()
-                            .is_some_and(|state| state.selected == index);
-                        if already_selected {
-                            self.save_selected_target_profile();
-                        } else {
-                            self.select_target_profile(index);
                         }
                         return;
                     }
@@ -3253,6 +3288,14 @@ fn format_target_settings_view(
             session_profile_name.unwrap_or("n/a")
         ),
         format!("default on next launch: {}", state.snapshot.default_profile),
+        format!(
+            "ssh auto-detection: {}",
+            if state.snapshot.auto_detect_ssh {
+                "enabled (~/.ssh/config)"
+            } else {
+                "disabled"
+            }
+        ),
         match state.selected_profile_name() {
             Some(selected) if selected == state.snapshot.default_profile => {
                 format!("selection: {selected} (already the saved default)")
@@ -3262,7 +3305,7 @@ fn format_target_settings_view(
             }
             None => "selection: none".into(),
         },
-        "Ctrl+R reloads target profiles from disk; Ctrl+T toggles this page.".into(),
+        "Ctrl+R reloads target profiles from disk; Esc or Ctrl+T closes this dialog.".into(),
         String::new(),
         "profiles:".into(),
     ];
@@ -3280,6 +3323,9 @@ fn format_target_settings_view(
         }
         if Some(profile.name.as_str()) == state.selected_profile_name() {
             tags.push("selected");
+        }
+        if let Some(source_tag) = target_profile_source_tag(profile) {
+            tags.push(source_tag);
         }
         if let Some(alert) = target_profile_alert(profile) {
             tags.push(alert);
@@ -3313,9 +3359,31 @@ fn target_profile_alert(
     match profile.transport.as_str() {
         "missing" => Some("missing"),
         "invalid" => Some("invalid"),
+        "ssh" => Some("restart-only"),
         _ if profile.detail == "unrecognized transport kind" => Some("invalid"),
         _ => None,
     }
+}
+
+fn target_profile_source_tag(
+    profile: &crate::target_config::TargetProfileSummary,
+) -> Option<&'static str> {
+    match profile.source {
+        TargetProfileSource::Local => Some("permanent"),
+        TargetProfileSource::Configured => Some("configured"),
+        TargetProfileSource::AutoDetectedSsh => Some("auto"),
+        TargetProfileSource::Missing => None,
+    }
+}
+
+fn target_profile_is_ssh(profile: &crate::target_config::TargetProfileSummary) -> bool {
+    profile.transport == "ssh"
+}
+
+fn target_profile_supports_live_reconnect(
+    profile: &crate::target_config::TargetProfileSummary,
+) -> bool {
+    profile.transport == "unix"
 }
 
 fn format_job_record(
@@ -3674,16 +3742,47 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    fn queue_pending(state: &mut AppState, id: u32, pending: PendingSubmission) {
+        state.track_pending_submission(id, pending);
+    }
+
+    fn test_target_profile(
+        name: &str,
+        transport: &str,
+        detail: &str,
+        source: TargetProfileSource,
+    ) -> crate::target_config::TargetProfileSummary {
+        crate::target_config::TargetProfileSummary {
+            name: name.into(),
+            transport: transport.into(),
+            detail: detail.into(),
+            source,
+        }
+    }
+
+    fn test_target_snapshot(
+        path: impl Into<PathBuf>,
+        default_profile: &str,
+        profiles: Vec<crate::target_config::TargetProfileSummary>,
+    ) -> TargetSettingsSnapshot {
+        TargetSettingsSnapshot {
+            source_path: path.into(),
+            using_legacy_config: false,
+            auto_detect_ssh: true,
+            default_profile: default_profile.into(),
+            profiles,
+        }
+    }
+
     #[test]
     fn job_created_response_shows_job_id_not_stdout() {
         let mut state = AppState::new();
         let card_index = state.main_view.push_card("sleep 4".into(), Mode::Job);
-        state.pending_submissions.push_back(PendingSubmission::user(
-            Some(card_index),
-            "sleep 4".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(Some(card_index), "sleep 4".into(), Mode::Job, Vec::new()),
+        );
         state.update(AppMsg::Response {
             id: 1,
             payload: ResponsePayload::Ok(OkPayload::JobCreated {
@@ -3707,12 +3806,11 @@ mod tests {
     #[test]
     fn job_created_without_precreated_card_opens_command_log_record() {
         let mut state = AppState::new();
-        state.pending_submissions.push_back(PendingSubmission::user(
-            None,
-            "sleep 4".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(None, "sleep 4".into(), Mode::Job, Vec::new()),
+        );
         state.update(AppMsg::Response {
             id: 1,
             payload: ResponsePayload::Ok(OkPayload::JobCreated {
@@ -3738,12 +3836,11 @@ mod tests {
     fn output_events_do_not_overwrite_run_card() {
         let mut state = AppState::new();
         let card_index = state.main_view.push_card("ls".into(), Mode::Job);
-        state.pending_submissions.push_back(PendingSubmission::user(
-            Some(card_index),
-            "ls".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(Some(card_index), "ls".into(), Mode::Job, Vec::new()),
+        );
         state.update(AppMsg::Response {
             id: 1,
             payload: ResponsePayload::Ok(OkPayload::JobCreated {
@@ -3804,12 +3901,11 @@ mod tests {
     #[test]
     fn output_response_without_precreated_card_opens_display_pane() {
         let mut state = AppState::new();
-        state.pending_submissions.push_back(PendingSubmission::user(
-            None,
-            ":out J1".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(None, ":out J1".into(), Mode::Job, Vec::new()),
+        );
 
         state.update(AppMsg::Response {
             id: 1,
@@ -3836,12 +3932,11 @@ mod tests {
     #[test]
     fn tail_response_opens_following_stdout_tab() {
         let mut state = AppState::new();
-        state.pending_submissions.push_back(PendingSubmission::user(
-            None,
-            ":tail J1".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(None, ":tail J1".into(), Mode::Job, Vec::new()),
+        );
 
         state.update(AppMsg::Response {
             id: 1,
@@ -3869,12 +3964,11 @@ mod tests {
     #[test]
     fn err_response_opens_stderr_tab() {
         let mut state = AppState::new();
-        state.pending_submissions.push_back(PendingSubmission::user(
-            None,
-            ":err J1".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(None, ":err J1".into(), Mode::Job, Vec::new()),
+        );
 
         state.update(AppMsg::Response {
             id: 1,
@@ -3896,12 +3990,11 @@ mod tests {
     fn scope_created_response_shows_summary_not_only_hash() {
         let mut state = AppState::new();
         let card_index = state.main_view.push_card(":cd /tmp".into(), Mode::Job);
-        state.pending_submissions.push_back(PendingSubmission::user(
-            Some(card_index),
-            ":cd /tmp".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(Some(card_index), ":cd /tmp".into(), Mode::Job, Vec::new()),
+        );
 
         state.update(AppMsg::Response {
             id: 1,
@@ -4008,56 +4101,55 @@ mod tests {
     fn targets_footer_shows_target_controls() {
         let mut state = AppState::new();
         state.session_profile_name = Some("local".into());
-        state.target_settings = Some(TargetSettingsState::new(TargetSettingsSnapshot {
-            source_path: PathBuf::from("/tmp/client.toml"),
-            using_legacy_config: false,
-            default_profile: "remote".into(),
-            profiles: vec![
-                crate::target_config::TargetProfileSummary {
-                    name: "local".into(),
-                    transport: "unix".into(),
-                    detail: "socket: /tmp/cue.sock".into(),
-                },
-                crate::target_config::TargetProfileSummary {
-                    name: "remote".into(),
-                    transport: "ssh".into(),
-                    detail: "devbox | cued gateway --stdio".into(),
-                },
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            "/tmp/client.toml",
+            "remote",
+            vec![
+                test_target_profile(
+                    "local",
+                    "unix",
+                    "socket: /tmp/cue.sock",
+                    TargetProfileSource::Local,
+                ),
+                test_target_profile(
+                    "remote",
+                    "ssh",
+                    "devbox | cued gateway --stdio",
+                    TargetProfileSource::Configured,
+                ),
             ],
-        }));
-        state.refresh_target_settings_tab();
+        )));
         state.focus = FocusArea::MainView;
 
         assert!(state.footer_text().contains("Enter save default"));
         assert!(state.footer_text().contains("Ctrl+R reload"));
-        assert!(
-            state
-                .display_pane_content()
-                .contains("current session target: local")
-        );
+        assert!(state.target_settings_content().is_some_and(|content| {
+            content.contains("current session target: local")
+                && content.contains("ssh auto-detection: enabled")
+        }));
     }
 
     #[test]
     fn targets_preview_keys_move_selection() {
         let mut state = AppState::new();
-        state.target_settings = Some(TargetSettingsState::new(TargetSettingsSnapshot {
-            source_path: PathBuf::from("/tmp/client.toml"),
-            using_legacy_config: false,
-            default_profile: "local".into(),
-            profiles: vec![
-                crate::target_config::TargetProfileSummary {
-                    name: "local".into(),
-                    transport: "unix".into(),
-                    detail: "socket: /tmp/cue.sock".into(),
-                },
-                crate::target_config::TargetProfileSummary {
-                    name: "remote".into(),
-                    transport: "ssh".into(),
-                    detail: "devbox | cued gateway --stdio".into(),
-                },
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            "/tmp/client.toml",
+            "local",
+            vec![
+                test_target_profile(
+                    "local",
+                    "unix",
+                    "socket: /tmp/cue.sock",
+                    TargetProfileSource::Local,
+                ),
+                test_target_profile(
+                    "remote",
+                    "ssh",
+                    "devbox | cued gateway --stdio",
+                    TargetProfileSource::Configured,
+                ),
             ],
-        }));
-        state.refresh_target_settings_tab();
+        )));
         state.focus = FocusArea::MainView;
 
         state.update(AppMsg::KeyEvent(KeyEvent::new(
@@ -4077,29 +4169,30 @@ mod tests {
     #[test]
     fn home_and_end_jump_target_selection() {
         let mut state = AppState::new();
-        state.target_settings = Some(TargetSettingsState::new(TargetSettingsSnapshot {
-            source_path: PathBuf::from("/tmp/client.toml"),
-            using_legacy_config: false,
-            default_profile: "local".into(),
-            profiles: vec![
-                crate::target_config::TargetProfileSummary {
-                    name: "local".into(),
-                    transport: "unix".into(),
-                    detail: "socket: /tmp/cue.sock".into(),
-                },
-                crate::target_config::TargetProfileSummary {
-                    name: "remote".into(),
-                    transport: "ssh".into(),
-                    detail: "devbox | cued gateway --stdio".into(),
-                },
-                crate::target_config::TargetProfileSummary {
-                    name: "staging".into(),
-                    transport: "ssh".into(),
-                    detail: "stagebox | cued gateway --stdio".into(),
-                },
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            "/tmp/client.toml",
+            "local",
+            vec![
+                test_target_profile(
+                    "local",
+                    "unix",
+                    "socket: /tmp/cue.sock",
+                    TargetProfileSource::Local,
+                ),
+                test_target_profile(
+                    "remote",
+                    "ssh",
+                    "devbox | cued gateway --stdio",
+                    TargetProfileSource::Configured,
+                ),
+                test_target_profile(
+                    "staging",
+                    "ssh",
+                    "stagebox | cued gateway --stdio",
+                    TargetProfileSource::AutoDetectedSsh,
+                ),
             ],
-        }));
-        state.refresh_target_settings_tab();
+        )));
         state.focus = FocusArea::MainView;
 
         state.update(AppMsg::KeyEvent(KeyEvent::new(
@@ -4157,24 +4250,24 @@ destination = "devbox"
         .unwrap();
 
         let mut state = AppState::new();
-        state.target_settings = Some(TargetSettingsState::new(TargetSettingsSnapshot {
-            source_path: config_path.clone(),
-            using_legacy_config: false,
-            default_profile: "local".into(),
-            profiles: vec![
-                crate::target_config::TargetProfileSummary {
-                    name: "local".into(),
-                    transport: "unix".into(),
-                    detail: "socket: /tmp/cue.sock".into(),
-                },
-                crate::target_config::TargetProfileSummary {
-                    name: "remote".into(),
-                    transport: "ssh".into(),
-                    detail: "devbox | cued gateway --stdio".into(),
-                },
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            config_path.clone(),
+            "local",
+            vec![
+                test_target_profile(
+                    "local",
+                    "unix",
+                    "socket: /tmp/cue.sock",
+                    TargetProfileSource::Local,
+                ),
+                test_target_profile(
+                    "remote",
+                    "ssh",
+                    "devbox | cued gateway --stdio",
+                    TargetProfileSource::Configured,
+                ),
             ],
-        }));
-        state.refresh_target_settings_tab();
+        )));
         state.focus = FocusArea::MainView;
         state.move_target_selection(1);
 
@@ -4199,24 +4292,24 @@ destination = "devbox"
     #[test]
     fn enter_on_existing_default_profile_shows_noop_notice() {
         let mut state = AppState::new();
-        state.target_settings = Some(TargetSettingsState::new(TargetSettingsSnapshot {
-            source_path: PathBuf::from("/tmp/client.toml"),
-            using_legacy_config: false,
-            default_profile: "remote".into(),
-            profiles: vec![
-                crate::target_config::TargetProfileSummary {
-                    name: "local".into(),
-                    transport: "unix".into(),
-                    detail: "socket: /tmp/cue.sock".into(),
-                },
-                crate::target_config::TargetProfileSummary {
-                    name: "remote".into(),
-                    transport: "ssh".into(),
-                    detail: "devbox | cued gateway --stdio".into(),
-                },
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            "/tmp/client.toml",
+            "remote",
+            vec![
+                test_target_profile(
+                    "local",
+                    "unix",
+                    "socket: /tmp/cue.sock",
+                    TargetProfileSource::Local,
+                ),
+                test_target_profile(
+                    "remote",
+                    "ssh",
+                    "devbox | cued gateway --stdio",
+                    TargetProfileSource::Configured,
+                ),
             ],
-        }));
-        state.refresh_target_settings_tab();
+        )));
         state.focus = FocusArea::MainView;
         state.move_target_selection(1);
 
@@ -4235,30 +4328,182 @@ destination = "devbox"
     }
 
     #[test]
+    fn saving_unix_profile_offers_live_reconnect() {
+        let unique = format!(
+            "cue-shell-targets-unix-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("client.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[transport]
+default_profile = "local"
+
+[transport.profiles.local]
+transport = "unix"
+socket = "/tmp/cue.sock"
+
+[transport.profiles.alt]
+transport = "unix"
+socket = "/tmp/alt.sock"
+"#,
+        )
+        .unwrap();
+
+        let mut state = AppState::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        state.set_reconnect_tx(tx);
+        state.session_profile_name = Some("local".into());
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            config_path.clone(),
+            "local",
+            vec![
+                test_target_profile(
+                    "local",
+                    "unix",
+                    "socket: /tmp/cue.sock",
+                    TargetProfileSource::Local,
+                ),
+                test_target_profile(
+                    "alt",
+                    "unix",
+                    "socket: /tmp/alt.sock",
+                    TargetProfileSource::Configured,
+                ),
+            ],
+        )));
+        state.focus = FocusArea::MainView;
+        state.move_target_selection(1);
+
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(
+            state
+                .target_settings
+                .as_ref()
+                .and_then(|state| state.notice.as_deref())
+                .is_some_and(|notice| notice.contains("Press R to reconnect now"))
+        );
+        assert_eq!(
+            state
+                .target_settings
+                .as_ref()
+                .and_then(|state| state.pending_reconnect_profile.as_deref()),
+            Some("alt")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saving_ssh_profile_reports_restart_only() {
+        let unique = format!(
+            "cue-shell-targets-ssh-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("client.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[transport]
+default_profile = "local"
+
+[transport.profiles.local]
+transport = "unix"
+
+[transport.profiles.remote]
+transport = "ssh"
+destination = "devbox"
+"#,
+        )
+        .unwrap();
+
+        let mut state = AppState::new();
+        state.session_profile_name = Some("local".into());
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            config_path.clone(),
+            "local",
+            vec![
+                test_target_profile(
+                    "local",
+                    "unix",
+                    "socket: /tmp/cue.sock",
+                    TargetProfileSource::Local,
+                ),
+                test_target_profile(
+                    "remote",
+                    "ssh",
+                    "devbox | cued gateway --stdio",
+                    TargetProfileSource::Configured,
+                ),
+            ],
+        )));
+        state.focus = FocusArea::MainView;
+        state.move_target_selection(1);
+
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(
+            state
+                .target_settings
+                .as_ref()
+                .and_then(|state| state.notice.as_deref())
+                .is_some_and(|notice| notice.contains("live reconnect is unsupported"))
+        );
+        assert_eq!(
+            state
+                .target_settings
+                .as_ref()
+                .and_then(|state| state.pending_reconnect_profile.as_deref()),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn target_settings_mouse_click_selects_profile() {
         let mut state = AppState::new();
-        state.target_settings = Some(TargetSettingsState::new(TargetSettingsSnapshot {
-            source_path: PathBuf::from("/tmp/client.toml"),
-            using_legacy_config: false,
-            default_profile: "local".into(),
-            profiles: vec![
-                crate::target_config::TargetProfileSummary {
-                    name: "local".into(),
-                    transport: "unix".into(),
-                    detail: "socket: /tmp/cue.sock".into(),
-                },
-                crate::target_config::TargetProfileSummary {
-                    name: "remote".into(),
-                    transport: "ssh".into(),
-                    detail: "devbox | cued gateway --stdio".into(),
-                },
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            "/tmp/client.toml",
+            "local",
+            vec![
+                test_target_profile(
+                    "local",
+                    "unix",
+                    "socket: /tmp/cue.sock",
+                    TargetProfileSource::Local,
+                ),
+                test_target_profile(
+                    "remote",
+                    "ssh",
+                    "devbox | cued gateway --stdio",
+                    TargetProfileSource::Configured,
+                ),
             ],
-        }));
-        state.refresh_target_settings_tab();
+        )));
         state.focus = FocusArea::MainView;
 
-        let regions = state.layout_regions();
-        let content_area = state.display_content_rect(regions.display);
+        let content_area = state.target_settings_content_rect().unwrap();
         let view = state.render_target_settings_view().unwrap();
         let remote_line = view.profile_line_rows[1] as u16;
 
@@ -4279,17 +4524,41 @@ destination = "devbox"
     }
 
     #[test]
+    fn target_settings_click_outside_modal_closes() {
+        let mut state = AppState::new();
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            "/tmp/client.toml",
+            "local",
+            vec![test_target_profile(
+                "local",
+                "unix",
+                "socket: /tmp/cue.sock",
+                TargetProfileSource::Local,
+            )],
+        )));
+
+        state.update(AppMsg::MouseEvent(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+
+        assert!(!state.target_settings_open());
+    }
+
+    #[test]
     fn target_settings_marks_missing_profiles() {
-        let state = TargetSettingsState::new(TargetSettingsSnapshot {
-            source_path: PathBuf::from("/tmp/client.toml"),
-            using_legacy_config: false,
-            default_profile: "remote".into(),
-            profiles: vec![crate::target_config::TargetProfileSummary {
-                name: "remote".into(),
-                transport: "missing".into(),
-                detail: "profile is referenced by default_profile but not defined".into(),
-            }],
-        });
+        let state = TargetSettingsState::new(test_target_snapshot(
+            "/tmp/client.toml",
+            "remote",
+            vec![test_target_profile(
+                "remote",
+                "missing",
+                "profile is referenced by default_profile but not defined",
+                TargetProfileSource::Missing,
+            )],
+        ));
 
         let view = format_target_settings_view(&state, Some("local"));
 
@@ -4299,17 +4568,16 @@ destination = "devbox"
     #[test]
     fn ctrl_t_toggles_targets_page_closed() {
         let mut state = AppState::new();
-        state.target_settings = Some(TargetSettingsState::new(TargetSettingsSnapshot {
-            source_path: PathBuf::from("/tmp/client.toml"),
-            using_legacy_config: false,
-            default_profile: "local".into(),
-            profiles: vec![crate::target_config::TargetProfileSummary {
-                name: "local".into(),
-                transport: "unix".into(),
-                detail: "socket: /tmp/cue.sock".into(),
-            }],
-        }));
-        state.refresh_target_settings_tab();
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            "/tmp/client.toml",
+            "local",
+            vec![test_target_profile(
+                "local",
+                "unix",
+                "socket: /tmp/cue.sock",
+                TargetProfileSource::Local,
+            )],
+        )));
         state.focus = FocusArea::MainView;
 
         state.update(AppMsg::KeyEvent(KeyEvent::new(
@@ -4317,7 +4585,7 @@ destination = "devbox"
             KeyModifiers::CONTROL,
         )));
 
-        assert!(!state.targets_preview_active());
+        assert!(!state.target_settings_open());
         assert!(state.target_settings.is_none());
     }
 
@@ -4550,12 +4818,11 @@ destination = "devbox"
     #[test]
     fn fg_attach_without_precreated_card_opens_display_and_session() {
         let mut state = AppState::new();
-        state.pending_submissions.push_back(PendingSubmission::user(
-            None,
-            ":fg J1".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(None, ":fg J1".into(), Mode::Job, Vec::new()),
+        );
 
         state.update(AppMsg::Response {
             id: 1,
@@ -4651,12 +4918,16 @@ destination = "devbox"
     fn chain_created_does_not_overwrite_leaf_label() {
         let mut state = AppState::new();
         let card_index = state.main_view.push_card("sleep 4 -> ls".into(), Mode::Job);
-        state.pending_submissions.push_back(PendingSubmission::user(
-            Some(card_index),
-            "sleep 4 -> ls".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(
+                Some(card_index),
+                "sleep 4 -> ls".into(),
+                Mode::Job,
+                Vec::new(),
+            ),
+        );
 
         state.update(AppMsg::ServerEvent(EventPayload::JobCreated {
             job_id: "J1".into(),
@@ -4711,12 +4982,11 @@ destination = "devbox"
     fn clear_display_is_blocked_while_submission_is_pending() {
         let mut state = AppState::new();
         let card_index = state.main_view.push_card("sleep 4".into(), Mode::Job);
-        state.pending_submissions.push_back(PendingSubmission::user(
-            Some(card_index),
-            "sleep 4".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(Some(card_index), "sleep 4".into(), Mode::Job, Vec::new()),
+        );
 
         state.update(AppMsg::ClearDisplay);
 
@@ -4735,15 +5005,12 @@ destination = "devbox"
     fn silent_snapshot_responses_do_not_consume_user_cards() {
         let mut state = AppState::new();
         let card_index = state.main_view.push_card("sleep 4".into(), Mode::Job);
-        state
-            .pending_submissions
-            .push_back(PendingSubmission::silent());
-        state.pending_submissions.push_back(PendingSubmission::user(
-            Some(card_index),
-            "sleep 4".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(&mut state, 1, PendingSubmission::silent());
+        queue_pending(
+            &mut state,
+            2,
+            PendingSubmission::user(Some(card_index), "sleep 4".into(), Mode::Job, Vec::new()),
+        );
 
         state.update(AppMsg::Response {
             id: 1,
@@ -4751,6 +5018,38 @@ destination = "devbox"
         });
         state.update(AppMsg::Response {
             id: 2,
+            payload: ResponsePayload::Ok(OkPayload::JobCreated {
+                job_id: "J1".into(),
+                start_scope: None,
+                open_hint: JobOpenHint::Stream,
+                chain_id: None,
+                chain_index: None,
+                chain_total: None,
+            }),
+        });
+
+        let card = &state.main_view.cards[card_index];
+        assert_eq!(card.label.as_deref(), Some("J1"));
+        assert_eq!(card.output, "J1\nstatus: running");
+    }
+
+    #[test]
+    fn responses_match_pending_submissions_by_request_id() {
+        let mut state = AppState::new();
+        let card_index = state.main_view.push_card("sleep 4".into(), Mode::Job);
+        queue_pending(
+            &mut state,
+            10,
+            PendingSubmission::user(Some(card_index), "sleep 4".into(), Mode::Job, Vec::new()),
+        );
+        queue_pending(&mut state, 11, PendingSubmission::silent());
+
+        state.update(AppMsg::Response {
+            id: 11,
+            payload: ResponsePayload::Ok(OkPayload::JobList(vec![])),
+        });
+        state.update(AppMsg::Response {
+            id: 10,
             payload: ResponsePayload::Ok(OkPayload::JobCreated {
                 job_id: "J1".into(),
                 start_scope: None,
@@ -4815,12 +5114,16 @@ destination = "devbox"
         let card_index = state
             .main_view
             .push_card("explain this".into(), Mode::Agent);
-        state.pending_submissions.push_back(PendingSubmission::user(
-            Some(card_index),
-            "explain this".into(),
-            Mode::Agent,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(
+                Some(card_index),
+                "explain this".into(),
+                Mode::Agent,
+                Vec::new(),
+            ),
+        );
 
         state.update(AppMsg::Response {
             id: 1,
@@ -4859,12 +5162,11 @@ destination = "devbox"
             "planner copilot".into(),
             AgentStatus::WaitingInput,
         );
-        state.pending_submissions.push_back(PendingSubmission::user(
-            None,
-            ":fg A1".into(),
-            Mode::Agent,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(None, ":fg A1".into(), Mode::Agent, Vec::new()),
+        );
 
         state.update(AppMsg::Response {
             id: 1,
@@ -4900,12 +5202,11 @@ destination = "devbox"
     #[test]
     fn fg_output_updates_terminal_modes_and_preserves_formatted_contents() {
         let mut state = AppState::new();
-        state.pending_submissions.push_back(PendingSubmission::user(
-            None,
-            ":fg J1".into(),
-            Mode::Job,
-            Vec::new(),
-        ));
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(None, ":fg J1".into(), Mode::Job, Vec::new()),
+        );
         state.update(AppMsg::Response {
             id: 1,
             payload: ResponsePayload::Ok(OkPayload::FgAttached { id: "J1".into() }),

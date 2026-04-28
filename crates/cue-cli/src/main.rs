@@ -15,9 +15,8 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use cue_client::{ClientConnector, CuedClient};
 use cue_core::ipc::{Message, OkPayload, ResponsePayload};
-use cue_tui::CuedClient;
-use cue_tui::client::ClientConnector;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as TokioCommand};
 use tokio::task::JoinHandle;

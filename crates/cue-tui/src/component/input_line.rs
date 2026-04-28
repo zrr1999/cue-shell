@@ -407,16 +407,10 @@ impl Component for InputLine {
             }
 
             // History navigation / multiline cursor movement
-            (_, KeyCode::Up) => {
-                if !self.move_up_line() {
-                    self.history_up();
-                }
-            }
-            (_, KeyCode::Down) => {
-                if !self.move_down_line() {
-                    self.history_down();
-                }
-            }
+            (_, KeyCode::Up) if !self.move_up_line() => self.history_up(),
+            (_, KeyCode::Up) => {}
+            (_, KeyCode::Down) if !self.move_down_line() => self.history_down(),
+            (_, KeyCode::Down) => {}
 
             // Cursor movement
             (KeyModifiers::ALT, KeyCode::Left) => self.move_word_left(),
@@ -436,27 +430,25 @@ impl Component for InputLine {
             (_, KeyCode::End) => self.move_to_line_end(),
 
             // Backspace
-            (_, KeyCode::Backspace) => {
-                if self.cursor > 0 {
-                    let prev = self.content[..self.cursor]
-                        .chars()
-                        .next_back()
-                        .map_or(0, char::len_utf8);
-                    self.content.drain(self.cursor - prev..self.cursor);
-                    self.cursor -= prev;
-                }
+            (_, KeyCode::Backspace) if self.cursor > 0 => {
+                let prev = self.content[..self.cursor]
+                    .chars()
+                    .next_back()
+                    .map_or(0, char::len_utf8);
+                self.content.drain(self.cursor - prev..self.cursor);
+                self.cursor -= prev;
             }
+            (_, KeyCode::Backspace) => {}
 
             // Delete
-            (_, KeyCode::Delete) => {
-                if self.cursor < self.content.len() {
-                    let next = self.content[self.cursor..]
-                        .chars()
-                        .next()
-                        .map_or(0, char::len_utf8);
-                    self.content.drain(self.cursor..self.cursor + next);
-                }
+            (_, KeyCode::Delete) if self.cursor < self.content.len() => {
+                let next = self.content[self.cursor..]
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8);
+                self.content.drain(self.cursor..self.cursor + next);
             }
+            (_, KeyCode::Delete) => {}
 
             // Printable character
             (_, KeyCode::Char(c)) => {

@@ -202,14 +202,6 @@ async fn handle_client(
     }
 
     // Split stream.
-    let (read_half, write_half) = stream.split();
-    let read_half = tokio::io::BufReader::new(read_half);
-    let write_half = tokio::io::BufWriter::new(write_half);
-
-    // We need owned halves for separate tasks — use a shared approach with a single loop.
-    drop(read_half);
-    drop(write_half);
-
     // Use a single-task select loop for simplicity.
     loop {
         tokio::select! {
@@ -292,6 +284,7 @@ async fn route_request(
 ) -> Result<()> {
     match payload {
         RequestPayload::Eval { input, mode } => {
+            let input = sys.config.aliases.apply(&input);
             // Parse → resolve → send to scheduler.
             match Parser::parse(&input) {
                 Ok(ast) => match Resolver::resolve(ast, mode) {

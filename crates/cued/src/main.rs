@@ -277,6 +277,9 @@ fn run_start_foreground(socket_override: Option<PathBuf>) -> Result<()> {
 }
 
 async fn async_main(socket_path: PathBuf) -> Result<()> {
+    // Load config.
+    let config = cued::config::Config::load().unwrap_or_default();
+
     // Open database.
     let db_path = cued::dirs::db_path();
     let scope_db = cued::storage::open_db(&db_path)
@@ -285,7 +288,7 @@ async fn async_main(socket_path: PathBuf) -> Result<()> {
         .with_context(|| format!("open database {}", db_path.display()))?;
 
     // Spawn all actors.
-    let sys = cued::actor::spawn_all(socket_path, scope_db, scheduler_db).await?;
+    let sys = cued::actor::spawn_all(socket_path, scope_db, scheduler_db, config).await?;
 
     info!("cued ready — waiting for signals");
 

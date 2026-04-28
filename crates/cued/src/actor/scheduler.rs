@@ -232,17 +232,11 @@ impl SchedulerState {
 /// Spawn the Scheduler actor task.
 pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorSystem) {
     tokio::spawn(async move {
-        let db = Arc::new(Mutex::new(conn));
-        let config = match Config::load() {
-            Ok(config) => config,
-            Err(e) => {
-                warn!("scheduler: failed to load config, using defaults: {e}");
-                Config::default()
-            }
-        };
+        let db = storage::shared_connection(conn);
+        let config = sys.config.clone();
         let mut state = SchedulerState::new();
-        restore_jobs(&db, &mut state);
-        restore_crons(&db, &mut state);
+        restore_jobs(&db, &mut state).await;
+        restore_crons(&db, &mut state).await;
         restore_agents(&db, &mut state, &config, &sys).await;
         debug!("scheduler: started");
 
@@ -345,7 +339,7 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
                                         channel: "agents".into(),
                                     })
                                     .await;
-                                if status.clone().is_terminal() {
+                                if status.is_terminal() {
                                     notify_agent_waiters(&mut state, &sys, agent_id).await;
                                 }
                             }
@@ -452,16 +446,8 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
     });
 }
 
-fn restore_jobs(db: &Arc<Mutex<Connection>>, state: &mut SchedulerState) {
-    let conn = match db.lock() {
-        Ok(conn) => conn,
-        Err(e) => {
-            warn!("scheduler: failed to lock job history db: {e}");
-            return;
-        }
-    };
-
-    let restored = match storage::load_job_history(&conn) {
+async fn restore_jobs(db: &storage::SharedConnection, state: &mut SchedulerState) {
+    let restored = match storage::with_connection(db, storage::load_job_history).await {
         Ok(jobs) => jobs,
         Err(e) => {
             warn!("scheduler: failed to load job history: {e}");
@@ -504,16 +490,8 @@ fn restore_jobs(db: &Arc<Mutex<Connection>>, state: &mut SchedulerState) {
     }
 }
 
-fn restore_crons(db: &Arc<Mutex<Connection>>, state: &mut SchedulerState) {
-    let conn = match db.lock() {
-        Ok(conn) => conn,
-        Err(e) => {
-            warn!("scheduler: failed to lock cron db: {e}");
-            return;
-        }
-    };
-
-    let restored = match storage::load_crons(&conn) {
+async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerState) {
+    let restored = match storage::with_connection(db, storage::load_crons).await {
         Ok(crons) => crons,
         Err(e) => {
             warn!("scheduler: failed to load crons: {e}");
@@ -553,17 +531,17 @@ fn restore_crons(db: &Arc<Mutex<Connection>>, state: &mut SchedulerState) {
             && cron.age_secs.max(0) as u64 >= duration.as_secs()
         {
             status = CronStatus::Expired;
-            if let Err(e) = storage::upsert_cron(
-                &conn,
-                &storage::StoredCron {
-                    id: cron.id.clone(),
-                    schedule: cron.schedule.clone(),
-                    command: cron.command.clone(),
-                    status,
-                    scope_hash: cron.scope_hash,
-                    age_secs: cron.age_secs,
-                },
-            ) {
+            let stored = storage::StoredCron {
+                id: cron.id.clone(),
+                schedule: cron.schedule.clone(),
+                command: cron.command.clone(),
+                status,
+                scope_hash: cron.scope_hash,
+                age_secs: cron.age_secs,
+            };
+            if let Err(e) =
+                storage::with_connection(db, move |conn| storage::upsert_cron(conn, &stored)).await
+            {
                 warn!(id = %cron.id, "scheduler: failed to persist expired cron history: {e}");
             }
         }
@@ -603,25 +581,16 @@ fn restore_crons(db: &Arc<Mutex<Connection>>, state: &mut SchedulerState) {
 }
 
 async fn restore_agents(
-    db: &Arc<Mutex<Connection>>,
+    db: &storage::SharedConnection,
     state: &mut SchedulerState,
     config: &Config,
     sys: &ActorSystem,
 ) {
-    let restored = {
-        let conn = match db.lock() {
-            Ok(conn) => conn,
-            Err(e) => {
-                warn!("scheduler: failed to lock agent history db: {e}");
-                return;
-            }
-        };
-        match storage::load_agent_history(&conn) {
-            Ok(agents) => agents,
-            Err(e) => {
-                warn!("scheduler: failed to load agent history: {e}");
-                return;
-            }
+    let restored = match storage::with_connection(db, storage::load_agent_history).await {
+        Ok(agents) => agents,
+        Err(e) => {
+            warn!("scheduler: failed to load agent history: {e}");
+            return;
         }
     };
 
@@ -814,37 +783,34 @@ async fn restore_agents(
     }
 }
 
-fn persist_job_entry(db: &Arc<Mutex<Connection>>, entry: &JobEntry) {
+fn persist_job_entry(db: &storage::SharedConnection, entry: &JobEntry) {
     if !entry.status.is_terminal() {
         return;
     }
 
-    let conn = match db.lock() {
-        Ok(conn) => conn,
-        Err(e) => {
-            warn!(job = %entry.job_id, "scheduler: failed to lock job history db: {e}");
-            return;
-        }
+    let job_id = entry.job_id.to_string();
+    let stored = storage::StoredJob {
+        id: job_id.clone(),
+        pipeline: entry.pipeline_text.clone(),
+        status: entry.status.clone(),
+        exit_code: entry.exit_code,
+        start_scope: entry.start_scope,
+        end_scope: entry.end_scope,
+        chain_id: entry.chain_id.map(|id| id.to_string()),
+        stderr: String::new(),
     };
-
-    if let Err(e) = storage::upsert_job_history(
-        &conn,
-        &storage::StoredJob {
-            id: entry.job_id.to_string(),
-            pipeline: entry.pipeline_text.clone(),
-            status: entry.status.clone(),
-            exit_code: entry.exit_code,
-            start_scope: entry.start_scope,
-            end_scope: entry.end_scope,
-            chain_id: entry.chain_id.map(|id| id.to_string()),
-            stderr: String::new(),
-        },
-    ) {
-        warn!(job = %entry.job_id, "scheduler: failed to persist job history: {e}");
-    }
+    let db = Arc::clone(db);
+    tokio::spawn(async move {
+        if let Err(error) =
+            storage::with_connection(&db, move |conn| storage::upsert_job_history(conn, &stored))
+                .await
+        {
+            warn!(job = %job_id, "scheduler: failed to persist job history: {error}");
+        }
+    });
 }
 
-fn persist_cron_entry(db: &Arc<Mutex<Connection>>, entry: &CronEntry) {
+fn persist_cron_entry(db: &storage::SharedConnection, entry: &CronEntry) {
     persist_cron_record(
         db,
         &storage::StoredCron {
@@ -858,45 +824,42 @@ fn persist_cron_entry(db: &Arc<Mutex<Connection>>, entry: &CronEntry) {
     );
 }
 
-fn persist_cron_record(db: &Arc<Mutex<Connection>>, cron: &storage::StoredCron) {
-    let conn = match db.lock() {
-        Ok(conn) => conn,
-        Err(e) => {
-            warn!(cron = %cron.id, "scheduler: failed to lock cron db: {e}");
-            return;
+fn persist_cron_record(db: &storage::SharedConnection, cron: &storage::StoredCron) {
+    let cron_id = cron.id.clone();
+    let stored = cron.clone();
+    let db = Arc::clone(db);
+    tokio::spawn(async move {
+        if let Err(error) =
+            storage::with_connection(&db, move |conn| storage::upsert_cron(conn, &stored)).await
+        {
+            warn!(cron = %cron_id, "scheduler: failed to persist cron: {error}");
         }
-    };
-
-    if let Err(e) = storage::upsert_cron(&conn, cron) {
-        warn!(cron = %cron.id, "scheduler: failed to persist cron: {e}");
-    }
+    });
 }
 
-fn persist_agent_entry(db: &Arc<Mutex<Connection>>, entry: &AgentEntry) {
-    let conn = match db.lock() {
-        Ok(conn) => conn,
-        Err(e) => {
-            warn!(agent = %entry.agent_id, "scheduler: failed to lock agent db: {e}");
-            return;
-        }
+fn persist_agent_entry(db: &storage::SharedConnection, entry: &AgentEntry) {
+    let agent_id = entry.agent_id.to_string();
+    let stored = storage::StoredAgent {
+        id: agent_id.clone(),
+        backend: entry.backend.clone(),
+        role: entry.role,
+        status: entry.status.clone(),
+        session_id: entry.session_id.clone(),
+        model: entry.model.clone(),
+        scope_hash: entry.scope_hash,
+        transcript: entry.transcript.clone(),
+        last_role: entry.last_role.clone(),
     };
-
-    if let Err(e) = storage::upsert_agent_history(
-        &conn,
-        &storage::StoredAgent {
-            id: entry.agent_id.to_string(),
-            backend: entry.backend.clone(),
-            role: entry.role,
-            status: entry.status.clone(),
-            session_id: entry.session_id.clone(),
-            model: entry.model.clone(),
-            scope_hash: entry.scope_hash,
-            transcript: entry.transcript.clone(),
-            last_role: entry.last_role.clone(),
-        },
-    ) {
-        warn!(agent = %entry.agent_id, "scheduler: failed to persist agent history: {e}");
-    }
+    let db = Arc::clone(db);
+    tokio::spawn(async move {
+        if let Err(error) = storage::with_connection(&db, move |conn| {
+            storage::upsert_agent_history(conn, &stored)
+        })
+        .await
+        {
+            warn!(agent = %agent_id, "scheduler: failed to persist agent history: {error}");
+        }
+    });
 }
 
 fn append_agent_transcript(entry: &mut AgentEntry, role: &str, content: &str) {
@@ -5081,6 +5044,7 @@ mod tests {
             process_mgr: pm_tx,
             scope_store: ss_tx,
             event_bus: eb_tx,
+            config: crate::config::Config::default(),
         };
         (sys, gw_rx, sched_rx, pm_rx, ss_rx, eb_rx)
     }
@@ -5190,6 +5154,7 @@ done
                     },
                 )]),
             },
+            aliases: crate::config::AliasConfig::default(),
         }
     }
 
@@ -5564,7 +5529,8 @@ done
         drop(guard);
 
         let mut state = SchedulerState::new();
-        restore_jobs(&conn, &mut state);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(restore_jobs(&conn, &mut state));
 
         assert_eq!(state.next_job, 8);
         assert_eq!(state.jobs[&JobId(7)].pipeline_text, "cargo test");
@@ -5590,7 +5556,8 @@ done
         drop(guard);
 
         let mut state = SchedulerState::new();
-        restore_crons(&conn, &mut state);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(restore_crons(&conn, &mut state));
 
         assert_eq!(state.next_cron, 5);
         assert!(state.crons.contains_key(&CronId(4)));
@@ -5623,7 +5590,8 @@ done
         drop(guard);
 
         let mut state = SchedulerState::new();
-        restore_crons(&conn, &mut state);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(restore_crons(&conn, &mut state));
 
         assert_eq!(state.crons.len(), 1);
         assert_eq!(state.crons[&CronId(1)].status, CronStatus::Expired);
@@ -6215,16 +6183,14 @@ done
             match recv_scheduler_msg(&mut sched_rx).await {
                 SchedulerMsg::AgentMessage {
                     agent_id, content, ..
-                } => {
-                    if agent_id == aid && content.contains("reply:first") {
-                        saw_first_reply = true;
-                    }
+                } if agent_id == aid && content.contains("reply:first") => {
+                    saw_first_reply = true;
                 }
-                SchedulerMsg::AgentStateChanged { agent_id, status } => {
-                    if agent_id == aid && status == AgentStatus::WaitingInput {
-                        saw_waiting = true;
-                        break;
-                    }
+                SchedulerMsg::AgentStateChanged { agent_id, status }
+                    if agent_id == aid && status == AgentStatus::WaitingInput =>
+                {
+                    saw_waiting = true;
+                    break;
                 }
                 _ => {}
             }
@@ -6253,16 +6219,14 @@ done
             match recv_scheduler_msg(&mut sched_rx).await {
                 SchedulerMsg::AgentMessage {
                     agent_id, content, ..
-                } => {
-                    if agent_id == aid && content.contains("reply:second") {
-                        saw_second_reply = true;
-                    }
+                } if agent_id == aid && content.contains("reply:second") => {
+                    saw_second_reply = true;
                 }
-                SchedulerMsg::AgentStateChanged { agent_id, status } => {
-                    if agent_id == aid && status == AgentStatus::WaitingInput {
-                        saw_second_waiting = true;
-                        break;
-                    }
+                SchedulerMsg::AgentStateChanged { agent_id, status }
+                    if agent_id == aid && status == AgentStatus::WaitingInput =>
+                {
+                    saw_second_waiting = true;
+                    break;
                 }
                 _ => {}
             }
@@ -6338,16 +6302,14 @@ done
             match recv_scheduler_msg(&mut sched_rx).await {
                 SchedulerMsg::AgentMessage {
                     agent_id, content, ..
-                } => {
-                    if agent_id == aid && content.contains("aborted by user") {
-                        saw_kill_message = true;
-                    }
+                } if agent_id == aid && content.contains("aborted by user") => {
+                    saw_kill_message = true;
                 }
-                SchedulerMsg::AgentStateChanged { agent_id, status } => {
-                    if agent_id == aid && status == AgentStatus::Failed {
-                        saw_failed = true;
-                        break;
-                    }
+                SchedulerMsg::AgentStateChanged { agent_id, status }
+                    if agent_id == aid && status == AgentStatus::Failed =>
+                {
+                    saw_failed = true;
+                    break;
                 }
                 _ => {}
             }
@@ -6400,11 +6362,11 @@ done
                         saw_reply = true;
                     }
                 }
-                SchedulerMsg::AgentStateChanged { agent_id, status } => {
-                    if agent_id == aid && status == AgentStatus::WaitingInput {
-                        saw_waiting = true;
-                        break;
-                    }
+                SchedulerMsg::AgentStateChanged { agent_id, status }
+                    if agent_id == aid && status == AgentStatus::WaitingInput =>
+                {
+                    saw_waiting = true;
+                    break;
                 }
                 _ => {}
             }
@@ -6499,16 +6461,14 @@ done
             match recv_scheduler_msg(&mut sched_rx).await {
                 SchedulerMsg::AgentMessage {
                     agent_id, content, ..
-                } => {
-                    if agent_id == aid && content.contains("does not support session/load") {
-                        saw_failure_message = true;
-                    }
+                } if agent_id == aid && content.contains("does not support session/load") => {
+                    saw_failure_message = true;
                 }
-                SchedulerMsg::AgentStateChanged { agent_id, status } => {
-                    if agent_id == aid && status == AgentStatus::Failed {
-                        saw_failed = true;
-                        break;
-                    }
+                SchedulerMsg::AgentStateChanged { agent_id, status }
+                    if agent_id == aid && status == AgentStatus::Failed =>
+                {
+                    saw_failed = true;
+                    break;
                 }
                 _ => {}
             }

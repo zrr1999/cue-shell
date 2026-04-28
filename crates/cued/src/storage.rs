@@ -3,14 +3,37 @@
 //! Uses WAL mode for concurrent reads.  The schema is migrated on open.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use cue_core::ScopeHash;
 use cue_core::agent::{AgentRole, AgentStatus};
 use cue_core::cron::CronStatus;
 use cue_core::job::{CancelReason, JobStatus};
 use cue_core::scope::Scope;
 use rusqlite::Connection;
+
+pub type SharedConnection = Arc<Mutex<Connection>>;
+
+pub fn shared_connection(conn: Connection) -> SharedConnection {
+    Arc::new(Mutex::new(conn))
+}
+
+pub async fn with_connection<T, F>(db: &SharedConnection, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+{
+    let db = Arc::clone(db);
+    tokio::task::spawn_blocking(move || {
+        let conn = db
+            .lock()
+            .map_err(|error| anyhow!("lock sqlite connection: {error}"))?;
+        f(&conn)
+    })
+    .await
+    .context("join sqlite task")?
+}
 
 // ── Schema migration ──
 
