@@ -57,7 +57,7 @@ impl StatusBar {
     fn mode_label(&self) -> &'static str {
         match self.mode {
             Mode::Job => "JOB",
-            Mode::Agent => "AGENT",
+            Mode::Agent => "JOB",
             Mode::Cron => "CRON",
         }
     }

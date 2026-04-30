@@ -22,7 +22,7 @@ pub enum ResolvedCommand {
         chain: core_pipeline::ChainNode,
         params: ModeParams,
     },
-    /// Send a prompt to the agent.
+    /// Send a prompt to the legacy session.
     Ask { text: String, params: ModeParams },
     /// Add a cron job.
     Cron {
@@ -30,9 +30,9 @@ pub enum ResolvedCommand {
         chain: core_pipeline::ChainNode,
         params: ModeParams,
     },
-    /// Spawn an executor agent.
+    /// Spawn a legacy session.
     Spawn { text: String, params: ModeParams },
-    /// Kill a job/agent.
+    /// Kill a job/session.
     Kill { id: String },
     /// Retry a failed job.
     Retry { id: String },
@@ -51,9 +51,9 @@ pub enum ResolvedCommand {
     Send { id: String, data: String },
     /// Cancel a pending job.
     Cancel { id: String },
-    /// Pause cron/agent.
+    /// Pause cron/session.
     Pause { id: String },
-    /// Resume cron/agent.
+    /// Resume cron/session.
     Resume { id: String },
     /// Probe (planner light query).
     Probe { query: String },
@@ -115,7 +115,7 @@ impl Resolver {
         }
 
         match mode {
-            Mode::Job => match argument {
+            Mode::Job | Mode::Agent => match argument {
                 Argument::Chain(chain) => Ok(ResolvedCommand::Run {
                     chain: convert_chain(chain),
                     params: ModeParams::new(),
@@ -133,32 +133,6 @@ impl Resolver {
                     suggestions: vec![],
                 }),
             },
-            Mode::Agent => {
-                let text = match argument {
-                    Argument::Chain(chain) => chain_to_text(&chain),
-                    Argument::Text(t) => t,
-                    Argument::Empty => {
-                        return Err(ParseError {
-                            span,
-                            message: "empty input".into(),
-                            kind: super::parse::ParseErrorKind::MissingArgument,
-                            suggestions: vec![],
-                        });
-                    }
-                    _ => {
-                        return Err(ParseError {
-                            span,
-                            message: "AGENT mode expects a prompt".into(),
-                            kind: super::parse::ParseErrorKind::UnexpectedToken,
-                            suggestions: vec![],
-                        });
-                    }
-                };
-                Ok(ResolvedCommand::Ask {
-                    text,
-                    params: ModeParams::new(),
-                })
-            }
             Mode::Cron => resolve_bare_cron(argument, span),
         }
     }
@@ -432,7 +406,7 @@ fn format_duration(duration: std::time::Duration) -> String {
     format!("{seconds}s")
 }
 
-/// Convert a chain AST back to text (for bare input in Agent mode).
+/// Convert a chain AST back to text (for legacy prompt-mode bare input).
 fn chain_to_text(node: &ChainNode) -> String {
     match node {
         ChainNode::Leaf(p) => p
@@ -690,7 +664,7 @@ fn is_mode_help_request(argument: &Argument) -> bool {
 fn mode_help_topic(mode: Mode) -> &'static str {
     match mode {
         Mode::Job => "job",
-        Mode::Agent => "agent",
+        Mode::Agent => "job",
         Mode::Cron => "cron",
     }
 }
@@ -731,12 +705,7 @@ mod tests {
     #[test]
     fn resolve_bare_agent() {
         let cmd = resolve("explain this error", Mode::Agent);
-        match cmd {
-            ResolvedCommand::Ask { text, .. } => {
-                assert_eq!(text, "explain this error");
-            }
-            _ => panic!("expected Ask"),
-        }
+        assert!(matches!(cmd, ResolvedCommand::Run { .. }));
     }
 
     #[test]
@@ -746,7 +715,7 @@ mod tests {
             cmd,
             ResolvedCommand::Help {
                 topic: Some(ref topic)
-            } if topic == "agent"
+            } if topic == "job"
         ));
     }
 

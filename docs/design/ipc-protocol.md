@@ -41,7 +41,7 @@ enum Message {
 ### JSON examples
 
 ```json
-// Request: Eval (user command)
+// Request: Eval (core job command)
 {"type": "request", "id": 1, "payload": {"Eval": {"input": ":run(retry=3) cargo test", "mode": "Job"}}}
 
 // Response (success — Eval resolved to a serial chain)
@@ -51,7 +51,7 @@ enum Message {
 {"type": "response", "id": 1, "payload": {"Err": {"code": "INVALID_SYNTAX", "message": "unexpected token '||?' at position 15"}}}
 
 // Request: Subscribe (protocol command)
-{"type": "request", "id": 2, "payload": {"Subscribe": {"channels": ["jobs", "agents", "output:J1"]}}}
+{"type": "request", "id": 2, "payload": {"Subscribe": {"channels": ["jobs", "crons", "output:J1"]}}}
 
 // Event
 {"type": "event", "payload": {"ChainProgress": {"chain": {"id": "CH1", "pipeline": "cargo test -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo test", "status": "Done", "job_id": "J1", "start_scope": "S@32b17bec", "end_scope": "S@32b17bec", "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Running", "job_id": "J2", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}]}}}}
@@ -83,9 +83,9 @@ struct SubscribeRequest {
 
 Channel types:
 - `"jobs"` — all job state changes (created, state transitions, removed)
-- `"agents"` — all agent state changes
+- `"agents"` — compatibility bridge agent state changes
 - `"crons"` — all cron state changes
-- `"output:<id>"` — stdout/stderr chunks for specific job/agent (e.g., `"output:J1"`, `"output:A2"`)
+- `"output:<id>"` — stdout/stderr chunks for specific job/bridge session (e.g., `"output:J1"`, `"output:A2"`)
 - `"scopes"` — scope creation, HEAD changes
 - `"system"` — cued status, shutdown notices
 
@@ -93,7 +93,7 @@ Operations:
 - `Subscribe { channels }` — add channels (additive, no duplicates)
 - `Unsubscribe { channels }` — remove channels
 
-TUI default subscription on connect: `["jobs", "agents", "crons", "system"]`
+TUI default subscription on connect: `["jobs", "crons", "system"]`
 `:out J1` triggers additional: `Subscribe { channels: ["output:J1"] }`
 
 ## 6. Request Types (Client → cued)
@@ -110,7 +110,7 @@ enum RequestPayload {
     Eval { input: String, mode: Mode },
     // input: raw user input, e.g. ":run(retry=3) cargo test -> cargo build"
     //        or bare input "cargo test" (cued applies mode default)
-    // mode: current TUI mode (JOB/AGENT/CRON) for bare input resolution
+    // mode: current TUI mode (JOB/CRON, plus AGENT bridge compatibility) for bare input resolution
 
     // === Protocol commands (structured, not user-typed) ===
 
@@ -118,7 +118,7 @@ enum RequestPayload {
     Subscribe { channels: Vec<String> },
     Unsubscribe { channels: Vec<String> },
 
-    // :fg mode (job pty attach or agent session foreground)
+    // :fg mode (job pty attach; agent session foreground is compatibility-only)
     FgAttach { id: String },  // J1 or A1
     FgDetach {},
     FgInput { data: Vec<u8> },  // raw bytes from TUI keyboard
@@ -162,7 +162,7 @@ enum OkPayload {
     ScopeCreated { hash: String, label: Option<String>, summary: String },
 
     JobInfo(JobInfo),
-    AgentInfo(AgentInfo),      // includes persisted transcript + last_role for UI hydration
+    AgentInfo(AgentInfo),      // compatibility bridge metadata + transcript for UI hydration
     JobList(Vec<JobInfo>),
     AgentList(Vec<AgentInfo>), // same AgentInfo payload, used by reconnect/sidebar snapshots
     CronList(Vec<CronInfo>),   // includes persisted cron status/history for reconnect snapshots
@@ -222,7 +222,7 @@ enum EventPayload {
     ChainProgress { chain: ChainInfo },
     JobRemoved { job_id: String },
 
-    // Agent events (channel: "agents")
+    // Agent events (channel: "agents") — compatibility bridge only
     AgentStateChanged { agent_id: String, old_state: AgentState, new_state: AgentState },
     AgentMessage { agent_id: String, role: String, content: String },  // conversation stream
 
@@ -320,8 +320,8 @@ Standard error codes returned in `Err { code, message }`:
 | `INVALID_SCOPE` | Referenced scope hash not found |
 | `INVALID_SYNTAX` | Malformed pipeline/chain/cron expression |
 | `ALREADY_EXISTS` | Duplicate operation (e.g., already fg-attached) |
-| `NOT_SUPPORTED` | Operation not supported (e.g., :fg on API Agent) |
-| `PERMISSION_DENIED` | Planner-only command from non-planner client |
+| `NOT_SUPPORTED` | Operation not supported (e.g., bridge feature unavailable) |
+| `PERMISSION_DENIED` | Bridge-only command from a non-bridge client |
 | `INTERNAL` | Unexpected cued error |
 
 ## 11. Connection Lifecycle
@@ -329,7 +329,7 @@ Standard error codes returned in `Err { code, message }`:
 ```
 Client                              cued
   |                                   |
-  |--- connect (Unix socket) -------->|
+   |--- connect (Unix socket) -------->|
   |                                   |
   |--- Subscribe {channels} --------->|
   |<-- Response {Ok: Ack} ------------|

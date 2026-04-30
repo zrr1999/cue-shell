@@ -13,4 +13,5 @@ pub mod runtime_env;
 pub mod service;
 pub mod storage;
 pub mod upgrade;
+pub mod weft;
 pub mod word_expansion;

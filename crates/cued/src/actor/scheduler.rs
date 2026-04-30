@@ -1,6 +1,7 @@
 //! Scheduler actor — command routing, ID assignment, chain execution, cron timer heap.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use chrono::{
@@ -26,13 +27,14 @@ use cue_core::pipeline::{ChainNode, ParallelOp, SerialOp};
 use cue_core::scope::EnvSnapshot;
 use cue_core::{AgentId, ChainId, CronId, JobId, ScopeHash};
 
-use crate::config::{AgentBackendConfig, Config};
+use crate::config::{AgentBackendConfig, AgentTransport, Config};
 use crate::parser::parse::Parser as CueParser;
 use crate::parser::resolver::{ResolvedCommand, Resolver};
 use crate::parser::token::Token;
 use crate::parser::tokenizer::Tokenizer;
 use crate::runtime_env::effective_snapshot;
 use crate::storage;
+use crate::weft::{SessionPrepareRequest, WeftClient, WeftClientError, WorkspaceRef};
 use crate::word_expansion::expand_command_line;
 
 use super::{ActorSystem, GatewayMsg, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg, StderrSnapshot};
@@ -115,9 +117,12 @@ struct AgentEntry {
     backend: String,
     role: AgentRole,
     status: AgentStatus,
+    proxied: bool,
     control: Option<mpsc::Sender<AgentControl>>,
     session_id: Option<String>,
+    #[allow(dead_code)]
     model: Option<String>,
+    #[allow(dead_code)]
     scope_hash: Option<ScopeHash>,
     transcript: String,
     last_role: Option<String>,
@@ -134,9 +139,6 @@ enum AgentLaunch {
     Prompt {
         initial_prompt: String,
         requested_session: Option<String>,
-    },
-    Restore {
-        session_id: String,
     },
 }
 
@@ -237,7 +239,6 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
         let mut state = SchedulerState::new();
         restore_jobs(&db, &mut state).await;
         restore_crons(&db, &mut state).await;
-        restore_agents(&db, &mut state, &config, &sys).await;
         debug!("scheduler: started");
 
         loop {
@@ -305,7 +306,6 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
                         } => {
                             if let Some(entry) = state.agents.get_mut(&agent_id) {
                                 append_agent_transcript(entry, &role, &content);
-                                persist_agent_entry(&db, entry);
                             }
                             let _ = sys
                                 .gateway
@@ -327,7 +327,6 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
                                 if status.is_terminal() {
                                     entry.control = None;
                                 }
-                                persist_agent_entry(&db, entry);
                                 let _ = sys
                                     .gateway
                                     .send(GatewayMsg::PushEvent {
@@ -351,7 +350,6 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
                         } => {
                             if let Some(entry) = state.agents.get_mut(&agent_id) {
                                 entry.session_id = Some(session_id);
-                                persist_agent_entry(&db, entry);
                             }
                         }
 
@@ -580,209 +578,6 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
     }
 }
 
-async fn restore_agents(
-    db: &storage::SharedConnection,
-    state: &mut SchedulerState,
-    config: &Config,
-    sys: &ActorSystem,
-) {
-    let restored = match storage::with_connection(db, storage::load_agent_history).await {
-        Ok(agents) => agents,
-        Err(e) => {
-            warn!("scheduler: failed to load agent history: {e}");
-            return;
-        }
-    };
-
-    let mut max_agent = 0;
-    let mut resumed = 0;
-    for agent in restored {
-        let Some(agent_id) = parse_agent_id(&agent.id) else {
-            warn!(id = %agent.id, "scheduler: skipping invalid persisted agent id");
-            continue;
-        };
-        max_agent = max_agent.max(agent_id.0);
-
-        if agent.status.is_terminal() {
-            state.agents.insert(
-                agent_id,
-                AgentEntry {
-                    agent_id,
-                    backend: agent.backend.clone(),
-                    role: agent.role,
-                    status: agent.status.clone(),
-                    control: None,
-                    session_id: agent.session_id.clone(),
-                    model: agent.model.clone(),
-                    scope_hash: agent.scope_hash,
-                    transcript: agent.transcript.clone(),
-                    last_role: agent.last_role.clone(),
-                },
-            );
-            continue;
-        }
-
-        let Some(session_id) = agent.session_id.clone() else {
-            warn!(id = %agent.id, "scheduler: cannot restore agent without persisted session id");
-            state.agents.insert(
-                agent_id,
-                AgentEntry {
-                    agent_id,
-                    backend: agent.backend.clone(),
-                    role: agent.role,
-                    status: AgentStatus::Failed,
-                    control: None,
-                    session_id: None,
-                    model: agent.model.clone(),
-                    scope_hash: agent.scope_hash,
-                    transcript: agent.transcript.clone(),
-                    last_role: agent.last_role.clone(),
-                },
-            );
-            if let Some(entry) = state.agents.get(&agent_id) {
-                persist_agent_entry(db, entry);
-            }
-            continue;
-        };
-        let Some(scope_hash) = agent.scope_hash else {
-            warn!(id = %agent.id, "scheduler: cannot restore agent without persisted scope");
-            state.agents.insert(
-                agent_id,
-                AgentEntry {
-                    agent_id,
-                    backend: agent.backend.clone(),
-                    role: agent.role,
-                    status: AgentStatus::Failed,
-                    control: None,
-                    session_id: Some(session_id),
-                    model: agent.model.clone(),
-                    scope_hash: None,
-                    transcript: agent.transcript.clone(),
-                    last_role: agent.last_role.clone(),
-                },
-            );
-            if let Some(entry) = state.agents.get(&agent_id) {
-                persist_agent_entry(db, entry);
-            }
-            continue;
-        };
-
-        let snapshot = match get_scope_snapshot_by_hash(sys, scope_hash).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                warn!(id = %agent.id, %error, "scheduler: cannot restore agent scope");
-                state.agents.insert(
-                    agent_id,
-                    AgentEntry {
-                        agent_id,
-                        backend: agent.backend.clone(),
-                        role: agent.role,
-                        status: AgentStatus::Failed,
-                        control: None,
-                        session_id: Some(session_id),
-                        model: agent.model.clone(),
-                        scope_hash: Some(scope_hash),
-                        transcript: agent.transcript.clone(),
-                        last_role: agent.last_role.clone(),
-                    },
-                );
-                if let Some(entry) = state.agents.get(&agent_id) {
-                    persist_agent_entry(db, entry);
-                }
-                continue;
-            }
-        };
-        let backend = match config.agent.backend(Some(&agent.backend)) {
-            Ok((_, backend)) => backend,
-            Err(error) => {
-                warn!(id = %agent.id, backend = %agent.backend, "scheduler: cannot restore agent backend: {error}");
-                state.agents.insert(
-                    agent_id,
-                    AgentEntry {
-                        agent_id,
-                        backend: agent.backend.clone(),
-                        role: agent.role,
-                        status: AgentStatus::Failed,
-                        control: None,
-                        session_id: Some(session_id),
-                        model: agent.model.clone(),
-                        scope_hash: Some(scope_hash),
-                        transcript: agent.transcript.clone(),
-                        last_role: agent.last_role.clone(),
-                    },
-                );
-                if let Some(entry) = state.agents.get(&agent_id) {
-                    persist_agent_entry(db, entry);
-                }
-                continue;
-            }
-        };
-
-        match launch_agent(
-            agent_id,
-            AgentLaunch::Restore {
-                session_id: session_id.clone(),
-            },
-            backend,
-            agent.model.clone(),
-            snapshot,
-            sys.scheduler.clone(),
-        ) {
-            Ok(control) => {
-                state.agents.insert(
-                    agent_id,
-                    AgentEntry {
-                        agent_id,
-                        backend: agent.backend.clone(),
-                        role: agent.role,
-                        status: AgentStatus::Running,
-                        control: Some(control),
-                        session_id: Some(session_id),
-                        model: agent.model.clone(),
-                        scope_hash: Some(scope_hash),
-                        transcript: agent.transcript.clone(),
-                        last_role: agent.last_role.clone(),
-                    },
-                );
-                if let Some(entry) = state.agents.get(&agent_id) {
-                    persist_agent_entry(db, entry);
-                }
-                resumed += 1;
-            }
-            Err(error) => {
-                warn!(id = %agent.id, "scheduler: failed to relaunch persisted agent: {error:?}");
-                state.agents.insert(
-                    agent_id,
-                    AgentEntry {
-                        agent_id,
-                        backend: agent.backend.clone(),
-                        role: agent.role,
-                        status: AgentStatus::Failed,
-                        control: None,
-                        session_id: Some(session_id),
-                        model: agent.model.clone(),
-                        scope_hash: Some(scope_hash),
-                        transcript: agent.transcript.clone(),
-                        last_role: agent.last_role.clone(),
-                    },
-                );
-                if let Some(entry) = state.agents.get(&agent_id) {
-                    persist_agent_entry(db, entry);
-                }
-            }
-        }
-    }
-
-    if max_agent > 0 {
-        state.next_agent = max_agent + 1;
-        info!(
-            restored = resumed,
-            next_agent = state.next_agent,
-            "scheduler: restored active agents"
-        );
-    }
-}
-
 fn persist_job_entry(db: &storage::SharedConnection, entry: &JobEntry) {
     if !entry.status.is_terminal() {
         return;
@@ -833,31 +628,6 @@ fn persist_cron_record(db: &storage::SharedConnection, cron: &storage::StoredCro
             storage::with_connection(&db, move |conn| storage::upsert_cron(conn, &stored)).await
         {
             warn!(cron = %cron_id, "scheduler: failed to persist cron: {error}");
-        }
-    });
-}
-
-fn persist_agent_entry(db: &storage::SharedConnection, entry: &AgentEntry) {
-    let agent_id = entry.agent_id.to_string();
-    let stored = storage::StoredAgent {
-        id: agent_id.clone(),
-        backend: entry.backend.clone(),
-        role: entry.role,
-        status: entry.status.clone(),
-        session_id: entry.session_id.clone(),
-        model: entry.model.clone(),
-        scope_hash: entry.scope_hash,
-        transcript: entry.transcript.clone(),
-        last_role: entry.last_role.clone(),
-    };
-    let db = Arc::clone(db);
-    tokio::spawn(async move {
-        if let Err(error) = storage::with_connection(&db, move |conn| {
-            storage::upsert_agent_history(conn, &stored)
-        })
-        .await
-        {
-            warn!(agent = %agent_id, "scheduler: failed to persist agent history: {error}");
         }
     });
 }
@@ -926,6 +696,63 @@ fn resolve_backend(
         .map_err(|error| ResponsePayload::err(error_code::NOT_FOUND, error.to_string()))
 }
 
+fn agent_transport_is_weft(config: &Config) -> bool {
+    matches!(config.agent.transport, AgentTransport::Weft)
+}
+
+fn weft_client(config: &Config) -> WeftClient {
+    WeftClient::new(config.weft.socket_path.clone())
+}
+
+fn weft_error_response(error: WeftClientError) -> ResponsePayload {
+    let code = match error {
+        WeftClientError::Http { status_code, .. } if (400..500).contains(&status_code) => {
+            error_code::INVALID_STATE
+        }
+        WeftClientError::Http { .. } => error_code::INTERNAL,
+        WeftClientError::Connect { .. } => error_code::INVALID_STATE,
+        WeftClientError::Io(_)
+        | WeftClientError::Serialize(_)
+        | WeftClientError::Deserialize(_)
+        | WeftClientError::Protocol(_) => error_code::INTERNAL,
+    };
+    ResponsePayload::err(code, error.to_string())
+}
+
+fn weft_not_supported(action: impl Into<String>) -> ResponsePayload {
+    ResponsePayload::err(
+        error_code::NOT_SUPPORTED,
+        format!(
+            "weft bootstrap proxy does not yet support {}",
+            action.into()
+        ),
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn weft_validate_agent_params(params: &ModeParams) -> Result<(), ResponsePayload> {
+    if params.get("session").is_some() {
+        return Err(ResponsePayload::err(
+            error_code::NOT_SUPPORTED,
+            "weft bootstrap proxy does not yet support session resume",
+        ));
+    }
+    if params.get("model").is_some() {
+        return Err(ResponsePayload::err(
+            error_code::NOT_SUPPORTED,
+            "weft bootstrap proxy does not yet support per-command model overrides",
+        ));
+    }
+    Ok(())
+}
+
+fn weft_proxy_transcript(socket_path: &std::path::Path) -> String {
+    format!(
+        "[system] proxied to weft bootstrap API via {}",
+        socket_path.display()
+    )
+}
+
 async fn get_head_snapshot(
     sys: &ActorSystem,
 ) -> Result<cue_core::scope::EnvSnapshot, ResponsePayload> {
@@ -945,6 +772,91 @@ async fn get_head_snapshot(
             "scope_store unreachable",
         )),
     }
+}
+
+async fn ensure_weft_available(config: &Config) -> Result<(), ResponsePayload> {
+    weft_client(config)
+        .discover()
+        .await
+        .map(|_| ())
+        .map_err(weft_error_response)
+}
+
+async fn spawn_weft_proxy_agent(
+    text: String,
+    params: ModeParams,
+    role: AgentRole,
+    state: &mut SchedulerState,
+    _db: &storage::SharedConnection,
+    config: &Config,
+    sys: &ActorSystem,
+) -> ResponsePayload {
+    if let Err(response) = weft_validate_agent_params(&params) {
+        return response;
+    }
+
+    let (label, _) = match resolve_backend(config, &params, true) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let scope_hash = match get_head_scope(sys).await {
+        Ok(hash) => hash,
+        Err(response) => return response,
+    };
+    let mut snapshot = match get_head_snapshot(sys).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
+    };
+    if let Some(cwd) = params.cwd() {
+        snapshot.cwd = cwd;
+    }
+
+    let client = weft_client(config);
+    let prepared = match client
+        .prepare_session(&SessionPrepareRequest {
+            agent: label.clone(),
+            workspace: WorkspaceRef {
+                root: snapshot.cwd.display().to_string(),
+            },
+            input: text,
+        })
+        .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => return weft_error_response(error),
+    };
+
+    let aid = state.alloc_agent();
+    let mut transcript = weft_proxy_transcript(client.socket_path());
+    let surface = prepared
+        .surface
+        .as_deref()
+        .unwrap_or(prepared.protocol.as_str());
+    let _ = write!(
+        transcript,
+        "\n[system] prepared {} session on {} ({})",
+        prepared.request.agent, surface, prepared.session.status
+    );
+    state.agents.insert(
+        aid,
+        AgentEntry {
+            agent_id: aid,
+            backend: label,
+            role,
+            status: AgentStatus::Running,
+            proxied: true,
+            control: None,
+            session_id: None,
+            model: None,
+            scope_hash: Some(scope_hash),
+            transcript,
+            last_role: Some("system".into()),
+        },
+    );
+
+    ResponsePayload::Ok(OkPayload::AgentSpawned {
+        agent_id: aid.to_string(),
+    })
 }
 
 async fn send_agent_failure(
@@ -1471,8 +1383,7 @@ fn launch_agent(
                                 AgentLaunch::Prompt {
                                     requested_session: Some(session_id),
                                     ..
-                                }
-                                | AgentLaunch::Restore { session_id } => {
+                                } => {
                                     if !load_supported {
                                         let _ = child.kill().await;
                                         terminal_status_sent = true;
@@ -1536,8 +1447,7 @@ fn launch_agent(
                                 AgentLaunch::Prompt {
                                     requested_session: Some(session_id),
                                     ..
-                                }
-                                | AgentLaunch::Restore { session_id } => session_id.clone(),
+                                } => session_id.clone(),
                                 AgentLaunch::Prompt {
                                     requested_session: None,
                                     ..
@@ -1599,16 +1509,6 @@ fn launch_agent(
                                         session_id,
                                         cancel_request_id: None,
                                     };
-                                }
-                                AgentLaunch::Restore { .. } => {
-                                    current_status = AgentStatus::WaitingInput;
-                                    let _ = scheduler
-                                        .send(SchedulerMsg::AgentStateChanged {
-                                            agent_id,
-                                            status: AgentStatus::WaitingInput,
-                                        })
-                                        .await;
-                                    phase = AcpPhase::Idle { session_id };
                                 }
                             }
                         }
@@ -3493,6 +3393,9 @@ async fn handle_command(
                 Ok(role) => role,
                 Err(response) => return response,
             };
+            if agent_transport_is_weft(config) {
+                return spawn_weft_proxy_agent(text, params, role, state, db, config, sys).await;
+            }
             let model_override = mode_param_string(&params, "model");
             let session_override = mode_param_string(&params, "session");
             let (label, backend) = match resolve_backend(config, &params, true) {
@@ -3532,6 +3435,7 @@ async fn handle_command(
                     backend: label.clone(),
                     role,
                     status: AgentStatus::Running,
+                    proxied: false,
                     control: Some(control),
                     session_id: session_override,
                     model: model_override,
@@ -3540,9 +3444,6 @@ async fn handle_command(
                     last_role: None,
                 },
             );
-            if let Some(entry) = state.agents.get(&aid) {
-                persist_agent_entry(db, entry);
-            }
             info!(%aid, backend = %label, %text, "scheduler: planner agent spawned");
             ResponsePayload::Ok(OkPayload::AgentSpawned {
                 agent_id: aid.to_string(),
@@ -3597,6 +3498,9 @@ async fn handle_command(
                 Ok(role) => role,
                 Err(response) => return response,
             };
+            if agent_transport_is_weft(config) {
+                return spawn_weft_proxy_agent(text, params, role, state, db, config, sys).await;
+            }
             let model_override = mode_param_string(&params, "model");
             let session_override = mode_param_string(&params, "session");
             let (label, backend) = match resolve_backend(config, &params, true) {
@@ -3636,6 +3540,7 @@ async fn handle_command(
                     backend: label.clone(),
                     role,
                     status: AgentStatus::Running,
+                    proxied: false,
                     control: Some(control),
                     session_id: session_override,
                     model: model_override,
@@ -3644,9 +3549,6 @@ async fn handle_command(
                     last_role: None,
                 },
             );
-            if let Some(entry) = state.agents.get(&aid) {
-                persist_agent_entry(db, entry);
-            }
             info!(%aid, backend = %label, %text, "scheduler: executor agent spawned");
             ResponsePayload::Ok(OkPayload::AgentSpawned {
                 agent_id: aid.to_string(),
@@ -3691,6 +3593,13 @@ async fn handle_command(
                 }
             } else if let Some(agent_id) = parse_agent_id(&id) {
                 match state.agents.get(&agent_id) {
+                    Some(entry) if entry.proxied => {
+                        if let Err(response) = ensure_weft_available(config).await {
+                            response
+                        } else {
+                            weft_not_supported(format!("foreground attach (`:fg {id}`)"))
+                        }
+                    }
                     Some(entry) if !entry.status.is_terminal() => {
                         ResponsePayload::Ok(OkPayload::FgAttached { id })
                     }
@@ -3764,6 +3673,12 @@ async fn handle_command(
                         format!("agent {id} not found"),
                     );
                 };
+                if entry.proxied {
+                    if let Err(response) = ensure_weft_available(config).await {
+                        return response;
+                    }
+                    return weft_not_supported(format!("agent termination (`:kill {id}`)"));
+                }
                 if entry.status.is_terminal() {
                     return ResponsePayload::err(
                         error_code::INVALID_STATE,
@@ -3845,6 +3760,12 @@ async fn handle_command(
                         format!("agent {id} not found"),
                     );
                 };
+                if entry.proxied {
+                    if let Err(response) = ensure_weft_available(config).await {
+                        return response;
+                    }
+                    return weft_not_supported(format!("agent cancellation (`:cancel {id}`)"));
+                }
                 if entry.status != AgentStatus::Running {
                     return ResponsePayload::err(
                         error_code::INVALID_STATE,
@@ -3922,6 +3843,11 @@ async fn handle_command(
         }
 
         ResolvedCommand::Agents => {
+            if agent_transport_is_weft(config)
+                && let Err(response) = ensure_weft_available(config).await
+            {
+                return response;
+            }
             let mut list: Vec<AgentInfo> =
                 state.agents.values().map(agent_info_from_entry).collect();
             list.sort_by_key(|agent| parse_agent_id(&agent.id).map(|id| id.0).unwrap_or(u32::MAX));
@@ -3950,6 +3876,18 @@ async fn handle_command(
         }
 
         ResolvedCommand::Escalate { text } => {
+            if agent_transport_is_weft(config) {
+                return spawn_weft_proxy_agent(
+                    format!("executor escalation: {text}"),
+                    ModeParams::new(),
+                    AgentRole::Planner,
+                    state,
+                    db,
+                    config,
+                    sys,
+                )
+                .await;
+            }
             let params = ModeParams::new();
             let role = AgentRole::Planner;
             let model_override = mode_param_string(&params, "model");
@@ -3988,6 +3926,7 @@ async fn handle_command(
                     backend: label.clone(),
                     role,
                     status: AgentStatus::Running,
+                    proxied: false,
                     control: Some(control),
                     session_id: session_override,
                     model: model_override,
@@ -3996,9 +3935,6 @@ async fn handle_command(
                     last_role: None,
                 },
             );
-            if let Some(entry) = state.agents.get(&aid) {
-                persist_agent_entry(db, entry);
-            }
             info!(%aid, backend = %label, %text, "scheduler: planner escalation spawned");
             ResponsePayload::Ok(OkPayload::AgentSpawned {
                 agent_id: aid.to_string(),
@@ -4170,6 +4106,12 @@ async fn handle_command(
                         format!("agent {id} not found"),
                     );
                 };
+                if entry.proxied {
+                    if let Err(response) = ensure_weft_available(config).await {
+                        return response;
+                    }
+                    return weft_not_supported(format!("follow-up prompts (`:send {id} ...`)"));
+                }
                 if entry.status != AgentStatus::WaitingInput {
                     return ResponsePayload::err(
                         error_code::INVALID_STATE,
@@ -4618,12 +4560,14 @@ fn general_help_text() -> &'static str {
         "\n",
         "Modes:\n",
         "- JOB: run shell commands and inspect output / scopes.\n",
-        "- AGENT: send prompts to ACP-backed agent sessions.\n",
         "- CRON: define scheduled commands.\n",
+        "\n",
+        "Compatibility bridge:\n",
+        "- legacy prompt/session commands can still be forwarded to weft during migration.\n",
         "\n",
         "Quick tips:\n",
         "- Enter bare `?` to show detailed help for the current mode.\n",
-        "- Use `:help job`, `:help agent`, or `:help cron` for mode-specific help.\n",
+        "- Use `:help job` or `:help cron` for mode-specific help.\n",
         "- Builtins start with `:` and are executed by `cued`.\n",
         "- Modes only change how bare input is interpreted.\n"
     )
@@ -4646,30 +4590,27 @@ fn job_help_text() -> &'static str {
         "- `:fg J<n>` attach an interactive job in the foreground\n",
         "- `:wait J<n>` block until the job finishes\n",
         "- `:retry J<n>` rerun from the original start scope\n",
-        "- `:probe status|out|err|env ...` inspect job state without changing it\n",
+        "- compatibility: `:probe status|out|err|env ...` inspect job state without changing it\n",
         "- `:env`, `:env set ...`, `:cd ...` inspect or update the persisted HEAD scope\n"
     )
 }
 
 fn agent_help_text() -> &'static str {
     concat!(
-        "AGENT mode\n",
+        "LEGACY compatibility\n",
         "\n",
-        "Bare input sends a prompt to the default ACP agent backend.\n",
-        "Examples:\n",
-        "- `explain this test failure`\n",
-        "- `draft a fix plan for parser regressions`\n",
+        "Legacy prompt/session commands remain available only as a transitional bridge.\n",
         "\n",
-        "Useful builtins:\n",
-        "- `:ask ...` send a one-shot prompt explicitly\n",
-        "- `:spawn ...` create a long-lived agent session\n",
-        "- `:send A<n> ...` continue an existing agent session\n",
-        "- `:cancel A<n>` cancel the current in-flight turn\n",
-        "- `:kill A<n>` terminate the whole session\n",
-        "- `:agents` list known agent sessions\n",
-        "- `:confirm ...` send a structured confirmation-style reply\n",
-        "- `:escalate ...` create a planner-style follow-up session\n",
-        "- `session=<id>` can resume a backend session when loadSession is available\n"
+        "Compatibility aliases:\n",
+        "- `:ask ...` one-shot prompt alias\n",
+        "- `:spawn ...` long-lived session alias\n",
+        "- `:send A<n> ...` continue an existing session\n",
+        "- `:cancel A<n>` cancel the current turn\n",
+        "- `:kill A<n>` terminate the session\n",
+        "- `:agents` list active sessions\n",
+        "- `:confirm ...` confirmation alias\n",
+        "- `:escalate ...` follow-up alias\n",
+        "- `session=<id>` resume when loadSession is available\n"
     )
 }
 
@@ -5007,9 +4948,15 @@ async fn read_stderr_from_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentBackendConfig, AgentConfig};
+    use crate::config::{AgentBackendConfig, AgentConfig, WeftConfig};
     use cue_core::pipeline::{PipeSegment, Pipeline};
-    use std::path::Path;
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+    use tokio::sync::Mutex as TokioMutex;
     use tokio::sync::mpsc;
 
     /// Helper: build a simple leaf from a command string.
@@ -5103,6 +5050,7 @@ mod tests {
     fn fake_agent_config() -> Config {
         Config {
             agent: AgentConfig {
+                transport: AgentTransport::Legacy,
                 default_backend: "fake".into(),
                 backends: std::collections::BTreeMap::from([(
                     "fake".into(),
@@ -5155,6 +5103,7 @@ done
                 )]),
             },
             aliases: crate::config::AliasConfig::default(),
+            weft: WeftConfig::default(),
         }
     }
 
@@ -5164,6 +5113,103 @@ done
         backend.args[1] =
             backend.args[1].replace(r#"\"loadSession\":true"#, r#"\"loadSession\":false"#);
         config
+    }
+
+    fn weft_agent_config(socket_path: &Path) -> Config {
+        Config {
+            agent: AgentConfig {
+                transport: AgentTransport::Weft,
+                default_backend: "weft-agent".into(),
+                backends: std::collections::BTreeMap::from([(
+                    "weft-agent".into(),
+                    AgentBackendConfig {
+                        command: String::new(),
+                        args: vec![],
+                        model: None,
+                    },
+                )]),
+            },
+            aliases: crate::config::AliasConfig::default(),
+            weft: WeftConfig {
+                socket_path: socket_path.to_path_buf(),
+            },
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedWeftRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    async fn spawn_fake_weft_server(
+        socket_path: PathBuf,
+        responses: Vec<String>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        Arc<TokioMutex<Vec<RecordedWeftRequest>>>,
+    ) {
+        let expected = responses.len();
+        let recorded = Arc::new(TokioMutex::new(Vec::new()));
+        let recorded_clone = Arc::clone(&recorded);
+        let response_queue = Arc::new(TokioMutex::new(VecDeque::from(responses)));
+        let response_queue_clone = Arc::clone(&response_queue);
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent).expect("create test socket dir");
+        }
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind fake weft server");
+
+        let handle = tokio::spawn(async move {
+            for _ in 0..expected {
+                let (mut stream, _) = listener.accept().await.expect("accept weft request");
+                let mut request = Vec::new();
+                stream
+                    .read_to_end(&mut request)
+                    .await
+                    .expect("read weft request");
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let (head, body) = request
+                    .split_once("\r\n\r\n")
+                    .expect("HTTP request should contain a body separator");
+                let mut parts = head
+                    .lines()
+                    .next()
+                    .expect("HTTP request line")
+                    .split_whitespace();
+                let method = parts.next().expect("HTTP method").to_string();
+                let path = parts.next().expect("HTTP path").to_string();
+                recorded_clone.lock().await.push(RecordedWeftRequest {
+                    method,
+                    path,
+                    body: body.to_string(),
+                });
+
+                let response = response_queue_clone
+                    .lock()
+                    .await
+                    .pop_front()
+                    .expect("queued HTTP response");
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write fake weft response");
+            }
+            let _ = std::fs::remove_file(&socket_path);
+        });
+
+        (handle, recorded)
+    }
+
+    fn unique_test_socket_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        PathBuf::from("target")
+            .join("test-sockets")
+            .join(format!("s-{name}-{nanos}.sock"))
     }
 
     async fn recv_scheduler_msg(rx: &mut mpsc::Receiver<SchedulerMsg>) -> SchedulerMsg {
@@ -5187,8 +5233,8 @@ done
         assert!(job.contains(":tail J<n>"));
 
         let agent = render_help_text(Some("agent"));
-        assert!(agent.contains("AGENT mode"));
-        assert!(agent.contains(":send A<n>"));
+        assert!(agent.contains("LEGACY compatibility"));
+        assert!(agent.contains("Compatibility aliases"));
 
         let cron = render_help_text(Some("cron"));
         assert!(cron.contains("CRON mode"));
@@ -5198,7 +5244,7 @@ done
     #[test]
     fn help_renderer_maps_command_aliases_to_modes() {
         assert!(render_help_text(Some("run")).contains("JOB mode"));
-        assert!(render_help_text(Some("ask")).contains("AGENT mode"));
+        assert!(render_help_text(Some("ask")).contains("LEGACY compatibility"));
         assert!(render_help_text(Some("pause")).contains("CRON mode"));
     }
 
@@ -5599,105 +5645,6 @@ done
         let crons = storage::load_crons(&guard).unwrap();
         assert_eq!(crons.len(), 1);
         assert_eq!(crons[0].status, CronStatus::Expired);
-    }
-
-    #[tokio::test]
-    async fn restore_agents_reloads_active_sessions_and_next_id() {
-        let (sys, _gw_rx, mut sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
-        spawn_fake_scope_store(ss_rx);
-
-        let conn = test_db();
-        {
-            let guard = conn.lock().unwrap();
-            storage::upsert_agent_history(
-                &guard,
-                &storage::StoredAgent {
-                    id: "A4".into(),
-                    backend: "fake".into(),
-                    role: AgentRole::Executor,
-                    status: AgentStatus::WaitingInput,
-                    session_id: Some("sess_resume".into()),
-                    model: None,
-                    scope_hash: Some(ScopeHash([0; 32])),
-                    transcript: "[assistant] already there".into(),
-                    last_role: Some("assistant".into()),
-                },
-            )
-            .unwrap();
-        }
-
-        let config = fake_agent_config();
-        let mut state = SchedulerState::new();
-        restore_agents(&conn, &mut state, &config, &sys).await;
-
-        assert_eq!(state.next_agent, 5);
-        let restored = state.agents.get(&AgentId(4)).expect("restored agent");
-        assert_eq!(restored.session_id.as_deref(), Some("sess_resume"));
-        assert_eq!(restored.status, AgentStatus::Running);
-        assert!(restored.control.is_some());
-        assert!(restored.transcript.contains("already there"));
-        assert_eq!(restored.last_role.as_deref(), Some("assistant"));
-
-        let mut saw_session = false;
-        let mut saw_waiting = false;
-        for _ in 0..4 {
-            match recv_scheduler_msg(&mut sched_rx).await {
-                SchedulerMsg::AgentMessage {
-                    agent_id, content, ..
-                } if agent_id == AgentId(4) && content.contains("ACP session: sess_resume") => {
-                    saw_session = true;
-                }
-                SchedulerMsg::AgentStateChanged { agent_id, status }
-                    if agent_id == AgentId(4) && status == AgentStatus::WaitingInput =>
-                {
-                    saw_waiting = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        assert!(
-            saw_session,
-            "restored agent did not surface its ACP session"
-        );
-        assert!(saw_waiting, "restored agent did not settle to WaitingInput");
-    }
-
-    #[tokio::test]
-    async fn restore_agents_keeps_terminal_history_visible() {
-        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
-        spawn_fake_scope_store(ss_rx);
-
-        let conn = test_db();
-        {
-            let guard = conn.lock().unwrap();
-            storage::upsert_agent_history(
-                &guard,
-                &storage::StoredAgent {
-                    id: "A9".into(),
-                    backend: "fake".into(),
-                    role: AgentRole::Planner,
-                    status: AgentStatus::Done,
-                    session_id: Some("sess_done".into()),
-                    model: None,
-                    scope_hash: Some(ScopeHash([1; 32])),
-                    transcript: "done".into(),
-                    last_role: Some("assistant".into()),
-                },
-            )
-            .unwrap();
-        }
-
-        let config = fake_agent_config();
-        let mut state = SchedulerState::new();
-        restore_agents(&conn, &mut state, &config, &sys).await;
-
-        assert_eq!(state.next_agent, 10);
-        let restored = state.agents.get(&AgentId(9)).expect("restored agent");
-        assert_eq!(restored.status, AgentStatus::Done);
-        assert!(restored.control.is_none());
-        assert_eq!(restored.transcript, "done");
     }
 
     #[tokio::test]
@@ -6148,6 +6095,163 @@ done
             1,
             "b should be spawned via Always after cancel"
         );
+    }
+
+    #[tokio::test]
+    async fn weft_proxy_routes_agent_commands() {
+        let socket_path = unique_test_socket_path("proxy-agent");
+        let (server, recorded) = spawn_fake_weft_server(
+            socket_path.clone(),
+            vec![
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"protocol\":\"v1\",\"request\":{\"agent\":\"weft-agent\",\"workspace\":{\"root\":\"/workspace\"},\"input\":\"plan\"},\"session\":{\"status\":\"pending\"}}".into(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"protocol\":\"v1\",\"request\":{\"agent\":\"weft-agent\",\"workspace\":{\"root\":\"/workspace\"},\"input\":\"execute\"},\"session\":{\"status\":\"pending\"}}".into(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"protocol\":\"v1\",\"capabilities\":[]}".into(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"protocol\":\"v1\",\"capabilities\":[]}".into(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"protocol\":\"v1\",\"capabilities\":[]}".into(),
+            ],
+        )
+        .await;
+
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+        let conn = test_db();
+        let config = weft_agent_config(&socket_path);
+        let mut state = SchedulerState::new();
+
+        let ask_response = handle_command(
+            ResolvedCommand::Ask {
+                text: "plan".into(),
+                params: ModeParams::new(),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        let ask_id = match ask_response {
+            ResponsePayload::Ok(OkPayload::AgentSpawned { agent_id }) => agent_id,
+            other => panic!("expected AgentSpawned, got {other:?}"),
+        };
+
+        let spawn_response = handle_command(
+            ResolvedCommand::Spawn {
+                text: "execute".into(),
+                params: ModeParams::new(),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        let spawn_id = match spawn_response {
+            ResponsePayload::Ok(OkPayload::AgentSpawned { agent_id }) => agent_id,
+            other => panic!("expected AgentSpawned, got {other:?}"),
+        };
+
+        let agents_response =
+            handle_command(ResolvedCommand::Agents, 0, &mut state, &conn, &config, &sys).await;
+        match agents_response {
+            ResponsePayload::Ok(OkPayload::AgentList(list)) => {
+                assert_eq!(list.len(), 2);
+                assert_eq!(list[0].id, ask_id);
+                assert_eq!(list[1].id, spawn_id);
+                assert!(list.iter().all(|agent| agent.backend == "weft-agent"));
+            }
+            other => panic!("expected AgentList, got {other:?}"),
+        }
+
+        let send_response = handle_command(
+            ResolvedCommand::Send {
+                id: ask_id.clone(),
+                data: "follow up".into(),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            send_response,
+            ResponsePayload::Err { code, message }
+                if code == error_code::NOT_SUPPORTED && message.contains("follow-up prompts")
+        ));
+
+        let cancel_response = handle_command(
+            ResolvedCommand::Cancel { id: ask_id.clone() },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            cancel_response,
+            ResponsePayload::Err { code, message }
+                if code == error_code::NOT_SUPPORTED && message.contains("cancellation")
+        ));
+
+        server.await.expect("fake weft server task");
+
+        let recorded = recorded.lock().await;
+        assert_eq!(recorded.len(), 5);
+        assert_eq!(recorded[0].method, "POST");
+        assert_eq!(recorded[0].path, "/sessions/prepare");
+        assert!(recorded[0].body.contains("\"input\":\"plan\""));
+        assert_eq!(recorded[1].method, "POST");
+        assert_eq!(recorded[1].path, "/sessions/prepare");
+        assert!(recorded[1].body.contains("\"input\":\"execute\""));
+        for request in &recorded[2..] {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, "/discover");
+        }
+        assert!(
+            state
+                .agents
+                .values()
+                .all(|entry| entry.proxied && entry.transcript.contains("weft bootstrap API"))
+        );
+    }
+
+    #[tokio::test]
+    async fn jobs_still_list_local_state_when_weft_proxy_is_enabled() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, _ss_rx, _eb_rx) = test_actor_system();
+        let conn = test_db();
+        let config = weft_agent_config(Path::new("/definitely/not/listened.sock"));
+        let mut state = SchedulerState::new();
+        state.jobs.insert(
+            JobId(1),
+            JobEntry {
+                job_id: JobId(1),
+                pipeline_text: "cargo test".into(),
+                status: JobStatus::Running,
+                exit_code: None,
+                start_scope: None,
+                end_scope: None,
+                open_hint: JobOpenHint::Stream,
+                chain_id: None,
+                chain_index: None,
+                chain_total: None,
+                stderr: String::new(),
+            },
+        );
+
+        let response =
+            handle_command(ResolvedCommand::Jobs, 0, &mut state, &conn, &config, &sys).await;
+        match response {
+            ResponsePayload::Ok(OkPayload::JobList(list)) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].id, "J1");
+                assert_eq!(list[0].pipeline, "cargo test");
+            }
+            other => panic!("expected JobList, got {other:?}"),
+        }
     }
 
     #[tokio::test]

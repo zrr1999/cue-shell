@@ -228,7 +228,7 @@ v2 改为 **3 个模式** + **`:` 前缀语法**：
 | `cmd:` → `:cmd` | TUI 文化一致（Vim）；首字符判断 vs 扫描冒号位置更简单；消除 `foo:bar` 误判 |
 | 去掉 CMD 模式 | `:` 前缀在任何模式下都能触发内建命令，CMD 模式冗余 |
 | SCHED → CRON | 与 `:cron` 命令命名一致 |
-| 新增 `:probe`/`:confirm`/`:escalate` | 完善 Planner-Executor 通信协议 |
+| 新增 `:probe`/`:confirm`/`:escalate` | 当时用于完善旧的 planner/executor 通信协议（现已转为兼容历史） |
 
 ### 3.4 解析器对比
 

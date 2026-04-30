@@ -1,7 +1,7 @@
 # Cue Shell — Design Overview
 
-> Architecture reference for cue-shell: an async process runtime with TUI
-> for human-agent collaboration.
+> Architecture reference for cue-shell: a durable process substrate with TUI
+> frontends and a transitional weft-backed agent bridge.
 
 ## Architecture
 
@@ -31,7 +31,7 @@
 | Crate | Role |
 |---|---|
 | **cue-core** | Shared types, parser, protocol definitions |
-| **cued** | Background daemon — scheduler, process manager, scope store |
+| **cued** | Background daemon — process substrate, scheduler, process manager, scope store |
 | **cue-tui** | Interactive TUI client (ratatui + crossterm) |
 | **cue-cli** | Headless CLI client for scripting |
 
@@ -40,11 +40,16 @@
 | Primitive | ID | Description |
 |---|---|---|
 | **Job** | J1, J2, ... | OS child process (or pipeline of processes) |
-| **Agent** | A1, A2, ... | AI assistant (CLI with pty, or API-only) |
 | **Cron** | C1, C2, ... | Scheduled/delayed task that spawns Jobs |
 | **Scope** | S0@a3f1 | Immutable environment snapshot (content-addressed, blake3) |
 | **Chain** | — | Job orchestration graph (serial/parallel) |
 | **Pipeline** | — | Process pipe chain within a single Job |
+
+Compatibility surface:
+
+| Surface | Description |
+|---|---|
+| **Agent** | Transitional bridge backed by weft; not a primary product primitive |
 
 ## Operator Model (Two Layers)
 
@@ -62,8 +67,8 @@ Priority: pipe (1) > parallel (2) > serial (3).
 | Mode | Indicator | Bare input becomes |
 |---|---|---|
 | JOB ⚡ | `[JOB ⚡] > _` | `:run <input>` |
-| AGENT 🤖 | `[AGENT 🤖] > _` | `:ask <input>` |
 | CRON ⏰ | `[CRON ⏰] > _` | `:cron <input>` |
+| AGENT 🤖 | `[AGENT 🤖] > _` | compatibility bridge → `:ask <input>` |
 
 Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless of mode.
 
@@ -98,7 +103,7 @@ Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default sc
 - **Model**: Request/Response + Event push, multiplexed on a single connection
 - **Eval-centric**: user commands sent as raw strings via `Eval { input, mode }`;
   cued owns the full parser (Tokenizer → Parser → Resolver)
-- **Subscriptions**: channel model (`jobs`, `agents`, `crons`, `output:J1`, `scopes`, `system`)
+- **Subscriptions**: channel model (`jobs`, `agents`, `crons`, `output:J1`, `scopes`, `system`) — `agents` is compatibility-only
 
 ## Storage (Three Layers)
 
@@ -113,7 +118,7 @@ Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default sc
 | Document | Contents |
 |---|---|
 | [commands-and-modes.md](commands-and-modes.md) | Complete command reference, modes, cron syntax |
-| [core-types.md](core-types.md) | Rust type definitions — Scope, Job, Agent, Cron, Pipeline, Chain |
+| [core-types.md](core-types.md) | Rust type definitions — Scope, Job, Cron, Pipeline, Chain, compatibility surfaces |
 | [tui.md](tui.md) | TUI architecture, layout, interaction design |
 | [ipc-protocol.md](ipc-protocol.md) | cued ↔ client protocol specification |
 | [parser.md](parser.md) | Command parser — tokenizer, grammar, completion |

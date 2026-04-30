@@ -81,7 +81,7 @@ impl Sidebar {
     fn list_title(&self) -> &'static str {
         match self.mode {
             Mode::Job => " Jobs ",
-            Mode::Agent => " Agents ",
+            Mode::Agent => " Jobs ",
             Mode::Cron => " Crons ",
         }
     }
@@ -89,7 +89,7 @@ impl Sidebar {
     fn empty_hint(&self) -> &'static str {
         match self.mode {
             Mode::Job => "No jobs yet.",
-            Mode::Agent => "No agents yet.",
+            Mode::Agent => "No jobs yet.",
             Mode::Cron => "No crons yet.",
         }
     }

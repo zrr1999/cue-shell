@@ -2,9 +2,10 @@
 
 ## 1. Overview
 
-cued is a long-running background daemon that manages Jobs, Agents, Crons, and Scopes.
-Clients (TUI, CLI, MCP) connect via Unix socket. cued owns the parser, scheduler,
-process manager, and all persistent state.
+cued is a long-running background daemon that manages Jobs, Crons, Scopes, and
+chains. Clients (TUI, CLI, MCP) connect via Unix socket. cued owns the parser,
+scheduler, process manager, and all persistent state. Any agent-facing surface is
+treated as a transitional bridge to weft rather than a core product primitive.
 
 ## 2. Runtime Model
 
@@ -12,7 +13,7 @@ process manager, and all persistent state.
 
 Rationale:
 - Future-proofing for heavy Cron loads, multiple clients, and extension system
-- Jobs and Agents are OS child processes (natural isolation from daemon)
+- Jobs are OS child processes (natural isolation from daemon)
 - Competing tools: Zellij uses multi-threaded tokio for similar reasons
 - `Send + Sync` overhead is acceptable given the Actor model (message passing, minimal shared state)
 
@@ -54,7 +55,7 @@ Responsibilities:
 - Route resolved requests to Scheduler
 - Manage per-client subscriptions (channel model)
 - Forward events from EventBus to subscribed clients
-- Handle :fg proxy mode (FgInput/FgOutput forwarding)
+- Handle :fg proxy mode (FgInput/FgOutput forwarding) and compatibility bridge requests
 - Serve Complete / Highlight editor requests
 
 State: per-client subscription sets, per-client fg attachment status
@@ -62,7 +63,7 @@ State: per-client subscription sets, per-client fg attachment status
 ### 3.2 Scheduler
 
 Responsibilities:
-- Assign Job/Agent/Cron IDs (monotonically increasing per type: J1, J2, ...)
+- Assign Job/Cron IDs (monotonically increasing per type: J1, J2, ...)
 - Manage Chain AST execution:
   - Track chain dependency graph
   - When a Job finishes, advance chain (serial → trigger next; parallel → check all)
@@ -92,7 +93,7 @@ Responsibilities:
 - Apply Scope (env vars + cwd) when spawning processes
 - Capture end_scope (env snapshot after process exits, if applicable)
 
-State: running process table (pid, pty fd, ring buffer, job/agent id mapping)
+State: running process table (pid, pty fd, ring buffer, job/session id mapping)
 
 ### 3.4 ScopeStore
 
@@ -123,10 +124,10 @@ State: subscriber registry (Gateway handles per-client routing)
 
 ### Layer 1: In-Memory (Real-time)
 
-- **Output ring buffer**: per-Job/Agent, fixed size (default 1 MiB), circular overwrite
+- **Output ring buffer**: per-Job/bridge session, fixed size (default 1 MiB), circular overwrite
   - Source of truth for OutputChunk events pushed to clients
   - Also serves `:out J1` tail queries for recent output
-- **Active state**: running Jobs, Agents, Chains, Crons (in respective Actors)
+- **Active state**: running Jobs, Chains, Crons, and bridge sessions (in respective Actors)
 
 ### Layer 2: File System (Output Persistence)
 
@@ -134,7 +135,7 @@ State: subscriber registry (Gateway handles per-client routing)
   - Append-only write from ProcessManager as chunks arrive
   - Full historical output for `:out J1 --full` or :log queries
   - Auto-cleanup: configurable retention (by age or total size)
-  - One file per Job/Agent, plain text (binary-safe with raw bytes)
+- One file per Job/bridge session, plain text (binary-safe with raw bytes)
 
 ### Layer 3: SQLite (Metadata Persistence)
 
@@ -182,12 +183,12 @@ CREATE TABLE jobs_history (
     exit_code    INTEGER
 );
 
--- Agent history
+-- Compatibility-bridge history
 CREATE TABLE agents_history (
     id          TEXT PRIMARY KEY,  -- A1, A2, ...
     kind        TEXT NOT NULL,     -- legacy compatibility mirror of backend
     backend     TEXT,              -- configured ACP backend/profile name
-    role        TEXT NOT NULL,     -- Planner, Executor
+    role        TEXT NOT NULL,     -- legacy session role / bridge metadata
     status      TEXT NOT NULL,
     session_id  TEXT,              -- ACP session id for resume/session-load
     model       TEXT,              -- optional model override
@@ -265,7 +266,7 @@ Triggered by: `cued stop`, SIGTERM, SIGINT, or `:shutdown` command.
    b. Reject new Eval requests (respond with Err { code: "SHUTTING_DOWN" })
    c. Push ShuttingDown event to all connected clients
 
-2. Wait for running Jobs/Agents to complete naturally
+2. Wait for running Jobs and bridge sessions to complete naturally
    - Monitor ProcessManager's active process count
    - No timeout yet — let them finish
 

@@ -47,7 +47,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             let block = Block::new()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(format!(" AGENT {fg_id} "));
+                .title(format!(" SESSION {fg_id} "));
             let inner = block.inner(body_area);
             frame.render_widget(block, body_area);
             frame.render_widget(

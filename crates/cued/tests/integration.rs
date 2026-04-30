@@ -1284,7 +1284,7 @@ async fn test_bare_question_returns_current_mode_help() {
 
         for (request_id, mode, expected) in [
             (1, Mode::Job, "JOB mode"),
-            (2, Mode::Agent, "AGENT mode"),
+            (2, Mode::Agent, "JOB mode"),
             (3, Mode::Cron, "CRON mode"),
         ] {
             let resp = roundtrip(

@@ -481,7 +481,7 @@ impl AppState {
             .and_then(|index| self.display_tabs.get(index))
             .map(|tab| tab.content.as_str())
             .unwrap_or(
-                "Use `:out J1` for a stdout snapshot, `:tail J1` to follow live stdout, or `:err J1` for stderr.\nOpen AGENT rows here for session history, or use `:fg A1` for fullscreen conversation.",
+                "Use `:out J1` for a stdout snapshot, `:tail J1` to follow live stdout, or `:err J1` for stderr.\nOpen session rows here for history, or use `:fg A1` for fullscreen conversation.",
             )
     }
 
@@ -526,12 +526,8 @@ impl AppState {
 
         match self.focus {
             FocusArea::Input => match self.mode {
-                Mode::Job => {
+                Mode::Job | Mode::Agent => {
                     "JOB: Enter submit  •  Shift+Enter newline  •  Tab complete  •  Shift+Tab mode"
-                        .to_string()
-                }
-                Mode::Agent => {
-                    "AGENT: Enter prompt  •  Shift+Enter newline  •  Tab complete  •  Shift+Tab mode"
                         .to_string()
                 }
                 Mode::Cron => {
@@ -540,7 +536,7 @@ impl AppState {
                 }
             },
             FocusArea::Sidebar => {
-                "Sidebar: Click row to open  •  Agent rows enter fg  •  Up/Down move  •  Enter open  •  Shift+Tab mode  •  Ctrl+B toggle".to_string()
+                "Sidebar: Click row to open  •  Session rows enter fg  •  Up/Down move  •  Enter open  •  Shift+Tab mode  •  Ctrl+B toggle".to_string()
             }
             FocusArea::MainView => {
                 if self.display_pane_has_target() {
@@ -575,7 +571,7 @@ impl AppState {
             .map(format_agent_status)
             .unwrap_or("unknown");
         format!(
-            "AGENT {status}: Enter send prompt  •  Shift+Enter newline  •  Ctrl+C cancel turn  •  Ctrl+Y copy transcript  •  Ctrl+Z detach"
+            "SESSION {status}: Enter send prompt  •  Shift+Enter newline  •  Ctrl+C cancel turn  •  Ctrl+Y copy transcript  •  Ctrl+Z detach"
         )
     }
 
@@ -587,7 +583,7 @@ impl AppState {
                     let prefix = if tab.follow { " follow" } else { "" };
                     format!("{prefix} {} {}  × ", stream.label(), id)
                 }
-                DisplayTarget::AgentSession { id } => format!(" agent {id}  × "),
+                DisplayTarget::AgentSession { id } => format!(" session {id}  × "),
                 DisplayTarget::Preview { title, .. } => format!(" {title}  × "),
             })
             .collect()
@@ -600,7 +596,7 @@ impl AppState {
     fn copy_target(&self) -> Option<CopyTarget> {
         if let Some(agent_id) = self.fg_id().filter(|_| self.fg_is_agent()) {
             return Some(CopyTarget {
-                label: format!("agent {agent_id}"),
+                label: format!("session {agent_id}"),
                 content: self
                     .fg_agent_content()
                     .unwrap_or_else(|| "No conversation yet.".to_string()),
@@ -635,7 +631,7 @@ impl AppState {
         {
             let label = match &tab.target {
                 DisplayTarget::Output { id, stream } => format!("{} {id}", stream.label()),
-                DisplayTarget::AgentSession { id } => format!("agent {id}"),
+                DisplayTarget::AgentSession { id } => format!("session {id}"),
                 DisplayTarget::Preview { title, .. } => title.clone(),
             };
             return Some(CopyTarget {
@@ -767,7 +763,7 @@ impl AppState {
     fn sync_sidebar_items(&mut self) {
         let items = match self.mode {
             Mode::Job => self.jobs.iter().rev().map(job_sidebar_item).collect(),
-            Mode::Agent => self.agents.iter().rev().map(agent_sidebar_item).collect(),
+            Mode::Agent => self.jobs.iter().rev().map(job_sidebar_item).collect(),
             Mode::Cron => self.crons.iter().rev().map(cron_sidebar_item).collect(),
         };
         self.sidebar.update(SidebarMsg::SetItems(items));
@@ -854,7 +850,7 @@ impl AppState {
             .iter()
             .find(|agent| agent.id == agent_id)
             .map(|agent| agent.label.as_str())
-            .unwrap_or("agent session");
+            .unwrap_or("legacy session");
         let transcript = session
             .map(|session| session.transcript.trim_end())
             .filter(|transcript| !transcript.is_empty())
@@ -1475,8 +1471,8 @@ impl AppState {
     fn request_sidebar_snapshots(&mut self) {
         for (input, mode) in [
             (":jobs", Mode::Job),
-            (":agents", Mode::Agent),
             (":crons", Mode::Cron),
+            (":agents", Mode::Agent),
         ] {
             if !self.enqueue_silent_request(
                 RequestPayload::Eval {
@@ -3088,11 +3084,8 @@ fn submission_precreates_card(input: &str, mode: Mode, warnings: &[String]) -> b
     submission_opens_agent_stream(input, mode)
 }
 
-fn submission_opens_agent_stream(input: &str, mode: Mode) -> bool {
+fn submission_opens_agent_stream(input: &str, _mode: Mode) -> bool {
     let trimmed = input.trim();
-    if mode == Mode::Agent && !trimmed.starts_with(':') {
-        return true;
-    }
     let Some(rest) = trimmed.strip_prefix(':') else {
         return false;
     };
@@ -3104,10 +3097,7 @@ fn submission_opens_agent_stream(input: &str, mode: Mode) -> bool {
     }
 }
 
-fn submission_agent_target(input: &str, mode: Mode) -> Option<String> {
-    if mode == Mode::Agent && !input.trim_start().starts_with(':') {
-        return None;
-    }
+fn submission_agent_target(input: &str, _mode: Mode) -> Option<String> {
     let rest = input.trim().strip_prefix(":send")?.trim_start();
     let target = rest.split_whitespace().next()?;
     target.starts_with('A').then(|| target.to_string())
@@ -3236,7 +3226,7 @@ fn format_ack_message(input: &str) -> String {
 fn format_card_preview(card: &Card) -> String {
     let mode = match card.mode {
         Mode::Job => "JOB",
-        Mode::Agent => "AGENT",
+        Mode::Agent => "JOB",
         Mode::Cron => "CRON",
     };
     let status = match card.status {
@@ -3449,7 +3439,7 @@ fn bare_completion_candidates(mode: Mode, line_prefix: &str, word: &str) -> Vec<
     match mode {
         Mode::Job => shell_segment_completion_candidates(line_prefix, word),
         Mode::Cron => cron_completion_candidates(line_prefix, word),
-        Mode::Agent => Vec::new(),
+        Mode::Agent => shell_segment_completion_candidates(line_prefix, word),
     }
 }
 
@@ -3677,19 +3667,6 @@ fn job_sidebar_item(job: &JobRow) -> SidebarItem {
             JobStatus::Failed => "❌",
             JobStatus::Killed => "🛑",
             JobStatus::Cancelled(_) => "⏹",
-        },
-    }
-}
-
-fn agent_sidebar_item(agent: &AgentRow) -> SidebarItem {
-    SidebarItem {
-        id: agent.id.clone(),
-        label: agent.label.clone(),
-        status_icon: match agent.status {
-            AgentStatus::Running => "🔄",
-            AgentStatus::WaitingInput => "💬",
-            AgentStatus::Done => "✅",
-            AgentStatus::Failed => "❌",
         },
     }
 }
@@ -4638,7 +4615,7 @@ destination = "devbox"
         assert_eq!(state.focus, FocusArea::MainView);
         assert_eq!(
             state.display_tab_labels(),
-            vec![" agent A1  × ".to_string()]
+            vec![" session A1  × ".to_string()]
         );
         assert!(state.display_pane_content().contains("hello"));
     }
@@ -4670,7 +4647,7 @@ destination = "devbox"
         }
         assert_eq!(
             state.display_tab_labels(),
-            vec![" agent A1  × ".to_string()]
+            vec![" session A1  × ".to_string()]
         );
     }
 
@@ -4705,7 +4682,7 @@ destination = "devbox"
         assert_eq!(
             state.copy_target(),
             Some(CopyTarget {
-                label: "agent A1".into(),
+                label: "session A1".into(),
                 content: "id: A1\nstatus: waiting_input\nlabel: copilot\n\nhello".into(),
             })
         );
@@ -4797,7 +4774,7 @@ destination = "devbox"
             KeyModifiers::SHIFT,
         )));
 
-        assert_eq!(state.mode, Mode::Agent);
+        assert_eq!(state.mode, Mode::Cron);
         assert_eq!(state.focus, FocusArea::Sidebar);
     }
 
@@ -4811,7 +4788,7 @@ destination = "devbox"
             KeyModifiers::SHIFT,
         )));
 
-        assert_eq!(state.mode, Mode::Agent);
+        assert_eq!(state.mode, Mode::Cron);
         assert_eq!(state.focus, FocusArea::MainView);
     }
 
@@ -4878,7 +4855,7 @@ destination = "devbox"
         state.main_view.push_card("cargo test".into(), Mode::Job);
         state
             .main_view
-            .push_card("explain this".into(), Mode::Agent);
+            .push_card("every 5m cargo test".into(), Mode::Cron);
 
         assert_eq!(state.main_view.mode, Mode::Job);
         assert_eq!(
@@ -4892,7 +4869,7 @@ destination = "devbox"
         );
 
         state.update(AppMsg::ModeSwitch);
-        assert_eq!(state.main_view.mode, Mode::Agent);
+        assert_eq!(state.main_view.mode, Mode::Cron);
         assert_eq!(
             state
                 .main_view
@@ -4971,7 +4948,7 @@ destination = "devbox"
     fn clear_display_clears_all_logs_when_idle() {
         let mut state = AppState::new();
         state.main_view.push_card("job".into(), Mode::Job);
-        state.main_view.push_card("agent".into(), Mode::Agent);
+        state.main_view.push_card("cron".into(), Mode::Cron);
 
         state.update(AppMsg::ClearDisplay);
 
@@ -5113,7 +5090,7 @@ destination = "devbox"
         let mut state = AppState::new();
         let card_index = state
             .main_view
-            .push_card("explain this".into(), Mode::Agent);
+            .push_card("every 5m cargo test".into(), Mode::Cron);
         queue_pending(
             &mut state,
             1,
@@ -5148,7 +5125,7 @@ destination = "devbox"
         assert_eq!(card.status, CardStatus::Streaming);
         assert_eq!(
             state.display_tab_labels(),
-            vec![" agent A1  × ".to_string()]
+            vec![" session A1  × ".to_string()]
         );
         assert!(state.display_pane_content().contains("status: done"));
         assert!(state.display_pane_content().contains("hello"));
@@ -5177,7 +5154,7 @@ destination = "devbox"
         assert!(state.fg_is_agent());
         assert_eq!(
             state.display_tab_labels(),
-            vec![" agent A1  × ".to_string()]
+            vec![" session A1  × ".to_string()]
         );
         let card = state.main_view.cards.last().unwrap();
         assert_eq!(card.output, "opened session A1");

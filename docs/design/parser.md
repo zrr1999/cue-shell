@@ -106,7 +106,7 @@ enum Argument {
         schedule: CronSchedule,
         body: ChainNode,
     },
-    Empty,                      // for :jobs, :agents, :crons, :scopes, :help
+    Empty,                      // for :jobs, :agents (compat), :crons, :scopes, :help
 }
 
 /// Chain AST — tree structure
@@ -181,7 +181,7 @@ The Resolver transforms `Ast` → `RequestPayload`:
 
 1. **Mode injection**: `BareInput` → wraps with default command per current mode
    - JOB ⚡ → `:run`
-   - AGENT 🤖 → `:ask`
+    - AGENT 🤖 → `:ask` (compatibility bridge)
    - CRON ⏰ → `:cron`
 
 2. **Argument type validation**: ensures command gets correct argument type
@@ -272,24 +272,24 @@ Which argument type each command expects:
 | Command | Argument | Mode Params |
 |---|---|---|
 | `:run` | Chain | ✓ (retry, timeout, scope) |
-| `:ask` | Text | ✓ (model, agent) |
+| `:ask` | Text | ✓ (model, agent/bridge) |
 | `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (scope) |
-| `:spawn` | Text | ✓ (agent, role) |
+| `:spawn` | Text | ✓ (agent, bridge) |
 | `:kill` | IdRef | ✗ |
 | `:retry` | IdRef | ✗ |
 | `:out` | IdRef | ✗ |
 | `:fg` | IdRef | ✗ |
 | `:jobs` | Empty | ✗ |
-| `:agents` | Empty | ✗ |
+| `:agents` | Empty | ✗ (compat bridge) |
 | `:crons` | Empty | ✗ |
 | `:scopes` | Empty | ✗ |
 | `:env` | Text (subcommand) | ✗ |
 | `:cd` | Text (path) | ✗ |
 | `:scope` | Text (subcommand) | ✓ (new/fork) |
 | `:help` | Empty or Text | ✗ |
-| `:confirm` | Text | ✗ |
-| `:escalate` | Text | ✗ |
-| `:probe` | Text | ✗ |
+| `:confirm` | Text | ✗ (legacy) |
+| `:escalate` | Text | ✗ (legacy) |
+| `:probe` | Text | ✗ (legacy) |
 | `:pause` | IdRef | ✗ |
 | `:resume` | IdRef | ✗ |
 | `:config` | Text | ✗ |

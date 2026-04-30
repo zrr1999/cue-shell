@@ -131,7 +131,7 @@ pub enum CancelReason {
 - Job 不可变（dispatch 后状态机单向推进，不可回退）
 - stdout/stderr 使用环形缓冲区，有界内存
 
-## 四、Agent
+## 四、兼容桥接会话
 
 ### 核心定义
 
@@ -164,8 +164,7 @@ pub enum AgentKind {
 }
 
 pub enum AgentRole {
-    Planner,   // 单例，全局
-    Executor,  // 多实例
+    Bridge,    // 兼容层会话标记，不是产品核心角色
 }
 ```
 
@@ -180,9 +179,9 @@ pub enum AgentRole {
                                       └──────┘
 ```
 
-- `Running ↔ WaitingInput` 可来回切换（Agent 多次请求输入）
-- CLI Agent: `:fg` 移交完整 pty
-- API Agent: `:fg` 报错 `Agent A1 has no pty, use :out A1`
+- `Running ↔ WaitingInput` 可来回切换（兼容会话多次请求输入）
+- CLI bridge session: `:fg` 移交完整 pty
+- API bridge session: `:fg` 报错 `Agent A1 has no pty, use :out A1`
 
 ## 五、Cron
 
