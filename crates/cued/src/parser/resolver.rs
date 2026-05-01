@@ -22,16 +22,12 @@ pub enum ResolvedCommand {
         chain: core_pipeline::ChainNode,
         params: ModeParams,
     },
-    /// Send a prompt to the legacy session.
-    Ask { text: String, params: ModeParams },
     /// Add a cron job.
     Cron {
         schedule_text: String,
         chain: core_pipeline::ChainNode,
         params: ModeParams,
     },
-    /// Spawn a legacy session.
-    Spawn { text: String, params: ModeParams },
     /// Kill a job/session.
     Kill { id: String },
     /// Retry a failed job.
@@ -55,22 +51,14 @@ pub enum ResolvedCommand {
     Pause { id: String },
     /// Resume cron/session.
     Resume { id: String },
-    /// Probe (planner light query).
-    Probe { query: String },
     /// View log.
     Log { id: Option<String> },
     /// List jobs.
     Jobs,
-    /// List agents.
-    Agents,
     /// List crons.
     Crons,
     /// List scopes.
     Scopes,
-    /// Confirm prompt.
-    Confirm { text: String },
-    /// Escalate from executor.
-    Escalate { text: String },
     /// Environment operations.
     Env { subcommand: Option<String> },
     /// Change directory.
@@ -115,7 +103,7 @@ impl Resolver {
         }
 
         match mode {
-            Mode::Job | Mode::Agent => match argument {
+            Mode::Job => match argument {
                 Argument::Chain(chain) => Ok(ResolvedCommand::Run {
                     chain: convert_chain(chain),
                     params: ModeParams::new(),
@@ -153,10 +141,6 @@ impl Resolver {
                 },
                 _ => unreachable!("parser guarantees Chain for :run"),
             },
-            "ask" => ResolvedCommand::Ask {
-                text: extract_text(argument),
-                params,
-            },
             "cron" => match argument {
                 Argument::Chain(chain) => {
                     let (schedule, body) = split_bare_cron_chain(chain, span)?;
@@ -172,10 +156,6 @@ impl Resolver {
                     params,
                 },
                 _ => unreachable!("parser guarantees chain-like input for :cron"),
-            },
-            "spawn" => ResolvedCommand::Spawn {
-                text: extract_text(argument),
-                params,
             },
             "kill" => ResolvedCommand::Kill {
                 id: extract_id(argument),
@@ -217,9 +197,6 @@ impl Resolver {
             "resume" => ResolvedCommand::Resume {
                 id: extract_id(argument),
             },
-            "probe" => ResolvedCommand::Probe {
-                query: extract_text(argument),
-            },
             "log" => ResolvedCommand::Log {
                 id: match argument {
                     Argument::IdRef(k, n) => Some(format!("{k}{n}")),
@@ -227,15 +204,8 @@ impl Resolver {
                 },
             },
             "jobs" => ResolvedCommand::Jobs,
-            "agents" => ResolvedCommand::Agents,
             "crons" => ResolvedCommand::Crons,
             "scopes" => ResolvedCommand::Scopes,
-            "confirm" => ResolvedCommand::Confirm {
-                text: extract_text(argument),
-            },
-            "escalate" => ResolvedCommand::Escalate {
-                text: extract_text(argument),
-            },
             "env" => ResolvedCommand::Env {
                 subcommand: extract_optional_text(argument),
             },
@@ -341,7 +311,7 @@ fn extract_target_and_text(
             span,
             message: format!("`:{command}` requires a target and input"),
             kind: ParseErrorKind::MissingArgument,
-            suggestions: vec![format!(":{command} A1 your input")],
+            suggestions: vec![format!(":{command} J1 your input")],
         });
     };
     if rest.trim().is_empty() {
@@ -349,7 +319,7 @@ fn extract_target_and_text(
             span,
             message: format!("`:{command}` requires input after the target"),
             kind: ParseErrorKind::MissingArgument,
-            suggestions: vec![format!(":{command} A1 your input")],
+            suggestions: vec![format!(":{command} J1 your input")],
         });
     }
     Ok((id.to_string(), rest.trim().to_string()))
@@ -664,7 +634,6 @@ fn is_mode_help_request(argument: &Argument) -> bool {
 fn mode_help_topic(mode: Mode) -> &'static str {
     match mode {
         Mode::Job => "job",
-        Mode::Agent => "job",
         Mode::Cron => "cron",
     }
 }
@@ -694,23 +663,6 @@ mod tests {
     #[test]
     fn resolve_bare_question_in_job_mode_to_help() {
         let cmd = resolve("?", Mode::Job);
-        assert!(matches!(
-            cmd,
-            ResolvedCommand::Help {
-                topic: Some(ref topic)
-            } if topic == "job"
-        ));
-    }
-
-    #[test]
-    fn resolve_bare_agent() {
-        let cmd = resolve("explain this error", Mode::Agent);
-        assert!(matches!(cmd, ResolvedCommand::Run { .. }));
-    }
-
-    #[test]
-    fn resolve_bare_question_in_agent_mode_to_help() {
-        let cmd = resolve("?", Mode::Agent);
         assert!(matches!(
             cmd,
             ResolvedCommand::Help {
@@ -854,36 +806,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_ask() {
-        let cmd = resolve(":ask explain this error", Mode::Job);
-        match cmd {
-            ResolvedCommand::Ask { text, .. } => {
-                assert_eq!(text, "explain this error");
-            }
-            _ => panic!("expected Ask"),
-        }
-    }
-
-    #[test]
     fn resolve_send_target_and_data() {
-        let cmd = resolve(":send A1 continue with the fix", Mode::Job);
+        let cmd = resolve(":send J1 continue with the fix", Mode::Job);
         match cmd {
             ResolvedCommand::Send { id, data } => {
-                assert_eq!(id, "A1");
+                assert_eq!(id, "J1");
                 assert_eq!(data, "continue with the fix");
             }
             _ => panic!("expected Send"),
-        }
-    }
-
-    #[test]
-    fn resolve_probe_keeps_query_text() {
-        let cmd = resolve(":probe status J1", Mode::Job);
-        match cmd {
-            ResolvedCommand::Probe { query } => {
-                assert_eq!(query, "status J1");
-            }
-            _ => panic!("expected Probe"),
         }
     }
 

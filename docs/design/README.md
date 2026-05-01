@@ -1,7 +1,7 @@
 # Cue Shell — Design Overview
 
 > Architecture reference for cue-shell: a durable process substrate with TUI
-> frontends and a transitional weft-backed agent bridge.
+> frontends. Agent runtime concerns now live outside cue-shell.
 
 ## Architecture
 
@@ -45,12 +45,6 @@
 | **Chain** | — | Job orchestration graph (serial/parallel) |
 | **Pipeline** | — | Process pipe chain within a single Job |
 
-Compatibility surface:
-
-| Surface | Description |
-|---|---|
-| **Agent** | Transitional bridge backed by weft; not a primary product primitive |
-
 ## Operator Model (Two Layers)
 
 ```
@@ -68,7 +62,6 @@ Priority: pipe (1) > parallel (2) > serial (3).
 |---|---|---|
 | JOB ⚡ | `[JOB ⚡] > _` | `:run <input>` |
 | CRON ⏰ | `[CRON ⏰] > _` | `:cron <input>` |
-| AGENT 🤖 | `[AGENT 🤖] > _` | compatibility bridge → `:ask <input>` |
 
 Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless of mode.
 
@@ -76,13 +69,12 @@ Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless o
 
 ```
 :run(retry=3, timeout=30s) cargo test
-:ask(model=gpt-4) explain this error
 :cron(scope=S0@a3f1) every 5m cargo clippy
 ```
 
 Parenthesized `key=value` pairs immediately after the command name configure
-execution behavior. They override `config.toml` defaults. Only "launcher" commands
-support mode params: `:run`, `:ask`, `:cron`, `:spawn`, `:scope new`.
+execution behavior. They override `config.toml` defaults. Only launcher-style
+commands support mode params: `:run`, `:cron`, `:scope new`.
 
 ## Scope Model
 
@@ -103,14 +95,14 @@ Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default sc
 - **Model**: Request/Response + Event push, multiplexed on a single connection
 - **Eval-centric**: user commands sent as raw strings via `Eval { input, mode }`;
   cued owns the full parser (Tokenizer → Parser → Resolver)
-- **Subscriptions**: channel model (`jobs`, `agents`, `crons`, `output:J1`, `scopes`, `system`) — `agents` is compatibility-only
+- **Subscriptions**: channel model (`jobs`, `crons`, `output:J1`, `scopes`, `system`)
 
 ## Storage (Three Layers)
 
 | Layer | What | Where |
 |---|---|---|
 | In-memory | Ring buffers (per-Job, 1 MiB), active state | cued process |
-| File system | Output logs (`J1.log`, `A1.log`) | `$XDG_DATA_HOME/cue-shell/output/` |
+| File system | Output logs (`J1.log`) | `$XDG_DATA_HOME/cue-shell/output/` |
 | SQLite | Scopes, Crons, job history, config | `$XDG_DATA_HOME/cue-shell/cued.db` |
 
 ## Design Documents
@@ -118,7 +110,7 @@ Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default sc
 | Document | Contents |
 |---|---|
 | [commands-and-modes.md](commands-and-modes.md) | Complete command reference, modes, cron syntax |
-| [core-types.md](core-types.md) | Rust type definitions — Scope, Job, Cron, Pipeline, Chain, compatibility surfaces |
+| [core-types.md](core-types.md) | Rust type definitions — Scope, Job, Cron, Pipeline, Chain |
 | [tui.md](tui.md) | TUI architecture, layout, interaction design |
 | [ipc-protocol.md](ipc-protocol.md) | cued ↔ client protocol specification |
 | [parser.md](parser.md) | Command parser — tokenizer, grammar, completion |

@@ -57,7 +57,6 @@ impl StatusBar {
     fn mode_label(&self) -> &'static str {
         match self.mode {
             Mode::Job => "JOB",
-            Mode::Agent => "JOB",
             Mode::Cron => "CRON",
         }
     }
@@ -185,8 +184,8 @@ impl Component for StatusBar {
             "(-)".to_string()
         };
         let counts = format!(
-            "J:{} {}  A:{}  C:{}",
-            self.overview.jobs, running, self.overview.agents, self.overview.crons
+            "J:{} {}  C:{}",
+            self.overview.jobs, running, self.overview.crons
         );
         let left = Line::from(vec![
             Span::styled(

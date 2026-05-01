@@ -443,28 +443,6 @@ async fn route_request(
                 .await?;
         }
 
-        RequestPayload::AgentPrompt { id, prompt } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::Send { id, data: prompt },
-                })
-                .await
-                .context("send agent prompt to scheduler")?;
-        }
-
-        RequestPayload::AgentCancel { id } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::Cancel { id },
-                })
-                .await
-                .context("send agent cancel to scheduler")?;
-        }
-
         RequestPayload::Ping {} => {
             sys.gateway
                 .send(GatewayMsg::SendResponse {
@@ -511,9 +489,6 @@ async fn route_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::{EventBusMsg, ProcessMgrMsg, ScopeStoreMsg};
-    use crate::config::Config;
-    use crate::parser::resolver::ResolvedCommand;
 
     #[tokio::test]
     async fn message_framing_roundtrip() {
@@ -555,86 +530,5 @@ mod tests {
                 payload: ResponsePayload::Ok(OkPayload::Pong {}),
             }
         ));
-    }
-
-    fn test_actor_system() -> (ActorSystem, mpsc::Receiver<SchedulerMsg>) {
-        let (gw_tx, _gw_rx) = mpsc::channel::<GatewayMsg>(8);
-        let (sched_tx, sched_rx) = mpsc::channel::<SchedulerMsg>(8);
-        let (pm_tx, _pm_rx) = mpsc::channel::<ProcessMgrMsg>(8);
-        let (ss_tx, _ss_rx) = mpsc::channel::<ScopeStoreMsg>(8);
-        let (eb_tx, _eb_rx) = mpsc::channel::<EventBusMsg>(8);
-        (
-            ActorSystem {
-                gateway: gw_tx,
-                scheduler: sched_tx,
-                process_mgr: pm_tx,
-                scope_store: ss_tx,
-                event_bus: eb_tx,
-                config: Config::default(),
-            },
-            sched_rx,
-        )
-    }
-
-    #[tokio::test]
-    async fn agent_prompt_routes_through_send_command() {
-        let (sys, mut sched_rx) = test_actor_system();
-        let (evt_tx, _evt_rx) = mpsc::channel::<EventPayload>(1);
-
-        route_request(
-            9,
-            42,
-            RequestPayload::AgentPrompt {
-                id: "A3".into(),
-                prompt: "follow up".into(),
-            },
-            &sys,
-            &evt_tx,
-        )
-        .await
-        .expect("route prompt request");
-
-        match sched_rx.recv().await.expect("scheduler message") {
-            SchedulerMsg::Eval {
-                client_id,
-                request_id,
-                command: ResolvedCommand::Send { id, data },
-            } => {
-                assert_eq!(client_id, 9);
-                assert_eq!(request_id, 42);
-                assert_eq!(id, "A3");
-                assert_eq!(data, "follow up");
-            }
-            _ => panic!("unexpected scheduler message"),
-        }
-    }
-
-    #[tokio::test]
-    async fn agent_cancel_routes_through_cancel_command() {
-        let (sys, mut sched_rx) = test_actor_system();
-        let (evt_tx, _evt_rx) = mpsc::channel::<EventPayload>(1);
-
-        route_request(
-            5,
-            7,
-            RequestPayload::AgentCancel { id: "A8".into() },
-            &sys,
-            &evt_tx,
-        )
-        .await
-        .expect("route cancel request");
-
-        match sched_rx.recv().await.expect("scheduler message") {
-            SchedulerMsg::Eval {
-                client_id,
-                request_id,
-                command: ResolvedCommand::Cancel { id },
-            } => {
-                assert_eq!(client_id, 5);
-                assert_eq!(request_id, 7);
-                assert_eq!(id, "A8");
-            }
-            _ => panic!("unexpected scheduler message"),
-        }
     }
 }

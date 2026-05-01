@@ -27,7 +27,7 @@ pub enum Argument {
     Chain(ChainNode),
     /// Entity ID reference (for `:kill`, `:out`, `:fg`, `:retry`).
     IdRef(IdKind, u32),
-    /// Free-form text (for `:ask`, `:confirm`).
+    /// Free-form text arguments for builtins like `:send`.
     Text(String),
     /// Cron expression: schedule + body.
     CronExpr {
@@ -36,7 +36,7 @@ pub enum Argument {
     },
     /// Entity ID with optional byte count (for `:tail J3 1024`).
     TailRef(IdKind, u32, Option<usize>),
-    /// No argument (`:jobs`, `:agents`, `:help`).
+    /// No argument (`:jobs`, `:crons`, `:help`).
     Empty,
 }
 

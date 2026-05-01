@@ -15,11 +15,10 @@ use crossterm::event::{
 };
 
 use cue_core::Mode;
-use cue_core::agent::AgentStatus;
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
-    AgentInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload,
-    ResponsePayload, Stream,
+    CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload, ResponsePayload,
+    Stream,
 };
 use cue_core::job::JobStatus;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -116,13 +115,6 @@ struct JobRow {
 }
 
 #[derive(Debug, Clone)]
-struct AgentRow {
-    id: String,
-    label: String,
-    status: AgentStatus,
-}
-
-#[derive(Debug, Clone)]
 struct CronRow {
     id: String,
     label: String,
@@ -136,13 +128,6 @@ struct PendingSubmission {
     mode: Mode,
     warnings: Vec<String>,
     silent: bool,
-    session_target: Option<String>,
-}
-
-struct AgentSession {
-    status: AgentStatus,
-    transcript: String,
-    last_role: Option<String>,
 }
 
 enum FgSessionKind {
@@ -150,7 +135,6 @@ enum FgSessionKind {
         card_index: Option<usize>,
         parser: Box<vt100::Parser>,
     },
-    Agent,
 }
 
 struct FgSession {
@@ -189,7 +173,6 @@ struct CopyTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DisplayTarget {
     Output { id: String, stream: DisplayStream },
-    AgentSession { id: String },
     Preview { key: String, title: String },
 }
 
@@ -294,7 +277,6 @@ impl PendingSubmission {
             mode,
             warnings,
             silent: false,
-            session_target: None,
         }
     }
 
@@ -305,18 +287,6 @@ impl PendingSubmission {
             mode: Mode::default(),
             warnings: Vec::new(),
             silent: true,
-            session_target: None,
-        }
-    }
-
-    fn session(agent_id: String) -> Self {
-        Self {
-            card_index: None,
-            input: String::new(),
-            mode: Mode::Agent,
-            warnings: Vec::new(),
-            silent: true,
-            session_target: Some(agent_id),
         }
     }
 }
@@ -354,12 +324,10 @@ pub struct AppState {
 
     // Entity state mirrored into the mode-specific sidebar.
     jobs: Vec<JobRow>,
-    agents: Vec<AgentRow>,
     crons: Vec<CronRow>,
     job_cards: HashMap<String, usize>,
     /// Maps chain_id → card_index for chain cards.
     chain_cards: HashMap<String, usize>,
-    agent_sessions: HashMap<String, AgentSession>,
     fg_session: Option<FgSession>,
     display_tabs: Vec<DisplayTab>,
     active_display_tab: Option<usize>,
@@ -393,11 +361,9 @@ impl AppState {
             reconnect_tx: None,
             pending_reconnect_profile_name: None,
             jobs: Vec::new(),
-            agents: Vec::new(),
             crons: Vec::new(),
             job_cards: HashMap::new(),
             chain_cards: HashMap::new(),
-            agent_sessions: HashMap::new(),
             fg_session: None,
             display_tabs: Vec::new(),
             active_display_tab: None,
@@ -446,30 +412,14 @@ impl AppState {
         self.fg_session.is_some()
     }
 
-    pub fn fg_is_agent(&self) -> bool {
-        self.fg_session
-            .as_ref()
-            .is_some_and(|session| matches!(session.kind, FgSessionKind::Agent))
-    }
-
     pub fn fg_id(&self) -> Option<&str> {
         self.fg_session.as_ref().map(|session| session.id.as_str())
     }
 
     pub fn fg_screen(&self) -> Option<&vt100::Screen> {
-        self.fg_session
-            .as_ref()
-            .and_then(|session| match &session.kind {
-                FgSessionKind::Job { parser, .. } => Some(parser.screen()),
-                FgSessionKind::Agent => None,
-            })
-    }
-
-    pub fn fg_agent_content(&self) -> Option<String> {
-        self.fg_session
-            .as_ref()
-            .filter(|session| matches!(session.kind, FgSessionKind::Agent))
-            .map(|session| self.render_agent_session_content(&session.id))
+        let session = self.fg_session.as_ref()?;
+        let FgSessionKind::Job { parser, .. } = &session.kind;
+        Some(parser.screen())
     }
 
     pub fn display_pane_title(&self) -> String {
@@ -481,7 +431,7 @@ impl AppState {
             .and_then(|index| self.display_tabs.get(index))
             .map(|tab| tab.content.as_str())
             .unwrap_or(
-                "Use `:out J1` for a stdout snapshot, `:tail J1` to follow live stdout, or `:err J1` for stderr.\nOpen session rows here for history, or use `:fg A1` for fullscreen conversation.",
+                "Use `:out J1` for a stdout snapshot, `:tail J1` to follow live stdout, or `:err J1` for stderr.",
             )
     }
 
@@ -526,7 +476,7 @@ impl AppState {
 
         match self.focus {
             FocusArea::Input => match self.mode {
-                Mode::Job | Mode::Agent => {
+                Mode::Job => {
                     "JOB: Enter submit  •  Shift+Enter newline  •  Tab complete  •  Shift+Tab mode"
                         .to_string()
                 }
@@ -548,33 +498,6 @@ impl AppState {
         }
     }
 
-    pub fn fg_agent_status(&self) -> Option<AgentStatus> {
-        let agent_id = self
-            .fg_session
-            .as_ref()
-            .filter(|session| matches!(session.kind, FgSessionKind::Agent))
-            .map(|session| session.id.as_str())?;
-        self.agent_sessions
-            .get(agent_id)
-            .map(|session| session.status.clone())
-            .or_else(|| {
-                self.agents
-                    .iter()
-                    .find(|agent| agent.id == agent_id)
-                    .map(|agent| agent.status.clone())
-            })
-    }
-
-    pub fn fg_agent_footer_text(&self) -> String {
-        let status = self
-            .fg_agent_status()
-            .map(format_agent_status)
-            .unwrap_or("unknown");
-        format!(
-            "SESSION {status}: Enter send prompt  •  Shift+Enter newline  •  Ctrl+C cancel turn  •  Ctrl+Y copy transcript  •  Ctrl+Z detach"
-        )
-    }
-
     pub fn display_tab_labels(&self) -> Vec<String> {
         self.display_tabs
             .iter()
@@ -583,7 +506,6 @@ impl AppState {
                     let prefix = if tab.follow { " follow" } else { "" };
                     format!("{prefix} {} {}  × ", stream.label(), id)
                 }
-                DisplayTarget::AgentSession { id } => format!(" session {id}  × "),
                 DisplayTarget::Preview { title, .. } => format!(" {title}  × "),
             })
             .collect()
@@ -594,19 +516,7 @@ impl AppState {
     }
 
     fn copy_target(&self) -> Option<CopyTarget> {
-        if let Some(agent_id) = self.fg_id().filter(|_| self.fg_is_agent()) {
-            return Some(CopyTarget {
-                label: format!("session {agent_id}"),
-                content: self
-                    .fg_agent_content()
-                    .unwrap_or_else(|| "No conversation yet.".to_string()),
-            });
-        }
-
-        if let Some(job_id) = self
-            .fg_id()
-            .filter(|_| self.fg_active() && !self.fg_is_agent())
-        {
+        if let Some(job_id) = self.fg_id().filter(|_| self.fg_active()) {
             return Some(CopyTarget {
                 label: format!("fg {job_id}"),
                 content: self
@@ -631,7 +541,6 @@ impl AppState {
         {
             let label = match &tab.target {
                 DisplayTarget::Output { id, stream } => format!("{} {id}", stream.label()),
-                DisplayTarget::AgentSession { id } => format!("session {id}"),
                 DisplayTarget::Preview { title, .. } => title.clone(),
             };
             return Some(CopyTarget {
@@ -763,7 +672,6 @@ impl AppState {
     fn sync_sidebar_items(&mut self) {
         let items = match self.mode {
             Mode::Job => self.jobs.iter().rev().map(job_sidebar_item).collect(),
-            Mode::Agent => self.jobs.iter().rev().map(job_sidebar_item).collect(),
             Mode::Cron => self.crons.iter().rev().map(cron_sidebar_item).collect(),
         };
         self.sidebar.update(SidebarMsg::SetItems(items));
@@ -778,7 +686,6 @@ impl AppState {
                 .iter()
                 .filter(|job| matches!(job.status, JobStatus::Running))
                 .count() as u32,
-            agents: self.agents.len() as u32,
             crons: self.crons.len() as u32,
         };
         self.set_overview(counts);
@@ -816,97 +723,6 @@ impl AppState {
         );
         self.main_view.set_card_status(card_index, status);
         card_index
-    }
-
-    fn ensure_agent_session(&mut self, agent_id: &str) -> &mut AgentSession {
-        let status = self
-            .agents
-            .iter()
-            .find(|agent| agent.id == agent_id)
-            .map(|agent| agent.status.clone())
-            .unwrap_or(AgentStatus::Running);
-        self.agent_sessions
-            .entry(agent_id.to_string())
-            .or_insert_with(|| AgentSession {
-                status,
-                transcript: String::new(),
-                last_role: None,
-            })
-    }
-
-    fn render_agent_session_content(&self, agent_id: &str) -> String {
-        let session = self.agent_sessions.get(agent_id);
-        let status = session
-            .map(|session| session.status.clone())
-            .or_else(|| {
-                self.agents
-                    .iter()
-                    .find(|agent| agent.id == agent_id)
-                    .map(|agent| agent.status.clone())
-            })
-            .unwrap_or(AgentStatus::Running);
-        let label = self
-            .agents
-            .iter()
-            .find(|agent| agent.id == agent_id)
-            .map(|agent| agent.label.as_str())
-            .unwrap_or("legacy session");
-        let transcript = session
-            .map(|session| session.transcript.trim_end())
-            .filter(|transcript| !transcript.is_empty())
-            .unwrap_or("No conversation yet.");
-        format!(
-            "id: {agent_id}\nstatus: {}\nlabel: {label}\n\n{transcript}",
-            format_agent_status(status)
-        )
-    }
-
-    fn refresh_agent_session_tabs(&mut self, agent_id: &str) {
-        let content = self.render_agent_session_content(agent_id);
-        for tab in &mut self.display_tabs {
-            if matches!(&tab.target, DisplayTarget::AgentSession { id } if id == agent_id) {
-                tab.content = content.clone();
-            }
-        }
-    }
-
-    fn open_agent_session_display(&mut self, agent_id: &str) {
-        self.ensure_agent_session(agent_id);
-        let content = self.render_agent_session_content(agent_id);
-        if let Some(index) = self.display_tabs.iter().position(
-            |tab| matches!(&tab.target, DisplayTarget::AgentSession { id } if id == agent_id),
-        ) {
-            self.display_tabs[index].content = content;
-            self.active_display_tab = Some(index);
-            return;
-        }
-
-        self.display_tabs.push(DisplayTab {
-            target: DisplayTarget::AgentSession {
-                id: agent_id.to_string(),
-            },
-            content,
-            follow: false,
-        });
-        self.active_display_tab = Some(self.display_tabs.len() - 1);
-    }
-
-    fn append_agent_session_message(&mut self, agent_id: &str, role: &str, content: &str) {
-        if content.is_empty() {
-            return;
-        }
-
-        let session = self.ensure_agent_session(agent_id);
-        let same_role = session.last_role.as_deref() == Some(role);
-        if !session.transcript.is_empty() && !same_role {
-            session.transcript.push_str("\n\n");
-        }
-        if !same_role && role != "assistant" {
-            session.transcript.push_str(&format!("[{role}] "));
-        }
-        session.transcript.push_str(content);
-        session.last_role = Some(role.to_string());
-        self.refresh_agent_session_tabs(agent_id);
     }
 
     fn sync_display_subscriptions(&mut self) {
@@ -1433,47 +1249,17 @@ impl AppState {
         }
     }
 
-    fn enqueue_session_request(
-        &mut self,
-        payload: RequestPayload,
-        description: &str,
-        agent_id: String,
-    ) -> bool {
-        let Some(writer) = &self.writer else {
-            return false;
-        };
-        match writer.try_send(payload) {
-            Ok(request_id) => {
-                self.track_pending_submission(request_id, PendingSubmission::session(agent_id));
-                true
-            }
-            Err(error) => {
-                tracing::warn!("failed to send {description}: {error}");
-                false
-            }
-        }
-    }
-
     fn subscribe_core_channels(&mut self) {
         let _ = self.enqueue_silent_request(
             RequestPayload::Subscribe {
-                channels: vec![
-                    "jobs".into(),
-                    "agents".into(),
-                    "crons".into(),
-                    "system".into(),
-                ],
+                channels: vec!["jobs".into(), "crons".into(), "system".into()],
             },
             "core subscriptions",
         );
     }
 
     fn request_sidebar_snapshots(&mut self) {
-        for (input, mode) in [
-            (":jobs", Mode::Job),
-            (":crons", Mode::Cron),
-            (":agents", Mode::Agent),
-        ] {
+        for (input, mode) in [(":jobs", Mode::Job), (":crons", Mode::Cron)] {
             if !self.enqueue_silent_request(
                 RequestPayload::Eval {
                     input: input.to_string(),
@@ -1496,13 +1282,6 @@ impl AppState {
 
     fn start_fg_session(&mut self, id: String, card_index: Option<usize>) {
         if id.starts_with('A') {
-            self.ensure_agent_session(&id);
-            self.fg_session = Some(FgSession {
-                id,
-                kind: FgSessionKind::Agent,
-            });
-            self.input.update(InputMsg::SetMode(Mode::Agent));
-            self.set_focus(FocusArea::Input);
             return;
         }
 
@@ -1584,14 +1363,6 @@ impl AppState {
         }
     }
 
-    fn request_fg_attach(&mut self, id: &str) -> bool {
-        self.enqueue_session_request(
-            RequestPayload::FgAttach { id: id.to_string() },
-            "foreground attach",
-            id.to_string(),
-        )
-    }
-
     fn copy_focus(&self) {
         let Some(target) = self.copy_target() else {
             return;
@@ -1601,71 +1372,10 @@ impl AppState {
         }
     }
 
-    fn send_agent_session_request(
-        &mut self,
-        agent_id: String,
-        payload: RequestPayload,
-        transport_error: impl FnOnce(String) -> String,
-    ) {
-        let Some(writer) = self.writer.clone() else {
-            self.append_agent_session_message(
-                &agent_id,
-                "system",
-                &transport_error("cued is not connected".to_string()),
-            );
-            return;
-        };
-
-        let request_id = match writer.try_send(payload) {
-            Ok(request_id) => request_id,
-            Err(error) => {
-                self.append_agent_session_message(
-                    &agent_id,
-                    "system",
-                    &transport_error(error.to_string()),
-                );
-                return;
-            }
-        };
-        self.track_pending_submission(request_id, PendingSubmission::session(agent_id));
-        self.refresh_clear_action();
-    }
-
-    fn submit_fg_agent_prompt(&mut self, agent_id: &str, prompt: String) {
-        self.input.update(InputMsg::Clear);
-        if prompt.trim().is_empty() {
-            return;
-        }
-
-        self.open_agent_session_display(agent_id);
-        self.send_agent_session_request(
-            agent_id.to_string(),
-            RequestPayload::AgentPrompt {
-                id: agent_id.to_string(),
-                prompt,
-            },
-            |error| format!("failed to send follow-up prompt: {error}"),
-        );
-    }
-
-    fn cancel_fg_agent_turn(&mut self, agent_id: &str) {
-        self.open_agent_session_display(agent_id);
-        self.send_agent_session_request(
-            agent_id.to_string(),
-            RequestPayload::AgentCancel {
-                id: agent_id.to_string(),
-            },
-            |error| format!("failed to cancel current turn: {error}"),
-        );
-    }
-
     fn fail_pending_submissions(&mut self, message: &str) {
         let pending = std::mem::take(&mut self.pending_submissions);
         for (_, pending) in pending {
             if pending.silent {
-                if let Some(agent_id) = pending.session_target {
-                    self.append_agent_session_message(&agent_id, "system", message);
-                }
                 continue;
             }
             self.show_submission_result(&pending, message.to_string(), CardStatus::Error, None);
@@ -1763,46 +1473,6 @@ impl AppState {
         self.main_view.set_card_status(card_index, status);
     }
 
-    fn upsert_agent(&mut self, id: String, label: String, status: AgentStatus) {
-        if let Some(index) = self.agents.iter().position(|agent| agent.id == id) {
-            let agent_id = self.agents[index].id.clone();
-            if !label.is_empty() {
-                self.agents[index].label = label;
-            }
-            self.agents[index].status = status.clone();
-            let session = self.ensure_agent_session(&agent_id);
-            session.status = status;
-            self.refresh_agent_session_tabs(&agent_id);
-            return;
-        }
-
-        self.agents.push(AgentRow {
-            id: id.clone(),
-            label,
-            status: status.clone(),
-        });
-        self.ensure_agent_session(&id).status = status;
-        self.refresh_agent_session_tabs(&id);
-    }
-
-    fn update_agent_status(&mut self, id: &str, status: AgentStatus) {
-        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
-            agent.status = status.clone();
-        } else {
-            self.agents.push(AgentRow {
-                id: id.to_string(),
-                label: id.to_string(),
-                status: status.clone(),
-            });
-        }
-        self.ensure_agent_session(id).status = status;
-        self.refresh_agent_session_tabs(id);
-    }
-
-    fn append_agent_message(&mut self, agent_id: &str, role: &str, content: &str) {
-        self.append_agent_session_message(agent_id, role, content);
-    }
-
     fn upsert_cron(&mut self, id: String, label: String, status: CronStatus) {
         if let Some(cron) = self.crons.iter_mut().find(|cron| cron.id == id) {
             if !label.is_empty() {
@@ -1829,35 +1499,6 @@ impl AppState {
             .collect();
     }
 
-    fn replace_agents(&mut self, list: Vec<AgentInfo>) {
-        let session_snapshots = list
-            .iter()
-            .map(|agent| {
-                (
-                    agent.id.clone(),
-                    agent.status.clone(),
-                    agent.transcript.clone(),
-                    agent.last_role.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        self.agents = list
-            .into_iter()
-            .map(|agent| AgentRow {
-                id: agent.id,
-                label: format!("{} {}", agent.role, agent.backend),
-                status: agent.status,
-            })
-            .collect();
-        for (agent_id, status, transcript, last_role) in session_snapshots {
-            let session = self.ensure_agent_session(&agent_id);
-            session.status = status;
-            session.transcript = transcript;
-            session.last_role = last_role;
-            self.refresh_agent_session_tabs(&agent_id);
-        }
-    }
-
     fn replace_crons(&mut self, list: Vec<CronInfo>) {
         self.crons = list
             .into_iter()
@@ -1867,16 +1508,6 @@ impl AppState {
                 status: cron.status,
             })
             .collect();
-    }
-
-    fn open_agent_row(&mut self, row: usize) {
-        let Some(agent) = self.agents.get(row).cloned() else {
-            return;
-        };
-        self.open_agent_session_display(&agent.id);
-        if !self.request_fg_attach(&agent.id) {
-            self.set_focus(FocusArea::MainView);
-        }
     }
 
     fn open_cron_row(&mut self, row: usize) {
@@ -1915,11 +1546,6 @@ impl AppState {
                     format!(":out {}", job.id)
                 };
                 self.update(AppMsg::Submit(command));
-            }
-            Mode::Agent => {
-                if let Some(idx) = self.sidebar_row_to_index(row, self.agents.len()) {
-                    self.open_agent_row(idx);
-                }
             }
             Mode::Cron => {
                 if let Some(idx) = self.sidebar_row_to_index(row, self.crons.len()) {
@@ -1981,27 +1607,22 @@ impl AppState {
                 .iter()
                 .map(|job| job.id.clone())
                 .collect::<Vec<_>>(),
-            ":fg" | ":wait" => {
-                let mut ids = self
-                    .jobs
-                    .iter()
-                    .map(|job| job.id.clone())
-                    .collect::<Vec<_>>();
-                ids.extend(self.agents.iter().map(|agent| agent.id.clone()));
-                ids
-            }
-            ":send" => self
-                .agents
+            ":fg" | ":wait" => self
+                .jobs
                 .iter()
-                .map(|agent| agent.id.clone())
+                .map(|job| job.id.clone())
                 .collect::<Vec<_>>(),
-            ":kill" | ":cancel" | ":pause" | ":resume" | ":probe" | ":log" => {
+            ":send" => self
+                .jobs
+                .iter()
+                .map(|job| job.id.clone())
+                .collect::<Vec<_>>(),
+            ":kill" | ":cancel" | ":pause" | ":resume" | ":log" => {
                 let mut ids = self
                     .jobs
                     .iter()
                     .map(|job| job.id.clone())
                     .collect::<Vec<_>>();
-                ids.extend(self.agents.iter().map(|agent| agent.id.clone()));
                 ids.extend(self.crons.iter().map(|cron| cron.id.clone()));
                 ids
             }
@@ -2022,7 +1643,7 @@ impl AppState {
             AppMsg::Resize(w, h) => {
                 self.terminal_width = w;
                 self.terminal_height = h;
-                if self.fg_active() && !self.fg_is_agent() {
+                if self.fg_active() {
                     let (cols, rows) = self.fg_terminal_size();
                     self.resize_fg_session(cols, rows);
                     self.send_fg_resize(cols, rows);
@@ -2075,10 +1696,6 @@ impl AppState {
             }
 
             AppMsg::Paste(text) => {
-                if self.fg_is_agent() {
-                    self.input.insert_text(&text);
-                    return;
-                }
                 if self.fg_active() {
                     self.send_fg_input(fg_paste_bytes(&text, self.fg_bracketed_paste()));
                     return;
@@ -2091,16 +1708,6 @@ impl AppState {
             }
 
             AppMsg::Submit(text) => {
-                if let Some(agent_id) = self
-                    .fg_session
-                    .as_ref()
-                    .filter(|session| matches!(session.kind, FgSessionKind::Agent))
-                    .map(|session| session.id.clone())
-                {
-                    self.submit_fg_agent_prompt(&agent_id, text);
-                    return;
-                }
-
                 if let Some(local) = parse_local_command(&text) {
                     self.input.update(InputMsg::Clear);
                     match local {
@@ -2159,15 +1766,11 @@ impl AppState {
 
             AppMsg::Disconnected => {
                 self.fail_pending_submissions("Error [transport]: cued disconnected");
-                let had_agent_fg = self.fg_is_agent();
                 self.fg_session = None;
                 self.connected = false;
                 self.writer = None;
                 self.close_job_picker();
                 self.status_bar.update(StatusBarMsg::SetConnected(false));
-                if had_agent_fg {
-                    self.sync_mode_views();
-                }
             }
 
             AppMsg::Reconnected { writer } => {
@@ -2199,22 +1802,12 @@ impl AppState {
                             if let Some(pending) = pending.as_ref()
                                 && !pending.silent
                             {
-                                if let Some(agent_id) =
-                                    submission_agent_target(&pending.input, pending.mode)
-                                {
-                                    self.open_agent_session_display(&agent_id);
-                                }
                                 self.show_submission_result(
                                     pending,
                                     format_ack_message(&pending.input),
                                     CardStatus::Success,
                                     None,
                                 );
-                            } else if let Some(agent_id) = pending
-                                .as_ref()
-                                .and_then(|pending| pending.session_target.clone())
-                            {
-                                self.refresh_agent_session_tabs(&agent_id);
                             }
                         }
                         OkPayload::JobCreated {
@@ -2276,55 +1869,22 @@ impl AppState {
                                 }
                             }
                         }
-                        OkPayload::AgentSpawned { agent_id } => {
-                            let label = pending
-                                .as_ref()
-                                .map(|pending| normalize_command_label(&pending.input))
-                                .unwrap_or_else(|| agent_id.clone());
-                            self.upsert_agent(agent_id.clone(), label, AgentStatus::Running);
-                            self.sync_sidebar_items();
-                            if let Some(pending) = pending.as_ref()
-                                && !pending.silent
-                            {
-                                self.show_submission_result(
-                                    pending,
-                                    format!("opened session {agent_id}"),
-                                    CardStatus::Streaming,
-                                    Some(agent_id.clone()),
-                                );
-                            }
-                            self.open_agent_session_display(&agent_id);
-                        }
                         OkPayload::FgAttached { id } => {
                             let card_index = if let Some(pending) = pending.as_ref()
                                 && !pending.silent
                             {
-                                let card_status = if id.starts_with('A') {
-                                    CardStatus::Success
-                                } else {
-                                    CardStatus::Streaming
-                                };
                                 Some(self.show_submission_result(
                                     pending,
-                                    if id.starts_with('A') {
-                                        format!("opened session {id}")
-                                    } else {
-                                        id.clone()
-                                    },
-                                    card_status,
+                                    id.clone(),
+                                    CardStatus::Streaming,
                                     Some(id.clone()),
                                 ))
                             } else {
                                 None
                             };
-                            if id.starts_with('A') {
-                                self.open_agent_session_display(&id);
-                            }
                             self.start_fg_session(id.clone(), card_index);
-                            if !id.starts_with('A') {
-                                let (cols, rows) = self.fg_terminal_size();
-                                self.send_fg_resize(cols, rows);
-                            }
+                            let (cols, rows) = self.fg_terminal_size();
+                            self.send_fg_resize(cols, rows);
                         }
                         OkPayload::CronAdded { cron_id } => {
                             let label = pending
@@ -2366,21 +1926,6 @@ impl AppState {
                                 self.show_submission_result(
                                     pending,
                                     format!("loaded {count} job(s) into sidebar"),
-                                    CardStatus::Success,
-                                    None,
-                                );
-                            }
-                        }
-                        OkPayload::AgentList(list) => {
-                            let count = list.len();
-                            self.replace_agents(list);
-                            self.sync_sidebar_items();
-                            if let Some(pending) = pending.as_ref()
-                                && !pending.silent
-                            {
-                                self.show_submission_result(
-                                    pending,
-                                    format!("loaded {count} agent(s) into sidebar"),
                                     CardStatus::Success,
                                     None,
                                 );
@@ -2468,23 +2013,15 @@ impl AppState {
                         }
                     },
                     ResponsePayload::Err { code, message } => {
-                        if let Some(pending) = pending.as_ref() {
-                            if pending.silent {
-                                if let Some(agent_id) = pending.session_target.as_deref() {
-                                    self.append_agent_session_message(
-                                        agent_id,
-                                        "system",
-                                        &format!("Error [{code}]: {message}"),
-                                    );
-                                }
-                            } else {
-                                self.show_submission_result(
-                                    pending,
-                                    format!("Error [{code}]: {message}"),
-                                    CardStatus::Error,
-                                    None,
-                                );
-                            }
+                        if let Some(pending) = pending.as_ref()
+                            && !pending.silent
+                        {
+                            self.show_submission_result(
+                                pending,
+                                format!("Error [{code}]: {message}"),
+                                CardStatus::Error,
+                                None,
+                            );
                         }
                     }
                 }
@@ -2587,21 +2124,6 @@ impl AppState {
                         self.main_view.set_card_status(card_index, status);
                     }
                 }
-                EventPayload::AgentStateChanged {
-                    agent_id,
-                    old_state: _,
-                    new_state,
-                } => {
-                    self.update_agent_status(&agent_id, new_state);
-                    self.sync_sidebar_items();
-                }
-                EventPayload::AgentMessage {
-                    agent_id,
-                    role,
-                    content,
-                } => {
-                    self.append_agent_message(&agent_id, &role, &content);
-                }
                 EventPayload::FgOutput { data } => {
                     self.append_fg_output(&data);
                 }
@@ -2626,33 +2148,6 @@ impl AppState {
 
             AppMsg::KeyEvent(key) => {
                 if self.fg_active() && key.kind == KeyEventKind::Press {
-                    if self.fg_is_agent() {
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && matches!(key.code, KeyCode::Char('z'))
-                        {
-                            self.detach_fg_session();
-                            return;
-                        }
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && matches!(key.code, KeyCode::Char('c'))
-                        {
-                            if let Some(agent_id) = self.fg_id().map(str::to_string) {
-                                self.cancel_fg_agent_turn(&agent_id);
-                            }
-                            return;
-                        }
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && matches!(key.code, KeyCode::Char('y'))
-                        {
-                            self.copy_focus();
-                            return;
-                        }
-                        if let Some(msg) = self.input.handle_key(key) {
-                            self.update(msg);
-                        }
-                        return;
-                    }
-
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && matches!(key.code, KeyCode::Char('z'))
                     {
@@ -2952,7 +2447,7 @@ impl Default for AppState {
 
 fn normalize_command_label(input: &str) -> String {
     let trimmed = input.trim();
-    for prefix in [":run", ":ask", ":cron", ":spawn"] {
+    for prefix in [":run", ":cron"] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             let rest = rest.trim();
             if !rest.is_empty() {
@@ -3080,27 +2575,8 @@ fn spaced_operator_suggestion(input: &str, pos: usize, op: &str) -> String {
 }
 
 fn submission_precreates_card(input: &str, mode: Mode, warnings: &[String]) -> bool {
-    let _ = warnings;
-    submission_opens_agent_stream(input, mode)
-}
-
-fn submission_opens_agent_stream(input: &str, _mode: Mode) -> bool {
-    let trimmed = input.trim();
-    let Some(rest) = trimmed.strip_prefix(':') else {
-        return false;
-    };
-    let mut parts = rest.split_whitespace();
-    match parts.next() {
-        Some("ask" | "spawn") => true,
-        Some("send") => parts.next().is_some_and(|target| target.starts_with('A')),
-        _ => false,
-    }
-}
-
-fn submission_agent_target(input: &str, _mode: Mode) -> Option<String> {
-    let rest = input.trim().strip_prefix(":send")?.trim_start();
-    let target = rest.split_whitespace().next()?;
-    target.starts_with('A').then(|| target.to_string())
+    let _ = (input, mode, warnings);
+    false
 }
 
 fn is_mode_switch_key(key: KeyEvent) -> bool {
@@ -3226,7 +2702,6 @@ fn format_ack_message(input: &str) -> String {
 fn format_card_preview(card: &Card) -> String {
     let mode = match card.mode {
         Mode::Job => "JOB",
-        Mode::Agent => "JOB",
         Mode::Cron => "CRON",
     };
     let status = match card.status {
@@ -3412,20 +2887,11 @@ fn format_job_status(status: &JobStatus) -> String {
     }
 }
 
-fn format_agent_status(status: AgentStatus) -> &'static str {
-    match status {
-        AgentStatus::Running => "running",
-        AgentStatus::WaitingInput => "waiting_input",
-        AgentStatus::Done => "done",
-        AgentStatus::Failed => "failed",
-    }
-}
-
 fn builtin_command_candidates(word: &str) -> Vec<String> {
     const COMMANDS: &[&str] = &[
-        "run", "ask", "spawn", "cron", "kill", "retry", "out", "err", "fg", "wait", "send",
-        "cancel", "pause", "resume", "probe", "log", "jobs", "agents", "crons", "scopes",
-        "confirm", "escalate", "env", "cd", "scope", "help", "config", "clear", "quit", "exit",
+        "run", "cron", "kill", "retry", "out", "err", "fg", "wait", "send", "cancel", "pause",
+        "resume", "log", "jobs", "crons", "scopes", "env", "cd", "scope", "help", "config",
+        "clear", "quit", "exit",
     ];
     let prefix = word.strip_prefix(':').unwrap_or(word);
     COMMANDS
@@ -3439,7 +2905,6 @@ fn bare_completion_candidates(mode: Mode, line_prefix: &str, word: &str) -> Vec<
     match mode {
         Mode::Job => shell_segment_completion_candidates(line_prefix, word),
         Mode::Cron => cron_completion_candidates(line_prefix, word),
-        Mode::Agent => shell_segment_completion_candidates(line_prefix, word),
     }
 }
 
@@ -3705,19 +3170,7 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::spawn_writer_task;
-    use cue_core::ipc::Message;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncReadExt, duplex};
-
-    async fn read_message(stream: &mut tokio::io::DuplexStream) -> Message {
-        let mut len_buf = [0_u8; 4];
-        stream.read_exact(&mut len_buf).await.unwrap();
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut body = vec![0_u8; len];
-        stream.read_exact(&mut body).await.unwrap();
-        serde_json::from_slice(&body).unwrap()
-    }
 
     fn queue_pending(state: &mut AppState, id: u32, pending: PendingSubmission) {
         state.track_pending_submission(id, pending);
@@ -4599,59 +4052,6 @@ destination = "devbox"
     }
 
     #[test]
-    fn agent_sidebar_open_opens_session_display() {
-        let mut state = AppState::new();
-        state.mode = Mode::Agent;
-        state.sync_mode_views();
-        state.agents.push(AgentRow {
-            id: "A1".into(),
-            label: "executor copilot".into(),
-            status: AgentStatus::WaitingInput,
-        });
-        state.append_agent_session_message("A1", "assistant", "hello");
-
-        state.activate_sidebar_row(0);
-
-        assert_eq!(state.focus, FocusArea::MainView);
-        assert_eq!(
-            state.display_tab_labels(),
-            vec![" session A1  × ".to_string()]
-        );
-        assert!(state.display_pane_content().contains("hello"));
-    }
-
-    #[tokio::test]
-    async fn agent_sidebar_open_requests_fg_attach() {
-        let mut state = AppState::new();
-        state.mode = Mode::Agent;
-        state.sync_mode_views();
-        state.agents.push(AgentRow {
-            id: "A1".into(),
-            label: "executor copilot".into(),
-            status: AgentStatus::WaitingInput,
-        });
-
-        let (client_stream, mut server_stream) = duplex(1024);
-        let client = cue_client::CuedClient::from_stream(client_stream);
-        let (_reader, writer) = client.into_split();
-        state.writer = Some(spawn_writer_task(writer));
-
-        state.activate_sidebar_row(0);
-
-        match read_message(&mut server_stream).await {
-            Message::Request {
-                payload: RequestPayload::FgAttach { id },
-                ..
-            } => assert_eq!(id, "A1"),
-            other => panic!("expected fg attach request, got {other:?}"),
-        }
-        assert_eq!(
-            state.display_tab_labels(),
-            vec![" session A1  × ".to_string()]
-        );
-    }
-
-    #[test]
     fn copy_target_prefers_active_display_tab() {
         let mut state = AppState::new();
         state.show_output_display(
@@ -4668,22 +4068,6 @@ destination = "devbox"
             Some(CopyTarget {
                 label: "stdout J1".into(),
                 content: "hello\n".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn copy_target_uses_fg_agent_transcript() {
-        let mut state = AppState::new();
-        state.upsert_agent("A1".into(), "copilot".into(), AgentStatus::WaitingInput);
-        state.append_agent_session_message("A1", "assistant", "hello");
-        state.start_fg_session("A1".into(), None);
-
-        assert_eq!(
-            state.copy_target(),
-            Some(CopyTarget {
-                label: "session A1".into(),
-                content: "id: A1\nstatus: waiting_input\nlabel: copilot\n\nhello".into(),
             })
         );
     }
@@ -4812,41 +4196,6 @@ destination = "devbox"
         assert_eq!(card.input, ":fg J1");
         assert_eq!(card.label.as_deref(), Some("J1"));
         assert_eq!(card.status, CardStatus::Streaming);
-    }
-
-    #[test]
-    fn agent_messages_are_buffered_for_session_views() {
-        let mut state = AppState::new();
-
-        state.update(AppMsg::ServerEvent(EventPayload::AgentMessage {
-            agent_id: "A1".into(),
-            role: "assistant".into(),
-            content: "hello".into(),
-        }));
-
-        assert!(state.main_view.cards.is_empty());
-        assert!(state.render_agent_session_content("A1").contains("hello"));
-    }
-
-    #[test]
-    fn agent_snapshots_restore_transcript_state() {
-        let mut state = AppState::new();
-
-        state.replace_agents(vec![AgentInfo {
-            id: "A1".into(),
-            status: AgentStatus::WaitingInput,
-            backend: "copilot".into(),
-            role: "planner".into(),
-            transcript: "hello".into(),
-            last_role: Some("assistant".into()),
-        }]);
-        state.append_agent_message("A1", "assistant", " world");
-
-        assert!(
-            state
-                .render_agent_session_content("A1")
-                .contains("hello world")
-        );
     }
 
     #[test]
@@ -5083,81 +4432,6 @@ destination = "devbox"
 
         assert_eq!(state.jobs.len(), 1);
         assert_eq!(state.jobs[0].start_scope.as_deref(), Some("S@abc12345"));
-    }
-
-    #[test]
-    fn agent_messages_open_session_view_without_streaming_into_cards() {
-        let mut state = AppState::new();
-        let card_index = state
-            .main_view
-            .push_card("every 5m cargo test".into(), Mode::Cron);
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(
-                Some(card_index),
-                "explain this".into(),
-                Mode::Agent,
-                Vec::new(),
-            ),
-        );
-
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::AgentSpawned {
-                agent_id: "A1".into(),
-            }),
-        });
-        state.update(AppMsg::ServerEvent(EventPayload::AgentMessage {
-            agent_id: "A1".into(),
-            role: "assistant".into(),
-            content: "hello".into(),
-        }));
-        state.update(AppMsg::ServerEvent(EventPayload::AgentStateChanged {
-            agent_id: "A1".into(),
-            old_state: AgentStatus::Running,
-            new_state: AgentStatus::Done,
-        }));
-
-        let card = &state.main_view.cards[card_index];
-        assert_eq!(card.label.as_deref(), Some("A1"));
-        assert_eq!(card.output, "opened session A1");
-        assert_eq!(card.status, CardStatus::Streaming);
-        assert_eq!(
-            state.display_tab_labels(),
-            vec![" session A1  × ".to_string()]
-        );
-        assert!(state.display_pane_content().contains("status: done"));
-        assert!(state.display_pane_content().contains("hello"));
-    }
-
-    #[test]
-    fn fg_attach_agent_starts_foreground_session() {
-        let mut state = AppState::new();
-        state.upsert_agent(
-            "A1".into(),
-            "planner copilot".into(),
-            AgentStatus::WaitingInput,
-        );
-        queue_pending(
-            &mut state,
-            1,
-            PendingSubmission::user(None, ":fg A1".into(), Mode::Agent, Vec::new()),
-        );
-
-        state.update(AppMsg::Response {
-            id: 1,
-            payload: ResponsePayload::Ok(OkPayload::FgAttached { id: "A1".into() }),
-        });
-
-        assert!(state.fg_active());
-        assert!(state.fg_is_agent());
-        assert_eq!(
-            state.display_tab_labels(),
-            vec![" session A1  × ".to_string()]
-        );
-        let card = state.main_view.cards.last().unwrap();
-        assert_eq!(card.output, "opened session A1");
     }
 
     #[test]

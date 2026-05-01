@@ -1,7 +1,6 @@
 //! Scheduler actor — command routing, ID assignment, chain execution, cron timer heap.
 
 use std::collections::{HashMap, VecDeque};
-use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use chrono::{
@@ -9,32 +8,26 @@ use chrono::{
     Timelike,
 };
 use rusqlite::Connection;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use cue_core::agent::{AgentRole, AgentStatus};
-use cue_core::command::{ModeParams, ParamValue};
 use cue_core::cron::{CronPreset, CronSchedule, CronStatus, DayFilter, Weekday};
 use cue_core::ipc::{
-    AgentInfo, ChainInfo, ChainJobInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload,
+    ChainInfo, ChainJobInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload,
     ResponsePayload, error_code,
 };
 use cue_core::job::{CancelReason, JobStatus};
 use cue_core::pipeline::{ChainNode, ParallelOp, SerialOp};
 use cue_core::scope::EnvSnapshot;
-use cue_core::{AgentId, ChainId, CronId, JobId, ScopeHash};
+use cue_core::{ChainId, CronId, JobId, ScopeHash};
 
-use crate::config::{AgentBackendConfig, AgentTransport, Config};
+use crate::config::Config;
 use crate::parser::parse::Parser as CueParser;
 use crate::parser::resolver::{ResolvedCommand, Resolver};
 use crate::parser::token::Token;
 use crate::parser::tokenizer::Tokenizer;
-use crate::runtime_env::effective_snapshot;
 use crate::storage;
-use crate::weft::{SessionPrepareRequest, WeftClient, WeftClientError, WorkspaceRef};
 use crate::word_expansion::expand_command_line;
 
 use super::{ActorSystem, GatewayMsg, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg, StderrSnapshot};
@@ -112,36 +105,6 @@ struct JobEntry {
     stderr: String,
 }
 
-struct AgentEntry {
-    agent_id: AgentId,
-    backend: String,
-    role: AgentRole,
-    status: AgentStatus,
-    proxied: bool,
-    control: Option<mpsc::Sender<AgentControl>>,
-    session_id: Option<String>,
-    #[allow(dead_code)]
-    model: Option<String>,
-    #[allow(dead_code)]
-    scope_hash: Option<ScopeHash>,
-    transcript: String,
-    last_role: Option<String>,
-}
-
-enum AgentControl {
-    Prompt(String),
-    Abort,
-    Shutdown,
-}
-
-#[derive(Debug, Clone)]
-enum AgentLaunch {
-    Prompt {
-        initial_prompt: String,
-        requested_session: Option<String>,
-    },
-}
-
 // ── Cron entry ──────────────────────────────────────────────────────────────
 
 /// A registered cron / timer entry.
@@ -167,7 +130,6 @@ struct PendingWait {
 
 struct SchedulerState {
     next_job: u32,
-    next_agent: u32,
     next_cron: u32,
     next_chain: u32,
 
@@ -177,42 +139,29 @@ struct SchedulerState {
     job_to_chain: HashMap<JobId, (ChainId, usize)>,
     /// All jobs the scheduler knows about.
     jobs: HashMap<JobId, JobEntry>,
-    /// All agents the scheduler knows about.
-    agents: HashMap<AgentId, AgentEntry>,
     /// Registered cron entries.
     crons: HashMap<CronId, CronEntry>,
     /// Deferred `:wait` responses keyed by job ID.
     job_waiters: HashMap<JobId, Vec<PendingWait>>,
-    /// Deferred `:wait` responses keyed by agent ID.
-    agent_waiters: HashMap<AgentId, Vec<PendingWait>>,
 }
 
 impl SchedulerState {
     fn new() -> Self {
         Self {
             next_job: 1,
-            next_agent: 1,
             next_cron: 1,
             next_chain: 1,
             chains: HashMap::new(),
             job_to_chain: HashMap::new(),
             jobs: HashMap::new(),
-            agents: HashMap::new(),
             crons: HashMap::new(),
             job_waiters: HashMap::new(),
-            agent_waiters: HashMap::new(),
         }
     }
 
     fn alloc_job(&mut self) -> JobId {
         let id = JobId(self.next_job);
         self.next_job += 1;
-        id
-    }
-
-    fn alloc_agent(&mut self) -> AgentId {
-        let id = AgentId(self.next_agent);
-        self.next_agent += 1;
         id
     }
 
@@ -297,60 +246,6 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
 
                         SchedulerMsg::JobFinished { job_id, exit_code } => {
                             handle_job_finished(job_id, exit_code, &mut state, &db, &sys).await;
-                        }
-
-                        SchedulerMsg::AgentMessage {
-                            agent_id,
-                            role,
-                            content,
-                        } => {
-                            if let Some(entry) = state.agents.get_mut(&agent_id) {
-                                append_agent_transcript(entry, &role, &content);
-                            }
-                            let _ = sys
-                                .gateway
-                                .send(GatewayMsg::PushEvent {
-                                    payload: EventPayload::AgentMessage {
-                                        agent_id: agent_id.to_string(),
-                                        role,
-                                        content,
-                                    },
-                                    channel: "agents".into(),
-                                })
-                                .await;
-                        }
-
-                        SchedulerMsg::AgentStateChanged { agent_id, status } => {
-                            if let Some(entry) = state.agents.get_mut(&agent_id) {
-                                let old_state = entry.status.clone();
-                                entry.status = status.clone();
-                                if status.is_terminal() {
-                                    entry.control = None;
-                                }
-                                let _ = sys
-                                    .gateway
-                                    .send(GatewayMsg::PushEvent {
-                                        payload: EventPayload::AgentStateChanged {
-                                            agent_id: agent_id.to_string(),
-                                            old_state,
-                                            new_state: status.clone(),
-                                        },
-                                        channel: "agents".into(),
-                                    })
-                                    .await;
-                                if status.is_terminal() {
-                                    notify_agent_waiters(&mut state, &sys, agent_id).await;
-                                }
-                            }
-                        }
-
-                        SchedulerMsg::AgentSessionBound {
-                            agent_id,
-                            session_id,
-                        } => {
-                            if let Some(entry) = state.agents.get_mut(&agent_id) {
-                                entry.session_id = Some(session_id);
-                            }
                         }
 
                         SchedulerMsg::Shutdown => {
@@ -632,127 +527,6 @@ fn persist_cron_record(db: &storage::SharedConnection, cron: &storage::StoredCro
     });
 }
 
-fn append_agent_transcript(entry: &mut AgentEntry, role: &str, content: &str) {
-    if content.is_empty() {
-        return;
-    }
-
-    if role == "system"
-        && let Some(session_id) = entry.session_id.as_deref()
-        && content == format!("ACP session: {session_id}")
-        && entry.transcript.contains(content)
-    {
-        entry.last_role = Some(role.to_string());
-        return;
-    }
-
-    let same_role = entry.last_role.as_deref() == Some(role);
-    if !entry.transcript.is_empty() && !same_role {
-        entry.transcript.push_str("\n\n");
-    }
-    if !same_role && role != "assistant" {
-        entry.transcript.push_str(&format!("[{role}] "));
-    }
-    entry.transcript.push_str(content);
-    entry.last_role = Some(role.to_string());
-}
-
-fn mode_param_string(params: &ModeParams, key: &str) -> Option<String> {
-    match params.get(key) {
-        Some(ParamValue::Str(value)) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-#[allow(clippy::result_large_err)]
-fn parse_agent_role(params: &ModeParams, default: AgentRole) -> Result<AgentRole, ResponsePayload> {
-    match mode_param_string(params, "role").as_deref() {
-        None => Ok(default),
-        Some("planner") => Ok(AgentRole::Planner),
-        Some("executor") => Ok(AgentRole::Executor),
-        Some(other) => Err(ResponsePayload::err(
-            error_code::INVALID_SYNTAX,
-            format!("invalid agent role `{other}`"),
-        )),
-    }
-}
-
-#[allow(clippy::result_large_err)]
-fn resolve_backend(
-    config: &Config,
-    params: &ModeParams,
-    allow_kind_param: bool,
-) -> Result<(String, AgentBackendConfig), ResponsePayload> {
-    let backend_name = mode_param_string(params, "agent").or_else(|| {
-        if allow_kind_param {
-            mode_param_string(params, "kind")
-        } else {
-            None
-        }
-    });
-    config
-        .agent
-        .backend(backend_name.as_deref())
-        .map_err(|error| ResponsePayload::err(error_code::NOT_FOUND, error.to_string()))
-}
-
-fn agent_transport_is_weft(config: &Config) -> bool {
-    matches!(config.agent.transport, AgentTransport::Weft)
-}
-
-fn weft_client(config: &Config) -> WeftClient {
-    WeftClient::new(config.weft.socket_path.clone())
-}
-
-fn weft_error_response(error: WeftClientError) -> ResponsePayload {
-    let code = match error {
-        WeftClientError::Http { status_code, .. } if (400..500).contains(&status_code) => {
-            error_code::INVALID_STATE
-        }
-        WeftClientError::Http { .. } => error_code::INTERNAL,
-        WeftClientError::Connect { .. } => error_code::INVALID_STATE,
-        WeftClientError::Io(_)
-        | WeftClientError::Serialize(_)
-        | WeftClientError::Deserialize(_)
-        | WeftClientError::Protocol(_) => error_code::INTERNAL,
-    };
-    ResponsePayload::err(code, error.to_string())
-}
-
-fn weft_not_supported(action: impl Into<String>) -> ResponsePayload {
-    ResponsePayload::err(
-        error_code::NOT_SUPPORTED,
-        format!(
-            "weft bootstrap proxy does not yet support {}",
-            action.into()
-        ),
-    )
-}
-
-#[allow(clippy::result_large_err)]
-fn weft_validate_agent_params(params: &ModeParams) -> Result<(), ResponsePayload> {
-    if params.get("session").is_some() {
-        return Err(ResponsePayload::err(
-            error_code::NOT_SUPPORTED,
-            "weft bootstrap proxy does not yet support session resume",
-        ));
-    }
-    if params.get("model").is_some() {
-        return Err(ResponsePayload::err(
-            error_code::NOT_SUPPORTED,
-            "weft bootstrap proxy does not yet support per-command model overrides",
-        ));
-    }
-    Ok(())
-}
-
-fn weft_proxy_transcript(socket_path: &std::path::Path) -> String {
-    format!(
-        "[system] proxied to weft bootstrap API via {}",
-        socket_path.display()
-    )
-}
-
 async fn get_head_snapshot(
     sys: &ActorSystem,
 ) -> Result<cue_core::scope::EnvSnapshot, ResponsePayload> {
@@ -772,796 +546,6 @@ async fn get_head_snapshot(
             "scope_store unreachable",
         )),
     }
-}
-
-async fn ensure_weft_available(config: &Config) -> Result<(), ResponsePayload> {
-    weft_client(config)
-        .discover()
-        .await
-        .map(|_| ())
-        .map_err(weft_error_response)
-}
-
-async fn spawn_weft_proxy_agent(
-    text: String,
-    params: ModeParams,
-    role: AgentRole,
-    state: &mut SchedulerState,
-    _db: &storage::SharedConnection,
-    config: &Config,
-    sys: &ActorSystem,
-) -> ResponsePayload {
-    if let Err(response) = weft_validate_agent_params(&params) {
-        return response;
-    }
-
-    let (label, _) = match resolve_backend(config, &params, true) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let scope_hash = match get_head_scope(sys).await {
-        Ok(hash) => hash,
-        Err(response) => return response,
-    };
-    let mut snapshot = match get_head_snapshot(sys).await {
-        Ok(snapshot) => snapshot,
-        Err(response) => return response,
-    };
-    if let Some(cwd) = params.cwd() {
-        snapshot.cwd = cwd;
-    }
-
-    let client = weft_client(config);
-    let prepared = match client
-        .prepare_session(&SessionPrepareRequest {
-            agent: label.clone(),
-            workspace: WorkspaceRef {
-                root: snapshot.cwd.display().to_string(),
-            },
-            input: text,
-        })
-        .await
-    {
-        Ok(prepared) => prepared,
-        Err(error) => return weft_error_response(error),
-    };
-
-    let aid = state.alloc_agent();
-    let mut transcript = weft_proxy_transcript(client.socket_path());
-    let surface = prepared
-        .surface
-        .as_deref()
-        .unwrap_or(prepared.protocol.as_str());
-    let _ = write!(
-        transcript,
-        "\n[system] prepared {} session on {} ({})",
-        prepared.request.agent, surface, prepared.session.status
-    );
-    state.agents.insert(
-        aid,
-        AgentEntry {
-            agent_id: aid,
-            backend: label,
-            role,
-            status: AgentStatus::Running,
-            proxied: true,
-            control: None,
-            session_id: None,
-            model: None,
-            scope_hash: Some(scope_hash),
-            transcript,
-            last_role: Some("system".into()),
-        },
-    );
-
-    ResponsePayload::Ok(OkPayload::AgentSpawned {
-        agent_id: aid.to_string(),
-    })
-}
-
-async fn send_agent_failure(
-    scheduler: mpsc::Sender<SchedulerMsg>,
-    agent_id: AgentId,
-    message: String,
-) {
-    let _ = scheduler
-        .send(SchedulerMsg::AgentMessage {
-            agent_id,
-            role: "system".into(),
-            content: message,
-        })
-        .await;
-    let _ = scheduler
-        .send(SchedulerMsg::AgentStateChanged {
-            agent_id,
-            status: AgentStatus::Failed,
-        })
-        .await;
-}
-
-async fn write_agent_rpc_line(
-    stdin: &mut tokio::process::ChildStdin,
-    value: serde_json::Value,
-) -> std::io::Result<()> {
-    stdin.write_all(value.to_string().as_bytes()).await?;
-    stdin.write_all(b"\n").await?;
-    stdin.flush().await
-}
-
-async fn write_agent_request(
-    stdin: &mut tokio::process::ChildStdin,
-    request_id: u64,
-    method: &str,
-    params: serde_json::Value,
-) -> std::io::Result<()> {
-    write_agent_rpc_line(
-        stdin,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params,
-        }),
-    )
-    .await
-}
-
-async fn write_agent_response(
-    stdin: &mut tokio::process::ChildStdin,
-    id: serde_json::Value,
-    result: serde_json::Value,
-) -> std::io::Result<()> {
-    write_agent_rpc_line(
-        stdin,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result,
-        }),
-    )
-    .await
-}
-
-async fn write_agent_error_response(
-    stdin: &mut tokio::process::ChildStdin,
-    id: serde_json::Value,
-    code: i64,
-    message: String,
-) -> std::io::Result<()> {
-    write_agent_rpc_line(
-        stdin,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {
-                "code": code,
-                "message": message,
-            },
-        }),
-    )
-    .await
-}
-
-async fn write_acp_prompt(
-    stdin: &mut tokio::process::ChildStdin,
-    request_id: u64,
-    session_id: &str,
-    prompt: String,
-) -> std::io::Result<()> {
-    write_agent_request(
-        stdin,
-        request_id,
-        "session/prompt",
-        serde_json::json!({
-            "sessionId": session_id,
-            "prompt": [{
-                "type": "text",
-                "text": prompt,
-            }],
-        }),
-    )
-    .await
-}
-
-fn extract_acp_text_block(value: &serde_json::Value) -> Option<String> {
-    match value.get("type").and_then(|value| value.as_str()) {
-        Some("text") => value
-            .get("text")
-            .and_then(|value| value.as_str())
-            .filter(|text| !text.is_empty())
-            .map(ToOwned::to_owned),
-        Some("content") => value.get("content").and_then(extract_acp_text_block),
-        _ => None,
-    }
-}
-
-fn extract_acp_text_blocks(values: &[serde_json::Value]) -> Option<String> {
-    let text = values
-        .iter()
-        .filter_map(extract_acp_text_block)
-        .collect::<Vec<_>>()
-        .join("");
-    (!text.is_empty()).then_some(text)
-}
-
-async fn forward_acp_session_update(
-    scheduler: &mpsc::Sender<SchedulerMsg>,
-    agent_id: AgentId,
-    update: &serde_json::Value,
-) {
-    let Some(kind) = update.get("sessionUpdate").and_then(|value| value.as_str()) else {
-        return;
-    };
-
-    let forwarded = match kind {
-        "agent_message_chunk" => update
-            .get("content")
-            .and_then(extract_acp_text_block)
-            .map(|content| ("assistant".to_string(), content)),
-        "user_message_chunk" => update
-            .get("content")
-            .and_then(extract_acp_text_block)
-            .map(|content| ("user".to_string(), content)),
-        "plan" => update
-            .get("entries")
-            .and_then(|value| value.as_array())
-            .map(|entries| {
-                let content = entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let text = entry.get("content")?.as_str()?;
-                        let status = entry
-                            .get("status")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("pending");
-                        Some(format!("- [{status}] {text}"))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                ("system".to_string(), format!("[plan]\n{content}"))
-            })
-            .filter(|(_, content)| !content.trim().is_empty()),
-        "tool_call" => Some((
-            "system".to_string(),
-            format!(
-                "[tool] {} ({})",
-                update
-                    .get("title")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("tool call"),
-                update
-                    .get("status")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("pending"),
-            ),
-        )),
-        "tool_call_update" => {
-            let status = update
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("updated");
-            let body = update
-                .get("content")
-                .and_then(|value| value.as_array())
-                .and_then(|items| extract_acp_text_blocks(items));
-            Some((
-                "system".to_string(),
-                match body {
-                    Some(text) => format!("[tool:{status}] {text}"),
-                    None => format!("[tool:{status}]"),
-                },
-            ))
-        }
-        _ => None,
-    };
-
-    if let Some((role, content)) = forwarded {
-        let _ = scheduler
-            .send(SchedulerMsg::AgentMessage {
-                agent_id,
-                role,
-                content,
-            })
-            .await;
-    }
-}
-
-fn acp_response_error(value: &serde_json::Value) -> Option<String> {
-    let error = value.get("error")?;
-    error
-        .get("message")
-        .and_then(|value| value.as_str())
-        .or_else(|| error.as_str())
-        .map(ToOwned::to_owned)
-}
-
-enum AcpPhase {
-    Initializing {
-        request_id: u64,
-        launch: AgentLaunch,
-    },
-    OpeningSession {
-        request_id: u64,
-        launch: AgentLaunch,
-    },
-    Prompting {
-        request_id: u64,
-        session_id: String,
-        cancel_request_id: Option<u64>,
-    },
-    Idle {
-        session_id: String,
-    },
-}
-
-#[allow(clippy::result_large_err)]
-fn launch_agent(
-    agent_id: AgentId,
-    launch: AgentLaunch,
-    backend: AgentBackendConfig,
-    model_override: Option<String>,
-    snapshot: cue_core::scope::EnvSnapshot,
-    scheduler: mpsc::Sender<SchedulerMsg>,
-) -> Result<mpsc::Sender<AgentControl>, ResponsePayload> {
-    if backend.command.trim().is_empty() {
-        return Err(ResponsePayload::err(
-            error_code::INVALID_STATE,
-            "ACP agent backend command is empty; set [agent.backends.<name>].command in server.toml (or legacy config.toml)",
-        ));
-    }
-
-    let snapshot = effective_snapshot(&snapshot);
-    let mut command = Command::new(&backend.command);
-    command.args(&backend.args);
-    if let Some(model) = model_override.or(backend.model.clone()) {
-        command.arg("--model").arg(model);
-    }
-    let session_cwd = snapshot.cwd.clone();
-    command.current_dir(&session_cwd);
-    command.env_clear();
-    command.envs(snapshot.env);
-    command.stdin(std::process::Stdio::piped());
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-
-    let mut child = command.spawn().map_err(|error| {
-        ResponsePayload::err(
-            error_code::INTERNAL,
-            format!(
-                "failed to start agent backend `{}`: {error}",
-                backend.command
-            ),
-        )
-    })?;
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        ResponsePayload::err(error_code::INTERNAL, "agent backend missing stdin pipe")
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        ResponsePayload::err(error_code::INTERNAL, "agent backend missing stdout pipe")
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        ResponsePayload::err(error_code::INTERNAL, "agent backend missing stderr pipe")
-    })?;
-    let (control_tx, mut control_rx) = mpsc::channel::<AgentControl>(16);
-
-    tokio::spawn(async move {
-        let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            let mut collected = String::new();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if !collected.is_empty() {
-                    collected.push('\n');
-                }
-                collected.push_str(&line);
-            }
-            collected
-        });
-
-        let mut next_request_id = 1_u64;
-        let init_request_id = next_request_id;
-        next_request_id += 1;
-        if write_agent_request(
-            &mut stdin,
-            init_request_id,
-            "initialize",
-            serde_json::json!({
-                "protocolVersion": 1,
-                "clientCapabilities": {},
-                "clientInfo": {
-                    "name": "cue-shell",
-                    "title": "Cue Shell",
-                    "version": cue_core::version(),
-                },
-            }),
-        )
-        .await
-        .is_err()
-        {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            send_agent_failure(
-                scheduler.clone(),
-                agent_id,
-                "failed to initialize ACP agent backend".into(),
-            )
-            .await;
-            return;
-        }
-
-        let mut lines = BufReader::new(stdout).lines();
-        let mut current_status = AgentStatus::Running;
-        let mut terminal_status_sent = false;
-        let mut phase = AcpPhase::Initializing {
-            request_id: init_request_id,
-            launch,
-        };
-
-        loop {
-            tokio::select! {
-                control = control_rx.recv() => {
-                    match control {
-                        Some(AgentControl::Prompt(next_prompt)) => {
-                            let session_id = match &phase {
-                                AcpPhase::Idle { session_id } => session_id.clone(),
-                                _ => continue,
-                            };
-                            let request_id = next_request_id;
-                            next_request_id += 1;
-                            if write_acp_prompt(&mut stdin, request_id, &session_id, next_prompt).await.is_err() {
-                                let _ = child.kill().await;
-                                terminal_status_sent = true;
-                                send_agent_failure(
-                                    scheduler.clone(),
-                                    agent_id,
-                                    "failed to send prompt to agent backend".into(),
-                                )
-                                .await;
-                                break;
-                            }
-                            phase = AcpPhase::Prompting {
-                                request_id,
-                                session_id,
-                                cancel_request_id: None,
-                            };
-                            if current_status != AgentStatus::Running {
-                                current_status = AgentStatus::Running;
-                                let _ = scheduler
-                                    .send(SchedulerMsg::AgentStateChanged {
-                                        agent_id,
-                                        status: AgentStatus::Running,
-                                    })
-                                    .await;
-                            }
-                        }
-                        Some(AgentControl::Abort) => {
-                            let (prompt_request_id, session_id, cancel_request_id) = match &phase {
-                                AcpPhase::Prompting {
-                                    request_id,
-                                    session_id,
-                                    cancel_request_id,
-                                } => (*request_id, session_id.clone(), *cancel_request_id),
-                                _ => continue,
-                            };
-                            if cancel_request_id.is_some() {
-                                continue;
-                            }
-                            let request_id = next_request_id;
-                            next_request_id += 1;
-                            if write_agent_request(
-                                &mut stdin,
-                                request_id,
-                                "session/cancel",
-                                serde_json::json!({ "sessionId": session_id }),
-                            )
-                                .await
-                                .is_err()
-                            {
-                                let _ = child.kill().await;
-                                terminal_status_sent = true;
-                                send_agent_failure(
-                                    scheduler.clone(),
-                                    agent_id,
-                                    "failed to cancel current ACP prompt turn".into(),
-                                )
-                                .await;
-                                break;
-                            }
-                            phase = AcpPhase::Prompting {
-                                request_id: prompt_request_id,
-                                session_id,
-                                cancel_request_id: Some(request_id),
-                            };
-                        }
-                        Some(AgentControl::Shutdown) | None => {
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                            let _ = scheduler
-                                .send(SchedulerMsg::AgentMessage {
-                                    agent_id,
-                                    role: "system".into(),
-                                    content: "aborted by user".into(),
-                                })
-                                .await;
-                            let _ = scheduler
-                                .send(SchedulerMsg::AgentStateChanged {
-                                    agent_id,
-                                    status: AgentStatus::Failed,
-                                })
-                                .await;
-                            return;
-                        }
-                    }
-                }
-                line = lines.next_line() => {
-                    let Ok(Some(line)) = line else {
-                        break;
-                    };
-                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                        continue;
-                    };
-
-                    if let Some(method) = value.get("method").and_then(|value| value.as_str()) {
-                        if method == "session/update" && value.get("id").is_none() {
-                            if let Some(update) = value.pointer("/params/update") {
-                                forward_acp_session_update(&scheduler, agent_id, update).await;
-                            }
-                            continue;
-                        }
-
-                        let Some(request_id) = value.get("id").cloned() else {
-                            continue;
-                        };
-                        let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
-                        let result = if method == "session/request_permission" {
-                            if let Some(option_id) = params
-                                .pointer("/options/0/optionId")
-                                .and_then(|value| value.as_str())
-                            {
-                                write_agent_response(
-                                    &mut stdin,
-                                    request_id,
-                                    serde_json::json!({
-                                        "outcome": "selected",
-                                        "optionId": option_id,
-                                    }),
-                                )
-                                .await
-                            } else {
-                                write_agent_response(
-                                    &mut stdin,
-                                    request_id,
-                                    serde_json::json!({ "outcome": "cancelled" }),
-                                )
-                                .await
-                            }
-                        } else {
-                            write_agent_error_response(
-                                &mut stdin,
-                                request_id,
-                                -32601,
-                                format!("ACP client method `{method}` is not supported by cue-shell yet"),
-                            )
-                            .await
-                        };
-                        if result.is_err() {
-                            let _ = child.kill().await;
-                            terminal_status_sent = true;
-                            send_agent_failure(
-                                scheduler.clone(),
-                                agent_id,
-                                "failed to reply to ACP agent request".into(),
-                            )
-                            .await;
-                            break;
-                        }
-                        continue;
-                    }
-
-                    let Some(response_id) = value.get("id").and_then(|value| value.as_u64()) else {
-                        continue;
-                    };
-                    if let Some(error) = acp_response_error(&value) {
-                        let _ = child.kill().await;
-                        terminal_status_sent = true;
-                        send_agent_failure(scheduler.clone(), agent_id, error).await;
-                        break;
-                    }
-
-                    match &phase {
-                        AcpPhase::Initializing {
-                            request_id,
-                            launch,
-                        } if response_id == *request_id => {
-                            let launch = launch.clone();
-                            let load_supported = value
-                                .pointer("/result/agentCapabilities/loadSession")
-                                .and_then(|value| value.as_bool())
-                                .unwrap_or(false);
-                            let request_id = next_request_id;
-                            next_request_id += 1;
-                            let request_result = match &launch {
-                                AgentLaunch::Prompt {
-                                    requested_session: Some(session_id),
-                                    ..
-                                } => {
-                                    if !load_supported {
-                                        let _ = child.kill().await;
-                                        terminal_status_sent = true;
-                                        send_agent_failure(
-                                            scheduler.clone(),
-                                            agent_id,
-                                            format!("ACP agent backend does not support session/load for session `{session_id}`"),
-                                        )
-                                        .await;
-                                        break;
-                                    }
-                                    write_agent_request(
-                                        &mut stdin,
-                                        request_id,
-                                        "session/load",
-                                        serde_json::json!({
-                                            "sessionId": session_id,
-                                            "cwd": session_cwd.to_string_lossy().into_owned(),
-                                            "mcpServers": [],
-                                        }),
-                                    )
-                                    .await
-                                }
-                                AgentLaunch::Prompt {
-                                    requested_session: None,
-                                    ..
-                                } => {
-                                    write_agent_request(
-                                        &mut stdin,
-                                        request_id,
-                                        "session/new",
-                                        serde_json::json!({
-                                            "cwd": session_cwd.to_string_lossy().into_owned(),
-                                            "mcpServers": [],
-                                        }),
-                                    )
-                                    .await
-                                }
-                            };
-                            if request_result.is_err() {
-                                let _ = child.kill().await;
-                                terminal_status_sent = true;
-                                send_agent_failure(
-                                    scheduler.clone(),
-                                    agent_id,
-                                    "failed to open ACP session".into(),
-                                )
-                                .await;
-                                break;
-                            }
-                            phase = AcpPhase::OpeningSession {
-                                request_id,
-                                launch,
-                            };
-                        }
-                        AcpPhase::OpeningSession {
-                            request_id,
-                            launch,
-                        } if response_id == *request_id => {
-                            let session_id = match launch {
-                                AgentLaunch::Prompt {
-                                    requested_session: Some(session_id),
-                                    ..
-                                } => session_id.clone(),
-                                AgentLaunch::Prompt {
-                                    requested_session: None,
-                                    ..
-                                } => value
-                                    .pointer("/result/sessionId")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                            };
-                            if session_id.is_empty() {
-                                let _ = child.kill().await;
-                                terminal_status_sent = true;
-                                send_agent_failure(
-                                    scheduler.clone(),
-                                    agent_id,
-                                    "ACP session open response did not include sessionId".into(),
-                                )
-                                .await;
-                                break;
-                            }
-                            let _ = scheduler
-                                .send(SchedulerMsg::AgentSessionBound {
-                                    agent_id,
-                                    session_id: session_id.clone(),
-                                })
-                                .await;
-                            let _ = scheduler
-                                .send(SchedulerMsg::AgentMessage {
-                                    agent_id,
-                                    role: "system".into(),
-                                    content: format!("ACP session: {session_id}"),
-                                })
-                                .await;
-                            match launch {
-                                AgentLaunch::Prompt { initial_prompt, .. } => {
-                                    let prompt_request_id = next_request_id;
-                                    next_request_id += 1;
-                                    if write_acp_prompt(
-                                        &mut stdin,
-                                        prompt_request_id,
-                                        &session_id,
-                                        initial_prompt.clone(),
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        let _ = child.kill().await;
-                                        terminal_status_sent = true;
-                                        send_agent_failure(
-                                            scheduler.clone(),
-                                            agent_id,
-                                            "failed to send ACP prompt".into(),
-                                        )
-                                        .await;
-                                        break;
-                                    }
-                                    phase = AcpPhase::Prompting {
-                                        request_id: prompt_request_id,
-                                        session_id,
-                                        cancel_request_id: None,
-                                    };
-                                }
-                            }
-                        }
-                        AcpPhase::Prompting {
-                            request_id,
-                            session_id,
-                            cancel_request_id,
-                        } if response_id == *request_id
-                            || cancel_request_id.is_some_and(|cancel_id| response_id == cancel_id) =>
-                        {
-                            let session_id = session_id.clone();
-                            if current_status != AgentStatus::WaitingInput {
-                                current_status = AgentStatus::WaitingInput;
-                                let _ = scheduler
-                                    .send(SchedulerMsg::AgentStateChanged {
-                                        agent_id,
-                                        status: AgentStatus::WaitingInput,
-                                    })
-                                    .await;
-                            }
-                            phase = AcpPhase::Idle { session_id };
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        let exit_status = child.wait().await.ok();
-        let stderr_output = stderr_task.await.unwrap_or_default();
-
-        if !terminal_status_sent {
-            if !stderr_output.trim().is_empty() {
-                let _ = scheduler
-                    .send(SchedulerMsg::AgentMessage {
-                        agent_id,
-                        role: "system".into(),
-                        content: stderr_output.trim().to_string(),
-                    })
-                    .await;
-            }
-            let status = if exit_status.is_some_and(|status| status.success()) {
-                AgentStatus::Done
-            } else {
-                AgentStatus::Failed
-            };
-            let _ = scheduler
-                .send(SchedulerMsg::AgentStateChanged { agent_id, status })
-                .await;
-        }
-    });
-
-    Ok(control_tx)
 }
 
 // ── Chain helpers ────────────────────────────────────────────────────────────
@@ -2762,20 +1746,6 @@ fn job_info_from_entry(entry: &JobEntry) -> JobInfo {
     }
 }
 
-fn agent_info_from_entry(entry: &AgentEntry) -> AgentInfo {
-    AgentInfo {
-        id: entry.agent_id.to_string(),
-        status: entry.status.clone(),
-        backend: entry.backend.clone(),
-        role: match entry.role {
-            AgentRole::Planner => "planner".into(),
-            AgentRole::Executor => "executor".into(),
-        },
-        transcript: entry.transcript.clone(),
-        last_role: entry.last_role.clone(),
-    }
-}
-
 async fn notify_job_waiters(state: &mut SchedulerState, sys: &ActorSystem, job_id: JobId) {
     let Some(waiters) = state.job_waiters.remove(&job_id) else {
         return;
@@ -2784,26 +1754,6 @@ async fn notify_job_waiters(state: &mut SchedulerState, sys: &ActorSystem, job_i
         return;
     };
     let payload = ResponsePayload::Ok(OkPayload::JobInfo(job_info_from_entry(entry)));
-    for waiter in waiters {
-        let _ = sys
-            .gateway
-            .send(GatewayMsg::SendResponse {
-                client_id: waiter.client_id,
-                request_id: waiter.request_id,
-                payload: payload.clone(),
-            })
-            .await;
-    }
-}
-
-async fn notify_agent_waiters(state: &mut SchedulerState, sys: &ActorSystem, agent_id: AgentId) {
-    let Some(waiters) = state.agent_waiters.remove(&agent_id) else {
-        return;
-    };
-    let Some(entry) = state.agents.get(&agent_id) else {
-        return;
-    };
-    let payload = ResponsePayload::Ok(OkPayload::AgentInfo(agent_info_from_entry(entry)));
     for waiter in waiters {
         let _ = sys
             .gateway
@@ -3332,33 +2282,10 @@ async fn handle_wait_command(
         return None;
     }
 
-    if let Some(agent_id) = parse_agent_id(&id) {
-        let Some(entry) = state.agents.get(&agent_id) else {
-            return Some(ResponsePayload::err(
-                error_code::NOT_FOUND,
-                format!("agent {id} not found"),
-            ));
-        };
-        if entry.status.is_terminal() {
-            return Some(ResponsePayload::Ok(OkPayload::AgentInfo(
-                agent_info_from_entry(entry),
-            )));
-        }
-        state
-            .agent_waiters
-            .entry(agent_id)
-            .or_default()
-            .push(PendingWait {
-                client_id,
-                request_id,
-            });
-        return None;
-    }
-
     if id.starts_with('S') {
         return Some(ResponsePayload::err(
             error_code::NOT_SUPPORTED,
-            "`:wait` currently supports job and agent IDs only",
+            "`:wait` currently supports job IDs only",
         ));
     }
 
@@ -3386,68 +2313,6 @@ async fn handle_command(
             };
             let cwd_override = params.cwd();
             spawn_chain(chain, scope_hash, 0, 0, cwd_override, state, db, sys).await
-        }
-
-        ResolvedCommand::Ask { text, params } => {
-            let role = match parse_agent_role(&params, AgentRole::Planner) {
-                Ok(role) => role,
-                Err(response) => return response,
-            };
-            if agent_transport_is_weft(config) {
-                return spawn_weft_proxy_agent(text, params, role, state, db, config, sys).await;
-            }
-            let model_override = mode_param_string(&params, "model");
-            let session_override = mode_param_string(&params, "session");
-            let (label, backend) = match resolve_backend(config, &params, true) {
-                Ok(value) => value,
-                Err(response) => return response,
-            };
-            let scope_hash = match get_head_scope(sys).await {
-                Ok(hash) => hash,
-                Err(response) => return response,
-            };
-            let mut snapshot = match get_head_snapshot(sys).await {
-                Ok(snapshot) => snapshot,
-                Err(response) => return response,
-            };
-            if let Some(cwd) = params.cwd() {
-                snapshot.cwd = cwd;
-            }
-            let aid = state.alloc_agent();
-            let control = match launch_agent(
-                aid,
-                AgentLaunch::Prompt {
-                    initial_prompt: text.clone(),
-                    requested_session: session_override.clone(),
-                },
-                backend.clone(),
-                model_override.clone(),
-                snapshot,
-                sys.scheduler.clone(),
-            ) {
-                Ok(control) => control,
-                Err(response) => return response,
-            };
-            state.agents.insert(
-                aid,
-                AgentEntry {
-                    agent_id: aid,
-                    backend: label.clone(),
-                    role,
-                    status: AgentStatus::Running,
-                    proxied: false,
-                    control: Some(control),
-                    session_id: session_override,
-                    model: model_override,
-                    scope_hash: Some(scope_hash),
-                    transcript: String::new(),
-                    last_role: None,
-                },
-            );
-            info!(%aid, backend = %label, %text, "scheduler: planner agent spawned");
-            ResponsePayload::Ok(OkPayload::AgentSpawned {
-                agent_id: aid.to_string(),
-            })
         }
 
         ResolvedCommand::Cron {
@@ -3493,68 +2358,6 @@ async fn handle_command(
             })
         }
 
-        ResolvedCommand::Spawn { text, params } => {
-            let role = match parse_agent_role(&params, AgentRole::Executor) {
-                Ok(role) => role,
-                Err(response) => return response,
-            };
-            if agent_transport_is_weft(config) {
-                return spawn_weft_proxy_agent(text, params, role, state, db, config, sys).await;
-            }
-            let model_override = mode_param_string(&params, "model");
-            let session_override = mode_param_string(&params, "session");
-            let (label, backend) = match resolve_backend(config, &params, true) {
-                Ok(value) => value,
-                Err(response) => return response,
-            };
-            let scope_hash = match get_head_scope(sys).await {
-                Ok(hash) => hash,
-                Err(response) => return response,
-            };
-            let mut snapshot = match get_head_snapshot(sys).await {
-                Ok(snapshot) => snapshot,
-                Err(response) => return response,
-            };
-            if let Some(cwd) = params.cwd() {
-                snapshot.cwd = cwd;
-            }
-            let aid = state.alloc_agent();
-            let control = match launch_agent(
-                aid,
-                AgentLaunch::Prompt {
-                    initial_prompt: text.clone(),
-                    requested_session: session_override.clone(),
-                },
-                backend.clone(),
-                model_override.clone(),
-                snapshot,
-                sys.scheduler.clone(),
-            ) {
-                Ok(control) => control,
-                Err(response) => return response,
-            };
-            state.agents.insert(
-                aid,
-                AgentEntry {
-                    agent_id: aid,
-                    backend: label.clone(),
-                    role,
-                    status: AgentStatus::Running,
-                    proxied: false,
-                    control: Some(control),
-                    session_id: session_override,
-                    model: model_override,
-                    scope_hash: Some(scope_hash),
-                    transcript: String::new(),
-                    last_role: None,
-                },
-            );
-            info!(%aid, backend = %label, %text, "scheduler: executor agent spawned");
-            ResponsePayload::Ok(OkPayload::AgentSpawned {
-                agent_id: aid.to_string(),
-            })
-        }
-
         ResolvedCommand::Fg { id } => {
             if let Some(job_id) = parse_job_id(&id) {
                 let Some(entry) = state.jobs.get(&job_id) else {
@@ -3589,26 +2392,6 @@ async fn handle_command(
                     Ok(Err(message)) => ResponsePayload::err(error_code::INVALID_STATE, message),
                     Err(_) => {
                         ResponsePayload::err(error_code::INTERNAL, "process_mgr reply dropped")
-                    }
-                }
-            } else if let Some(agent_id) = parse_agent_id(&id) {
-                match state.agents.get(&agent_id) {
-                    Some(entry) if entry.proxied => {
-                        if let Err(response) = ensure_weft_available(config).await {
-                            response
-                        } else {
-                            weft_not_supported(format!("foreground attach (`:fg {id}`)"))
-                        }
-                    }
-                    Some(entry) if !entry.status.is_terminal() => {
-                        ResponsePayload::Ok(OkPayload::FgAttached { id })
-                    }
-                    Some(_) => ResponsePayload::err(
-                        error_code::INVALID_STATE,
-                        format!("agent {agent_id} is already terminal"),
-                    ),
-                    None => {
-                        ResponsePayload::err(error_code::NOT_FOUND, format!("agent {id} not found"))
                     }
                 }
             } else {
@@ -3666,35 +2449,6 @@ async fn handle_command(
                         ResponsePayload::err(error_code::NOT_FOUND, format!("job {id} not found"))
                     }
                 }
-            } else if let Some(aid) = parse_agent_id(&id) {
-                let Some(entry) = state.agents.get(&aid) else {
-                    return ResponsePayload::err(
-                        error_code::NOT_FOUND,
-                        format!("agent {id} not found"),
-                    );
-                };
-                if entry.proxied {
-                    if let Err(response) = ensure_weft_available(config).await {
-                        return response;
-                    }
-                    return weft_not_supported(format!("agent termination (`:kill {id}`)"));
-                }
-                if entry.status.is_terminal() {
-                    return ResponsePayload::err(
-                        error_code::INVALID_STATE,
-                        format!("agent {aid} is already terminal"),
-                    );
-                }
-                let Some(control) = entry.control.clone() else {
-                    return ResponsePayload::err(
-                        error_code::INVALID_STATE,
-                        format!("agent {aid} runtime is unavailable"),
-                    );
-                };
-                if control.send(AgentControl::Shutdown).await.is_err() {
-                    return ResponsePayload::err(error_code::INTERNAL, "agent runtime dropped");
-                }
-                ResponsePayload::ack()
             } else {
                 warn!(%id, "scheduler: kill target not found");
                 ResponsePayload::err(error_code::NOT_FOUND, format!("{id} not found"))
@@ -3753,35 +2507,6 @@ async fn handle_command(
                         ResponsePayload::err(error_code::NOT_FOUND, format!("job {id} not found"))
                     }
                 }
-            } else if let Some(aid) = parse_agent_id(&id) {
-                let Some(entry) = state.agents.get(&aid) else {
-                    return ResponsePayload::err(
-                        error_code::NOT_FOUND,
-                        format!("agent {id} not found"),
-                    );
-                };
-                if entry.proxied {
-                    if let Err(response) = ensure_weft_available(config).await {
-                        return response;
-                    }
-                    return weft_not_supported(format!("agent cancellation (`:cancel {id}`)"));
-                }
-                if entry.status != AgentStatus::Running {
-                    return ResponsePayload::err(
-                        error_code::INVALID_STATE,
-                        format!("agent {aid} is not running"),
-                    );
-                }
-                let Some(control) = entry.control.clone() else {
-                    return ResponsePayload::err(
-                        error_code::INVALID_STATE,
-                        format!("agent {aid} runtime is unavailable"),
-                    );
-                };
-                if control.send(AgentControl::Abort).await.is_err() {
-                    return ResponsePayload::err(error_code::INTERNAL, "agent runtime dropped");
-                }
-                ResponsePayload::ack()
             } else {
                 ResponsePayload::err(error_code::NOT_FOUND, format!("{id} not found"))
             }
@@ -3842,18 +2567,6 @@ async fn handle_command(
             ResponsePayload::Ok(OkPayload::JobList(list))
         }
 
-        ResolvedCommand::Agents => {
-            if agent_transport_is_weft(config)
-                && let Err(response) = ensure_weft_available(config).await
-            {
-                return response;
-            }
-            let mut list: Vec<AgentInfo> =
-                state.agents.values().map(agent_info_from_entry).collect();
-            list.sort_by_key(|agent| parse_agent_id(&agent.id).map(|id| id.0).unwrap_or(u32::MAX));
-            ResponsePayload::Ok(OkPayload::AgentList(list))
-        }
-
         ResolvedCommand::Crons => {
             let mut list: Vec<CronInfo> = state
                 .crons
@@ -3870,76 +2583,6 @@ async fn handle_command(
         }
 
         ResolvedCommand::Scopes => handle_list_scopes(sys).await,
-
-        ResolvedCommand::Confirm { text } => {
-            ResponsePayload::Ok(OkPayload::ConfirmRequest { prompt: text })
-        }
-
-        ResolvedCommand::Escalate { text } => {
-            if agent_transport_is_weft(config) {
-                return spawn_weft_proxy_agent(
-                    format!("executor escalation: {text}"),
-                    ModeParams::new(),
-                    AgentRole::Planner,
-                    state,
-                    db,
-                    config,
-                    sys,
-                )
-                .await;
-            }
-            let params = ModeParams::new();
-            let role = AgentRole::Planner;
-            let model_override = mode_param_string(&params, "model");
-            let session_override = mode_param_string(&params, "session");
-            let (label, backend) = match resolve_backend(config, &params, true) {
-                Ok(value) => value,
-                Err(response) => return response,
-            };
-            let scope_hash = match get_head_scope(sys).await {
-                Ok(hash) => hash,
-                Err(response) => return response,
-            };
-            let snapshot = match get_head_snapshot(sys).await {
-                Ok(snapshot) => snapshot,
-                Err(response) => return response,
-            };
-            let aid = state.alloc_agent();
-            let control = match launch_agent(
-                aid,
-                AgentLaunch::Prompt {
-                    initial_prompt: format!("executor escalation: {text}"),
-                    requested_session: session_override.clone(),
-                },
-                backend.clone(),
-                model_override.clone(),
-                snapshot,
-                sys.scheduler.clone(),
-            ) {
-                Ok(control) => control,
-                Err(response) => return response,
-            };
-            state.agents.insert(
-                aid,
-                AgentEntry {
-                    agent_id: aid,
-                    backend: label.clone(),
-                    role,
-                    status: AgentStatus::Running,
-                    proxied: false,
-                    control: Some(control),
-                    session_id: session_override,
-                    model: model_override,
-                    scope_hash: Some(scope_hash),
-                    transcript: String::new(),
-                    last_role: None,
-                },
-            );
-            info!(%aid, backend = %label, %text, "scheduler: planner escalation spawned");
-            ResponsePayload::Ok(OkPayload::AgentSpawned {
-                agent_id: aid.to_string(),
-            })
-        }
 
         ResolvedCommand::Env { subcommand } => {
             let snapshot = match get_head_snapshot(sys).await {
@@ -4099,35 +2742,6 @@ async fn handle_command(
                         ResponsePayload::err(error_code::INTERNAL, "process_mgr reply dropped")
                     }
                 }
-            } else if let Some(agent_id) = parse_agent_id(&id) {
-                let Some(entry) = state.agents.get(&agent_id) else {
-                    return ResponsePayload::err(
-                        error_code::NOT_FOUND,
-                        format!("agent {id} not found"),
-                    );
-                };
-                if entry.proxied {
-                    if let Err(response) = ensure_weft_available(config).await {
-                        return response;
-                    }
-                    return weft_not_supported(format!("follow-up prompts (`:send {id} ...`)"));
-                }
-                if entry.status != AgentStatus::WaitingInput {
-                    return ResponsePayload::err(
-                        error_code::INVALID_STATE,
-                        format!("agent {agent_id} is not waiting for input"),
-                    );
-                }
-                let Some(control) = entry.control.clone() else {
-                    return ResponsePayload::err(
-                        error_code::INVALID_STATE,
-                        format!("agent {agent_id} runtime is unavailable"),
-                    );
-                };
-                if control.send(AgentControl::Prompt(data)).await.is_err() {
-                    return ResponsePayload::err(error_code::INTERNAL, "agent runtime dropped");
-                }
-                ResponsePayload::ack()
             } else {
                 ResponsePayload::err(error_code::NOT_FOUND, format!("{id} not found"))
             }
@@ -4165,14 +2779,6 @@ async fn handle_command(
                 }
             };
             spawn_chain(chain, start_scope, 0, 0, None, state, db, sys).await
-        }
-
-        ResolvedCommand::Probe { query } => {
-            let parsed = match parse_probe_query(&query) {
-                Ok(parsed) => parsed,
-                Err(message) => return ResponsePayload::err(error_code::INVALID_SYNTAX, message),
-            };
-            handle_probe(parsed, state, sys).await
         }
 
         ResolvedCommand::Wait { .. } => ResponsePayload::err(
@@ -4230,14 +2836,6 @@ fn parse_job_id(s: &str) -> Option<JobId> {
         .map(JobId)
 }
 
-/// Parse a string like `"A2"` into an `AgentId`.
-fn parse_agent_id(s: &str) -> Option<AgentId> {
-    let s = s.trim();
-    s.strip_prefix('A')
-        .and_then(|n| n.parse::<u32>().ok())
-        .map(AgentId)
-}
-
 /// Parse a string like `"C3"` into a `CronId`.
 fn parse_cron_id(s: &str) -> Option<CronId> {
     let s = s.trim();
@@ -4291,152 +2889,6 @@ fn tokenize_words(input: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
-enum ProbeCommand {
-    Status { id: String },
-    Output { id: String, tail_bytes: usize },
-    Env { target: String, keys: Vec<String> },
-}
-
-fn parse_probe_query(input: &str) -> Result<ProbeCommand, String> {
-    let words = tokenize_words(input)?;
-    let Some((verb, rest)) = words.split_first() else {
-        return Err("`:probe` requires a subcommand".into());
-    };
-    match verb.as_str() {
-        "status" => {
-            let id = rest
-                .first()
-                .cloned()
-                .ok_or_else(|| "`:probe status` expects an ID".to_string())?;
-            Ok(ProbeCommand::Status { id })
-        }
-        "out" | "err" => {
-            let id = rest
-                .first()
-                .cloned()
-                .ok_or_else(|| format!("`:probe {verb}` expects a job ID"))?;
-            let mut tail_bytes = 4096usize;
-            let mut idx = 1;
-            while idx < rest.len() {
-                match rest[idx].as_str() {
-                    "--tail" => {
-                        let value = rest
-                            .get(idx + 1)
-                            .ok_or_else(|| "missing value after `--tail`".to_string())?;
-                        tail_bytes = value
-                            .parse::<usize>()
-                            .map_err(|_| format!("invalid `--tail` value `{value}`"))?
-                            .min(4096);
-                        idx += 2;
-                    }
-                    other => {
-                        return Err(format!("unsupported `:probe {verb}` flag `{other}`"));
-                    }
-                }
-            }
-            Ok(ProbeCommand::Output { id, tail_bytes })
-        }
-        "env" => {
-            let target = rest
-                .first()
-                .cloned()
-                .ok_or_else(|| "`:probe env` expects `head` or a job ID".to_string())?;
-            Ok(ProbeCommand::Env {
-                target,
-                keys: rest[1..].to_vec(),
-            })
-        }
-        other => Err(format!(
-            "unsupported `:probe` subcommand `{other}` (use status/out/err/env)"
-        )),
-    }
-}
-
-async fn handle_probe(
-    command: ProbeCommand,
-    state: &SchedulerState,
-    sys: &ActorSystem,
-) -> ResponsePayload {
-    match command {
-        ProbeCommand::Status { id } => {
-            if let Some(job_id) = parse_job_id(&id) {
-                let Some(entry) = state.jobs.get(&job_id) else {
-                    return ResponsePayload::err(
-                        error_code::NOT_FOUND,
-                        format!("job {id} not found"),
-                    );
-                };
-                ResponsePayload::Ok(OkPayload::JobInfo(job_info_from_entry(entry)))
-            } else if let Some(agent_id) = parse_agent_id(&id) {
-                let Some(entry) = state.agents.get(&agent_id) else {
-                    return ResponsePayload::err(
-                        error_code::NOT_FOUND,
-                        format!("agent {id} not found"),
-                    );
-                };
-                ResponsePayload::Ok(OkPayload::AgentInfo(agent_info_from_entry(entry)))
-            } else if let Some(cron_id) = parse_cron_id(&id) {
-                let Some(entry) = state.crons.get(&cron_id) else {
-                    return ResponsePayload::err(
-                        error_code::NOT_FOUND,
-                        format!("cron {id} not found"),
-                    );
-                };
-                ResponsePayload::Ok(OkPayload::EvalText {
-                    text: format!(
-                        "{} {} status={:?} next={:?}",
-                        entry.cron_id, entry.schedule_text, entry.status, entry.next_trigger
-                    ),
-                })
-            } else {
-                ResponsePayload::err(error_code::NOT_FOUND, format!("{id} not found"))
-            }
-        }
-        ProbeCommand::Output { id, tail_bytes } => {
-            let Some(job_id) = parse_job_id(&id) else {
-                return ResponsePayload::err(
-                    error_code::NOT_FOUND,
-                    format!("invalid job id: {id}"),
-                );
-            };
-            read_job_output(sys, job_id, &id, tail_bytes).await
-        }
-        ProbeCommand::Env { target, keys } => {
-            let snapshot = if target.eq_ignore_ascii_case("head") {
-                match get_head_snapshot(sys).await {
-                    Ok(snapshot) => snapshot,
-                    Err(response) => return response,
-                }
-            } else if let Some(job_id) = parse_job_id(&target) {
-                let Some(entry) = state.jobs.get(&job_id) else {
-                    return ResponsePayload::err(
-                        error_code::NOT_FOUND,
-                        format!("job {target} not found"),
-                    );
-                };
-                let Some(scope_hash) = entry.end_scope.or(entry.start_scope) else {
-                    return ResponsePayload::err(
-                        error_code::INVALID_SCOPE,
-                        format!("job {job_id} has no recorded scope"),
-                    );
-                };
-                match get_scope_snapshot_by_hash(sys, scope_hash).await {
-                    Ok(snapshot) => snapshot,
-                    Err(message) => return ResponsePayload::err(error_code::INTERNAL, message),
-                }
-            } else {
-                return ResponsePayload::err(
-                    error_code::NOT_SUPPORTED,
-                    "`:probe env` currently supports `head` and job IDs only",
-                );
-            };
-            ResponsePayload::Ok(OkPayload::EvalText {
-                text: format_probe_env(&snapshot, &keys),
-            })
-        }
-    }
-}
-
 fn format_snapshot_env(snapshot: &EnvSnapshot) -> String {
     let mut lines = vec![format!("cwd={}", snapshot.cwd.display())];
     lines.extend(
@@ -4445,22 +2897,6 @@ fn format_snapshot_env(snapshot: &EnvSnapshot) -> String {
             .iter()
             .map(|(key, value)| format!("{key}={}", value.escape_default())),
     );
-    lines.join("\n")
-}
-
-fn format_probe_env(snapshot: &EnvSnapshot, keys: &[String]) -> String {
-    if keys.is_empty() {
-        return format_snapshot_env(snapshot);
-    }
-    let mut lines = vec![format!("cwd={}", snapshot.cwd.display())];
-    for key in keys {
-        let value = snapshot
-            .env
-            .get(key)
-            .map(|value| value.escape_default().to_string())
-            .unwrap_or_else(|| "<unset>".into());
-        lines.push(format!("{key}={value}"));
-    }
     lines.join("\n")
 }
 
@@ -4515,10 +2951,9 @@ fn render_help_text(topic: Option<&str>) -> String {
     {
         None => general_help_text().into(),
         Some(topic) if is_job_help_topic(topic) => job_help_text().into(),
-        Some(topic) if is_agent_help_topic(topic) => agent_help_text().into(),
         Some(topic) if is_cron_help_topic(topic) => cron_help_text().into(),
         Some(topic) => format!(
-            "Unknown help topic `{topic}`.\n\nAvailable help topics: job, agent, cron.\nUse bare `?` to show detailed help for the current mode."
+            "Unknown help topic `{topic}`.\n\nAvailable help topics: job, cron.\nUse bare `?` to show detailed help for the current mode."
         ),
     }
 }
@@ -4543,13 +2978,6 @@ fn is_job_help_topic(topic: &str) -> bool {
     )
 }
 
-fn is_agent_help_topic(topic: &str) -> bool {
-    matches!(
-        topic,
-        "agent" | "agents" | "ask" | "spawn" | "send" | "cancel" | "confirm" | "escalate" | "probe"
-    )
-}
-
 fn is_cron_help_topic(topic: &str) -> bool {
     matches!(topic, "cron" | "crons" | "pause" | "resume")
 }
@@ -4561,9 +2989,6 @@ fn general_help_text() -> &'static str {
         "Modes:\n",
         "- JOB: run shell commands and inspect output / scopes.\n",
         "- CRON: define scheduled commands.\n",
-        "\n",
-        "Compatibility bridge:\n",
-        "- legacy prompt/session commands can still be forwarded to weft during migration.\n",
         "\n",
         "Quick tips:\n",
         "- Enter bare `?` to show detailed help for the current mode.\n",
@@ -4590,27 +3015,7 @@ fn job_help_text() -> &'static str {
         "- `:fg J<n>` attach an interactive job in the foreground\n",
         "- `:wait J<n>` block until the job finishes\n",
         "- `:retry J<n>` rerun from the original start scope\n",
-        "- compatibility: `:probe status|out|err|env ...` inspect job state without changing it\n",
         "- `:env`, `:env set ...`, `:cd ...` inspect or update the persisted HEAD scope\n"
-    )
-}
-
-fn agent_help_text() -> &'static str {
-    concat!(
-        "LEGACY compatibility\n",
-        "\n",
-        "Legacy prompt/session commands remain available only as a transitional bridge.\n",
-        "\n",
-        "Compatibility aliases:\n",
-        "- `:ask ...` one-shot prompt alias\n",
-        "- `:spawn ...` long-lived session alias\n",
-        "- `:send A<n> ...` continue an existing session\n",
-        "- `:cancel A<n>` cancel the current turn\n",
-        "- `:kill A<n>` terminate the session\n",
-        "- `:agents` list active sessions\n",
-        "- `:confirm ...` confirmation alias\n",
-        "- `:escalate ...` follow-up alias\n",
-        "- `session=<id>` resume when loadSession is available\n"
     )
 }
 
@@ -4660,9 +3065,9 @@ async fn handle_list_scopes(sys: &ActorSystem) -> ResponsePayload {
     }
 }
 
-/// Build a human-readable log of jobs and agents.
+/// Build a human-readable log of jobs and crons.
 ///
-/// If `id` is given, only log for that specific job or agent is shown.
+/// If `id` is given, only log for that specific job or cron is shown.
 fn format_log_text(state: &SchedulerState, id: Option<&str>) -> String {
     if let Some(id) = id {
         if let Some(job_id) = parse_job_id(id) {
@@ -4681,19 +3086,19 @@ fn format_log_text(state: &SchedulerState, id: Option<&str>) -> String {
                 })
                 .unwrap_or_else(|| format!("{id}: job not found"));
         }
-        if let Some(agent_id) = parse_agent_id(id) {
+        if let Some(cron_id) = parse_cron_id(id) {
             return state
-                .agents
-                .get(&agent_id)
+                .crons
+                .get(&cron_id)
                 .map(|entry| {
                     format!(
-                        "{}: backend={} role={:?} status={:?}",
-                        entry.agent_id, entry.backend, entry.role, entry.status
+                        "{}: {} [{:?}]",
+                        entry.cron_id, entry.schedule_text, entry.status
                     )
                 })
-                .unwrap_or_else(|| format!("{id}: agent not found"));
+                .unwrap_or_else(|| format!("{id}: cron not found"));
         }
-        return format!("{id}: unrecognised ID (expected J<n> or A<n>)");
+        return format!("{id}: unrecognised ID (expected J<n> or C<n>)");
     }
 
     let mut lines = Vec::new();
@@ -4712,16 +3117,16 @@ fn format_log_text(state: &SchedulerState, id: Option<&str>) -> String {
         }
     }
 
-    let mut agents: Vec<&AgentEntry> = state.agents.values().collect();
-    agents.sort_by_key(|a| a.agent_id.0);
-    if agents.is_empty() {
-        lines.push("agents: none".into());
+    let mut crons: Vec<&CronEntry> = state.crons.values().collect();
+    crons.sort_by_key(|c| c.cron_id.0);
+    if crons.is_empty() {
+        lines.push("crons: none".into());
     } else {
-        lines.push("=== Agents ===".into());
-        for entry in agents {
+        lines.push("=== Crons ===".into());
+        for entry in crons {
             lines.push(format!(
-                "  {}: backend={} role={:?} [{:?}]",
-                entry.agent_id, entry.backend, entry.role, entry.status
+                "  {}: {} [{:?}]",
+                entry.cron_id, entry.schedule_text, entry.status
             ));
         }
     }
@@ -4731,29 +3136,7 @@ fn format_log_text(state: &SchedulerState, id: Option<&str>) -> String {
 
 /// Format the active config as human-readable text.
 fn format_config_text(config: &Config) -> String {
-    let mut lines = vec![format!(
-        "agent.default_backend = {}",
-        config.agent.default_backend
-    )];
-    for (name, backend) in &config.agent.backends {
-        lines.push(format!("[agent.backends.{name}]"));
-        if !backend.command.is_empty() {
-            lines.push(format!("  command = {}", backend.command));
-        }
-        if !backend.args.is_empty() {
-            let args = backend
-                .args
-                .iter()
-                .map(|a| format!("{a:?}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            lines.push(format!("  args = [{args}]"));
-        }
-        if let Some(model) = &backend.model {
-            lines.push(format!("  model = {model}"));
-        }
-    }
-    lines.join("\n")
+    format!("weft.socket_path = {}", config.weft.socket_path.display())
 }
 
 async fn read_job_output(
@@ -4948,15 +3331,9 @@ async fn read_stderr_from_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentBackendConfig, AgentConfig, WeftConfig};
     use cue_core::pipeline::{PipeSegment, Pipeline};
-    use std::collections::VecDeque;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixListener;
-    use tokio::sync::Mutex as TokioMutex;
     use tokio::sync::mpsc;
 
     /// Helper: build a simple leaf from a command string.
@@ -5047,178 +3424,6 @@ mod tests {
         ids
     }
 
-    fn fake_agent_config() -> Config {
-        Config {
-            agent: AgentConfig {
-                transport: AgentTransport::Legacy,
-                default_backend: "fake".into(),
-                backends: std::collections::BTreeMap::from([(
-                    "fake".into(),
-                    AgentBackendConfig {
-                        command: "/bin/sh".into(),
-                        args: vec![
-                            "-c".into(),
-                            r#"
-blocked_prompt_id=
-count=0
-while IFS= read -r line; do
-  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true}}}"
-      ;;
-    *'"method":"session/new"'*)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"sessionId\":\"sess_fake\"}}"
-      ;;
-    *'"method":"session/load"'*)
-      session_id=$(printf '%s\n' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"sessionId\":\"$session_id\"}}"
-      ;;
-    *'"method":"session/cancel"'*)
-      if [ -n "$blocked_prompt_id" ]; then
-        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$blocked_prompt_id,\"result\":{}}"
-        blocked_prompt_id=
-      fi
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
-      ;;
-    *'"method":"session/prompt"'*)
-      count=$((count + 1))
-      if [ "$count" -eq 1 ]; then
-        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply:first"}}}}'
-        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
-      elif [ "$count" -eq 2 ]; then
-        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply:second"}}}}'
-        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
-      else
-        blocked_prompt_id=$id
-      fi
-      ;;
-  esac
-done
-"#
-                            .into(),
-                        ],
-                        model: None,
-                    },
-                )]),
-            },
-            aliases: crate::config::AliasConfig::default(),
-            weft: WeftConfig::default(),
-        }
-    }
-
-    fn fake_agent_config_without_load_session() -> Config {
-        let mut config = fake_agent_config();
-        let backend = config.agent.backends.get_mut("fake").expect("fake backend");
-        backend.args[1] =
-            backend.args[1].replace(r#"\"loadSession\":true"#, r#"\"loadSession\":false"#);
-        config
-    }
-
-    fn weft_agent_config(socket_path: &Path) -> Config {
-        Config {
-            agent: AgentConfig {
-                transport: AgentTransport::Weft,
-                default_backend: "weft-agent".into(),
-                backends: std::collections::BTreeMap::from([(
-                    "weft-agent".into(),
-                    AgentBackendConfig {
-                        command: String::new(),
-                        args: vec![],
-                        model: None,
-                    },
-                )]),
-            },
-            aliases: crate::config::AliasConfig::default(),
-            weft: WeftConfig {
-                socket_path: socket_path.to_path_buf(),
-            },
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    struct RecordedWeftRequest {
-        method: String,
-        path: String,
-        body: String,
-    }
-
-    async fn spawn_fake_weft_server(
-        socket_path: PathBuf,
-        responses: Vec<String>,
-    ) -> (
-        tokio::task::JoinHandle<()>,
-        Arc<TokioMutex<Vec<RecordedWeftRequest>>>,
-    ) {
-        let expected = responses.len();
-        let recorded = Arc::new(TokioMutex::new(Vec::new()));
-        let recorded_clone = Arc::clone(&recorded);
-        let response_queue = Arc::new(TokioMutex::new(VecDeque::from(responses)));
-        let response_queue_clone = Arc::clone(&response_queue);
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent).expect("create test socket dir");
-        }
-        let _ = std::fs::remove_file(&socket_path);
-        let listener = UnixListener::bind(&socket_path).expect("bind fake weft server");
-
-        let handle = tokio::spawn(async move {
-            for _ in 0..expected {
-                let (mut stream, _) = listener.accept().await.expect("accept weft request");
-                let mut request = Vec::new();
-                stream
-                    .read_to_end(&mut request)
-                    .await
-                    .expect("read weft request");
-                let request = String::from_utf8_lossy(&request).into_owned();
-                let (head, body) = request
-                    .split_once("\r\n\r\n")
-                    .expect("HTTP request should contain a body separator");
-                let mut parts = head
-                    .lines()
-                    .next()
-                    .expect("HTTP request line")
-                    .split_whitespace();
-                let method = parts.next().expect("HTTP method").to_string();
-                let path = parts.next().expect("HTTP path").to_string();
-                recorded_clone.lock().await.push(RecordedWeftRequest {
-                    method,
-                    path,
-                    body: body.to_string(),
-                });
-
-                let response = response_queue_clone
-                    .lock()
-                    .await
-                    .pop_front()
-                    .expect("queued HTTP response");
-                stream
-                    .write_all(response.as_bytes())
-                    .await
-                    .expect("write fake weft response");
-            }
-            let _ = std::fs::remove_file(&socket_path);
-        });
-
-        (handle, recorded)
-    }
-
-    fn unique_test_socket_path(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        PathBuf::from("target")
-            .join("test-sockets")
-            .join(format!("s-{name}-{nanos}.sock"))
-    }
-
-    async fn recv_scheduler_msg(rx: &mut mpsc::Receiver<SchedulerMsg>) -> SchedulerMsg {
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("scheduler message timeout")
-            .expect("scheduler channel closed")
-    }
-
     async fn recv_gateway_msg(rx: &mut mpsc::Receiver<GatewayMsg>) -> GatewayMsg {
         tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
@@ -5232,10 +3437,6 @@ done
         assert!(job.contains("JOB mode"));
         assert!(job.contains(":tail J<n>"));
 
-        let agent = render_help_text(Some("agent"));
-        assert!(agent.contains("LEGACY compatibility"));
-        assert!(agent.contains("Compatibility aliases"));
-
         let cron = render_help_text(Some("cron"));
         assert!(cron.contains("CRON mode"));
         assert!(cron.contains("every 5m cargo test"));
@@ -5244,7 +3445,7 @@ done
     #[test]
     fn help_renderer_maps_command_aliases_to_modes() {
         assert!(render_help_text(Some("run")).contains("JOB mode"));
-        assert!(render_help_text(Some("ask")).contains("LEGACY compatibility"));
+        assert!(render_help_text(Some("ask")).contains("Unknown help topic"));
         assert!(render_help_text(Some("pause")).contains("CRON mode"));
     }
 
@@ -6094,497 +4295,6 @@ done
             after.len(),
             1,
             "b should be spawned via Always after cancel"
-        );
-    }
-
-    #[tokio::test]
-    async fn weft_proxy_routes_agent_commands() {
-        let socket_path = unique_test_socket_path("proxy-agent");
-        let (server, recorded) = spawn_fake_weft_server(
-            socket_path.clone(),
-            vec![
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"protocol\":\"v1\",\"request\":{\"agent\":\"weft-agent\",\"workspace\":{\"root\":\"/workspace\"},\"input\":\"plan\"},\"session\":{\"status\":\"pending\"}}".into(),
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"protocol\":\"v1\",\"request\":{\"agent\":\"weft-agent\",\"workspace\":{\"root\":\"/workspace\"},\"input\":\"execute\"},\"session\":{\"status\":\"pending\"}}".into(),
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"protocol\":\"v1\",\"capabilities\":[]}".into(),
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"protocol\":\"v1\",\"capabilities\":[]}".into(),
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"protocol\":\"v1\",\"capabilities\":[]}".into(),
-            ],
-        )
-        .await;
-
-        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
-        spawn_fake_scope_store(ss_rx);
-        let conn = test_db();
-        let config = weft_agent_config(&socket_path);
-        let mut state = SchedulerState::new();
-
-        let ask_response = handle_command(
-            ResolvedCommand::Ask {
-                text: "plan".into(),
-                params: ModeParams::new(),
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        let ask_id = match ask_response {
-            ResponsePayload::Ok(OkPayload::AgentSpawned { agent_id }) => agent_id,
-            other => panic!("expected AgentSpawned, got {other:?}"),
-        };
-
-        let spawn_response = handle_command(
-            ResolvedCommand::Spawn {
-                text: "execute".into(),
-                params: ModeParams::new(),
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        let spawn_id = match spawn_response {
-            ResponsePayload::Ok(OkPayload::AgentSpawned { agent_id }) => agent_id,
-            other => panic!("expected AgentSpawned, got {other:?}"),
-        };
-
-        let agents_response =
-            handle_command(ResolvedCommand::Agents, 0, &mut state, &conn, &config, &sys).await;
-        match agents_response {
-            ResponsePayload::Ok(OkPayload::AgentList(list)) => {
-                assert_eq!(list.len(), 2);
-                assert_eq!(list[0].id, ask_id);
-                assert_eq!(list[1].id, spawn_id);
-                assert!(list.iter().all(|agent| agent.backend == "weft-agent"));
-            }
-            other => panic!("expected AgentList, got {other:?}"),
-        }
-
-        let send_response = handle_command(
-            ResolvedCommand::Send {
-                id: ask_id.clone(),
-                data: "follow up".into(),
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        assert!(matches!(
-            send_response,
-            ResponsePayload::Err { code, message }
-                if code == error_code::NOT_SUPPORTED && message.contains("follow-up prompts")
-        ));
-
-        let cancel_response = handle_command(
-            ResolvedCommand::Cancel { id: ask_id.clone() },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        assert!(matches!(
-            cancel_response,
-            ResponsePayload::Err { code, message }
-                if code == error_code::NOT_SUPPORTED && message.contains("cancellation")
-        ));
-
-        server.await.expect("fake weft server task");
-
-        let recorded = recorded.lock().await;
-        assert_eq!(recorded.len(), 5);
-        assert_eq!(recorded[0].method, "POST");
-        assert_eq!(recorded[0].path, "/sessions/prepare");
-        assert!(recorded[0].body.contains("\"input\":\"plan\""));
-        assert_eq!(recorded[1].method, "POST");
-        assert_eq!(recorded[1].path, "/sessions/prepare");
-        assert!(recorded[1].body.contains("\"input\":\"execute\""));
-        for request in &recorded[2..] {
-            assert_eq!(request.method, "GET");
-            assert_eq!(request.path, "/discover");
-        }
-        assert!(
-            state
-                .agents
-                .values()
-                .all(|entry| entry.proxied && entry.transcript.contains("weft bootstrap API"))
-        );
-    }
-
-    #[tokio::test]
-    async fn jobs_still_list_local_state_when_weft_proxy_is_enabled() {
-        let (sys, _gw_rx, _sched_rx, _pm_rx, _ss_rx, _eb_rx) = test_actor_system();
-        let conn = test_db();
-        let config = weft_agent_config(Path::new("/definitely/not/listened.sock"));
-        let mut state = SchedulerState::new();
-        state.jobs.insert(
-            JobId(1),
-            JobEntry {
-                job_id: JobId(1),
-                pipeline_text: "cargo test".into(),
-                status: JobStatus::Running,
-                exit_code: None,
-                start_scope: None,
-                end_scope: None,
-                open_hint: JobOpenHint::Stream,
-                chain_id: None,
-                chain_index: None,
-                chain_total: None,
-                stderr: String::new(),
-            },
-        );
-
-        let response =
-            handle_command(ResolvedCommand::Jobs, 0, &mut state, &conn, &config, &sys).await;
-        match response {
-            ResponsePayload::Ok(OkPayload::JobList(list)) => {
-                assert_eq!(list.len(), 1);
-                assert_eq!(list[0].id, "J1");
-                assert_eq!(list[0].pipeline, "cargo test");
-            }
-            other => panic!("expected JobList, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn agent_follow_up_abort_and_kill() {
-        let (sys, _gw_rx, mut sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
-        spawn_fake_scope_store(ss_rx);
-
-        let conn = test_db();
-        let config = fake_agent_config();
-        let mut state = SchedulerState::new();
-
-        let resp = handle_command(
-            ResolvedCommand::Ask {
-                text: "first".into(),
-                params: cue_core::command::ModeParams::new(),
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        let agent_id = match resp {
-            ResponsePayload::Ok(OkPayload::AgentSpawned { agent_id }) => agent_id,
-            other => panic!("expected AgentSpawned, got {other:?}"),
-        };
-        let aid = parse_agent_id(&agent_id).expect("valid agent id");
-
-        let mut saw_first_reply = false;
-        let mut saw_waiting = false;
-        for _ in 0..4 {
-            match recv_scheduler_msg(&mut sched_rx).await {
-                SchedulerMsg::AgentMessage {
-                    agent_id, content, ..
-                } if agent_id == aid && content.contains("reply:first") => {
-                    saw_first_reply = true;
-                }
-                SchedulerMsg::AgentStateChanged { agent_id, status }
-                    if agent_id == aid && status == AgentStatus::WaitingInput =>
-                {
-                    saw_waiting = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_first_reply, "agent did not stream the first reply");
-        assert!(saw_waiting, "agent did not enter WaitingInput");
-        state.agents.get_mut(&aid).unwrap().status = AgentStatus::WaitingInput;
-
-        let send_resp = handle_command(
-            ResolvedCommand::Send {
-                id: agent_id.clone(),
-                data: "second".into(),
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        assert!(matches!(send_resp, ResponsePayload::Ok(OkPayload::Ack {})));
-
-        let mut saw_second_reply = false;
-        let mut saw_second_waiting = false;
-        for _ in 0..4 {
-            match recv_scheduler_msg(&mut sched_rx).await {
-                SchedulerMsg::AgentMessage {
-                    agent_id, content, ..
-                } if agent_id == aid && content.contains("reply:second") => {
-                    saw_second_reply = true;
-                }
-                SchedulerMsg::AgentStateChanged { agent_id, status }
-                    if agent_id == aid && status == AgentStatus::WaitingInput =>
-                {
-                    saw_second_waiting = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_second_reply, "agent did not stream the follow-up reply");
-        assert!(saw_second_waiting, "agent did not return to WaitingInput");
-        state.agents.get_mut(&aid).unwrap().status = AgentStatus::WaitingInput;
-
-        let block_resp = handle_command(
-            ResolvedCommand::Send {
-                id: agent_id.clone(),
-                data: "__block__".into(),
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        assert!(matches!(block_resp, ResponsePayload::Ok(OkPayload::Ack {})));
-        state.agents.get_mut(&aid).unwrap().status = AgentStatus::Running;
-
-        let cancel_resp = handle_command(
-            ResolvedCommand::Cancel {
-                id: agent_id.clone(),
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        assert!(matches!(
-            cancel_resp,
-            ResponsePayload::Ok(OkPayload::Ack {})
-        ));
-
-        let mut saw_abort_waiting = false;
-        for _ in 0..4 {
-            if let SchedulerMsg::AgentStateChanged { agent_id, status } =
-                recv_scheduler_msg(&mut sched_rx).await
-                && agent_id == aid
-                && status == AgentStatus::WaitingInput
-            {
-                saw_abort_waiting = true;
-                break;
-            }
-        }
-        assert!(
-            saw_abort_waiting,
-            "agent did not return to WaitingInput after cancel"
-        );
-        state.agents.get_mut(&aid).unwrap().status = AgentStatus::WaitingInput;
-
-        let kill_resp = handle_command(
-            ResolvedCommand::Kill {
-                id: agent_id.clone(),
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        assert!(matches!(kill_resp, ResponsePayload::Ok(OkPayload::Ack {})));
-
-        let mut saw_kill_message = false;
-        let mut saw_failed = false;
-        for _ in 0..4 {
-            match recv_scheduler_msg(&mut sched_rx).await {
-                SchedulerMsg::AgentMessage {
-                    agent_id, content, ..
-                } if agent_id == aid && content.contains("aborted by user") => {
-                    saw_kill_message = true;
-                }
-                SchedulerMsg::AgentStateChanged { agent_id, status }
-                    if agent_id == aid && status == AgentStatus::Failed =>
-                {
-                    saw_failed = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_kill_message, "agent did not emit an abort message");
-        assert!(saw_failed, "agent did not transition to Failed after kill");
-    }
-
-    #[tokio::test]
-    async fn agent_session_override_loads_existing_session() {
-        let (sys, _gw_rx, mut sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
-        spawn_fake_scope_store(ss_rx);
-
-        let conn = test_db();
-        let config = fake_agent_config();
-        let mut state = SchedulerState::new();
-        let mut params = cue_core::command::ModeParams::new();
-        params.insert("session", ParamValue::Str("sess_resume".into()));
-
-        let resp = handle_command(
-            ResolvedCommand::Ask {
-                text: "resume".into(),
-                params,
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        let agent_id = match resp {
-            ResponsePayload::Ok(OkPayload::AgentSpawned { agent_id }) => agent_id,
-            other => panic!("expected AgentSpawned, got {other:?}"),
-        };
-        let aid = parse_agent_id(&agent_id).expect("valid agent id");
-
-        let mut saw_session_message = false;
-        let mut saw_reply = false;
-        let mut saw_waiting = false;
-        for _ in 0..5 {
-            match recv_scheduler_msg(&mut sched_rx).await {
-                SchedulerMsg::AgentMessage {
-                    agent_id, content, ..
-                } => {
-                    if agent_id == aid && content.contains("ACP session: sess_resume") {
-                        saw_session_message = true;
-                    }
-                    if agent_id == aid && content.contains("reply:first") {
-                        saw_reply = true;
-                    }
-                }
-                SchedulerMsg::AgentStateChanged { agent_id, status }
-                    if agent_id == aid && status == AgentStatus::WaitingInput =>
-                {
-                    saw_waiting = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        assert!(
-            saw_session_message,
-            "agent did not surface the loaded ACP session ID"
-        );
-        assert!(
-            saw_reply,
-            "agent did not continue the loaded session prompt"
-        );
-        assert!(saw_waiting, "agent did not settle back to WaitingInput");
-    }
-
-    #[tokio::test]
-    async fn fg_accepts_agent_sessions() {
-        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
-        spawn_fake_scope_store(ss_rx);
-
-        let conn = test_db();
-        let config = fake_agent_config();
-        let mut state = SchedulerState::new();
-
-        let resp = handle_command(
-            ResolvedCommand::Ask {
-                text: "first".into(),
-                params: cue_core::command::ModeParams::new(),
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        let agent_id = match resp {
-            ResponsePayload::Ok(OkPayload::AgentSpawned { agent_id }) => agent_id,
-            other => panic!("expected AgentSpawned, got {other:?}"),
-        };
-
-        let fg_resp = handle_command(
-            ResolvedCommand::Fg {
-                id: agent_id.clone(),
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        assert!(matches!(
-            fg_resp,
-            ResponsePayload::Ok(OkPayload::FgAttached { id }) if id == agent_id
-        ));
-    }
-
-    #[tokio::test]
-    async fn agent_session_override_requires_load_session_capability() {
-        let (sys, _gw_rx, mut sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
-        spawn_fake_scope_store(ss_rx);
-
-        let conn = test_db();
-        let config = fake_agent_config_without_load_session();
-        let mut state = SchedulerState::new();
-        let mut params = cue_core::command::ModeParams::new();
-        params.insert("session", ParamValue::Str("sess_resume".into()));
-
-        let resp = handle_command(
-            ResolvedCommand::Ask {
-                text: "resume".into(),
-                params,
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-        let agent_id = match resp {
-            ResponsePayload::Ok(OkPayload::AgentSpawned { agent_id }) => agent_id,
-            other => panic!("expected AgentSpawned, got {other:?}"),
-        };
-        let aid = parse_agent_id(&agent_id).expect("valid agent id");
-
-        let mut saw_failure_message = false;
-        let mut saw_failed = false;
-        for _ in 0..4 {
-            match recv_scheduler_msg(&mut sched_rx).await {
-                SchedulerMsg::AgentMessage {
-                    agent_id, content, ..
-                } if agent_id == aid && content.contains("does not support session/load") => {
-                    saw_failure_message = true;
-                }
-                SchedulerMsg::AgentStateChanged { agent_id, status }
-                    if agent_id == aid && status == AgentStatus::Failed =>
-                {
-                    saw_failed = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        assert!(
-            saw_failure_message,
-            "agent did not explain the missing loadSession capability"
-        );
-        assert!(
-            saw_failed,
-            "agent did not fail after rejecting session/load"
         );
     }
 

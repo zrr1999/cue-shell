@@ -1282,11 +1282,9 @@ async fn test_bare_question_returns_current_mode_help() {
         let mut child = env.spawn_daemon();
         let mut stream = wait_for_socket(&env.socket).await;
 
-        for (request_id, mode, expected) in [
-            (1, Mode::Job, "JOB mode"),
-            (2, Mode::Agent, "JOB mode"),
-            (3, Mode::Cron, "CRON mode"),
-        ] {
+        for (request_id, mode, expected) in
+            [(1, Mode::Job, "JOB mode"), (2, Mode::Cron, "CRON mode")]
+        {
             let resp = roundtrip(
                 &mut stream,
                 request_id,

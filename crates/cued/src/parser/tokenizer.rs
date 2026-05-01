@@ -263,7 +263,7 @@ impl<'a> Tokenizer<'a> {
     fn tokenize_word(&mut self) -> Result<Token, TokenizeError> {
         let start = self.pos;
 
-        // Check for ID ref: J1, A2, C3, S0
+        // Check for ID ref: J1, C3, S0
         if let Some(kind) = self.try_id_kind() {
             let prefix_pos = self.pos;
             self.pos += 1; // skip prefix letter
@@ -332,7 +332,6 @@ impl<'a> Tokenizer<'a> {
     fn try_id_kind(&self) -> Option<IdKind> {
         match self.peek()? {
             b'J' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Job),
-            b'A' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Agent),
             b'C' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Cron),
             b'S' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Scope),
             _ => None,

@@ -18,7 +18,7 @@ use crate::app::AppMsg;
 /// A single item in the sidebar list.
 #[derive(Debug, Clone)]
 pub struct SidebarItem {
-    /// Short identifier, e.g. "J1", "A2".
+    /// Short identifier, e.g. "J1", "C2".
     pub id: String,
     /// Human-readable label (command text).
     pub label: String,
@@ -31,7 +31,6 @@ pub struct SidebarItem {
 pub struct OverviewCounts {
     pub jobs: u32,
     pub jobs_running: u32,
-    pub agents: u32,
     pub crons: u32,
 }
 
@@ -81,7 +80,6 @@ impl Sidebar {
     fn list_title(&self) -> &'static str {
         match self.mode {
             Mode::Job => " Jobs ",
-            Mode::Agent => " Jobs ",
             Mode::Cron => " Crons ",
         }
     }
@@ -89,7 +87,6 @@ impl Sidebar {
     fn empty_hint(&self) -> &'static str {
         match self.mode {
             Mode::Job => "No jobs yet.",
-            Mode::Agent => "No jobs yet.",
             Mode::Cron => "No crons yet.",
         }
     }

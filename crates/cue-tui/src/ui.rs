@@ -29,46 +29,6 @@ use cue_core::job::JobStatus;
 pub fn draw(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
     if state.fg_active() {
-        if state.fg_is_agent() {
-            let input_height = state
-                .input
-                .desired_height()
-                .min(area.height.saturating_sub(4).max(1));
-            let vertical = Layout::vertical([
-                Constraint::Min(3),
-                Constraint::Length(input_height),
-                Constraint::Length(1),
-            ])
-            .split(area);
-            let body_area = vertical[0];
-            let input_area = vertical[1];
-            let footer_area = vertical[2];
-            let fg_id = state.fg_id().unwrap_or("?");
-            let block = Block::new()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(format!(" SESSION {fg_id} "));
-            let inner = block.inner(body_area);
-            frame.render_widget(block, body_area);
-            frame.render_widget(
-                Paragraph::new(ansi::to_text(
-                    &state
-                        .fg_agent_content()
-                        .unwrap_or_else(|| "No conversation yet.".to_string()),
-                ))
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(Color::White)),
-                inner,
-            );
-            state.input.render(frame, input_area);
-            frame.render_widget(
-                Paragraph::new(Line::from(state.fg_agent_footer_text()))
-                    .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
-                footer_area,
-            );
-            return;
-        }
-
         let vertical = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
         let body_area = vertical[0];
         let status_area = vertical[1];

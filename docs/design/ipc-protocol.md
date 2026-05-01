@@ -83,9 +83,8 @@ struct SubscribeRequest {
 
 Channel types:
 - `"jobs"` — all job state changes (created, state transitions, removed)
-- `"agents"` — compatibility bridge agent state changes
 - `"crons"` — all cron state changes
-- `"output:<id>"` — stdout/stderr chunks for specific job/bridge session (e.g., `"output:J1"`, `"output:A2"`)
+- `"output:<id>"` — stdout/stderr chunks for a specific job (e.g., `"output:J1"`)
 - `"scopes"` — scope creation, HEAD changes
 - `"system"` — cued status, shutdown notices
 
@@ -110,7 +109,7 @@ enum RequestPayload {
     Eval { input: String, mode: Mode },
     // input: raw user input, e.g. ":run(retry=3) cargo test -> cargo build"
     //        or bare input "cargo test" (cued applies mode default)
-    // mode: current TUI mode (JOB/CRON, plus AGENT bridge compatibility) for bare input resolution
+    // mode: current TUI mode (JOB/CRON) for bare input resolution
 
     // === Protocol commands (structured, not user-typed) ===
 
@@ -118,15 +117,11 @@ enum RequestPayload {
     Subscribe { channels: Vec<String> },
     Unsubscribe { channels: Vec<String> },
 
-    // :fg mode (job pty attach; agent session foreground is compatibility-only)
-    FgAttach { id: String },  // J1 or A1
+    // :fg mode (job pty attach)
+    FgAttach { id: String },  // J1
     FgDetach {},
     FgInput { data: Vec<u8> },  // raw bytes from TUI keyboard
     FgResize { cols: u16, rows: u16 },  // terminal resize
-
-    // Structured agent session controls used by the TUI foreground view
-    AgentPrompt { id: String, prompt: String },
-    AgentCancel { id: String },
 
     // Editor services (completion & highlighting)
     Complete { input: String, cursor: usize, mode: Mode },
@@ -157,14 +152,11 @@ enum OkPayload {
         chain_total: Option<usize>,
     },  // scope snapshot used when the job starts; open_hint tells the TUI whether running jobs should open as :out or :fg
     ChainCreated { chain_id: String, job_ids: Vec<String>, chain: ChainInfo },
-    AgentSpawned { agent_id: String },
     CronAdded { cron_id: String },
     ScopeCreated { hash: String, label: Option<String>, summary: String },
 
     JobInfo(JobInfo),
-    AgentInfo(AgentInfo),      // compatibility bridge metadata + transcript for UI hydration
     JobList(Vec<JobInfo>),
-    AgentList(Vec<AgentInfo>), // same AgentInfo payload, used by reconnect/sidebar snapshots
     CronList(Vec<CronInfo>),   // includes persisted cron status/history for reconnect snapshots
     ScopeInfo(ScopeInfo),
     Output { id: String, data: String, truncated: bool },
@@ -172,13 +164,11 @@ enum OkPayload {
     // Eval can return any of the above depending on the parsed command.
     // Additionally, some commands produce text output:
     EvalText { text: String },  // for :help, :env list, etc.
-    ConfirmRequest { prompt: String },
-
     // Editor services
     CompletionList { items: Vec<CompletionItem> },
     HighlightResult { spans: Vec<HighlightSpan> },
 
-    FgAttached { id: String },  // J<n> = live PTY attach; A<n> = foreground session view opened
+    FgAttached { id: String },  // J<n> = live PTY attach
     Pong {},
 }
 
@@ -222,10 +212,6 @@ enum EventPayload {
     ChainProgress { chain: ChainInfo },
     JobRemoved { job_id: String },
 
-    // Agent events (channel: "agents") — compatibility bridge only
-    AgentStateChanged { agent_id: String, old_state: AgentState, new_state: AgentState },
-    AgentMessage { agent_id: String, role: String, content: String },  // conversation stream
-
     // Cron events (channel: "crons")
     CronTriggered { cron_id: String, job_id: String },  // cron fired, spawned job
     CronRemoved { cron_id: String },
@@ -243,7 +229,7 @@ enum EventPayload {
 
     // :fg events (no channel — only sent to fg-attached client)
     FgOutput { data: Vec<u8> },  // raw pty output
-    FgExited { id: String, reason: String },  // process exited while in :fg (jobs only)
+    FgExited { id: String, reason: String },  // process exited while in :fg
 
     // System events (channel: "system")
     ShuttingDown { reason: String },
@@ -300,7 +286,7 @@ Job scope fields are intentionally split:
 
 When client sends `FgAttach { id: "J1" }`:
 1. cued responds `FgAttached { id: "J1" }`
-2. Connection enters **fg proxy mode** for this job/agent:
+2. Connection enters **fg proxy mode** for this job:
    - Client → cued: `FgInput { data }` messages (raw keystrokes)
    - cued → client: `FgOutput { data }` events (raw pty output)
    - Client → cued: `FgResize { cols, rows }` on terminal resize
@@ -315,13 +301,13 @@ Standard error codes returned in `Err { code, message }`:
 
 | Code | Meaning |
 |---|---|
-| `NOT_FOUND` | Job/Agent/Cron/Scope not found |
+| `NOT_FOUND` | Job/Cron/Scope not found |
 | `INVALID_STATE` | Operation not valid in current state (e.g., :fg on Done job) |
 | `INVALID_SCOPE` | Referenced scope hash not found |
 | `INVALID_SYNTAX` | Malformed pipeline/chain/cron expression |
 | `ALREADY_EXISTS` | Duplicate operation (e.g., already fg-attached) |
-| `NOT_SUPPORTED` | Operation not supported (e.g., bridge feature unavailable) |
-| `PERMISSION_DENIED` | Bridge-only command from a non-bridge client |
+| `NOT_SUPPORTED` | Operation not supported |
+| `PERMISSION_DENIED` | Operation rejected by policy |
 | `INTERNAL` | Unexpected cued error |
 
 ## 11. Connection Lifecycle

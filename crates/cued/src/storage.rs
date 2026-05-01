@@ -37,7 +37,7 @@ where
 // ── Schema migration ──
 
 /// Current schema version (bump when adding migrations).
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 const MIGRATION_V1: &str = r"
 CREATE TABLE IF NOT EXISTS scopes (
@@ -69,15 +69,6 @@ CREATE TABLE IF NOT EXISTS jobs_history (
     scope_hash  BLOB,
     start_scope BLOB,
     end_scope   BLOB,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    finished_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS agents_history (
-    id          TEXT PRIMARY KEY,    -- e.g. 'A1'
-    kind        TEXT NOT NULL,
-    role        TEXT NOT NULL,
-    status      TEXT NOT NULL,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     finished_at TEXT
 );
@@ -140,41 +131,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", 3)?;
     }
     if current < 4 {
-        if !column_exists(conn, "agents_history", "backend")? {
-            conn.execute_batch("ALTER TABLE agents_history ADD COLUMN backend TEXT;")
-                .context("failed to add agents_history.backend")?;
-        }
-        if !column_exists(conn, "agents_history", "session_id")? {
-            conn.execute_batch("ALTER TABLE agents_history ADD COLUMN session_id TEXT;")
-                .context("failed to add agents_history.session_id")?;
-        }
-        if !column_exists(conn, "agents_history", "model")? {
-            conn.execute_batch("ALTER TABLE agents_history ADD COLUMN model TEXT;")
-                .context("failed to add agents_history.model")?;
-        }
-        if !column_exists(conn, "agents_history", "scope_hash")? {
-            conn.execute_batch("ALTER TABLE agents_history ADD COLUMN scope_hash BLOB;")
-                .context("failed to add agents_history.scope_hash")?;
-        }
-        conn.execute_batch(
-            "UPDATE agents_history
-             SET backend = COALESCE(backend, kind)
-             WHERE backend IS NULL OR backend = '';",
-        )
-        .context("failed to backfill agents_history.backend")?;
         conn.pragma_update(None, "user_version", 4)?;
     }
     if current < 5 {
-        if !column_exists(conn, "agents_history", "transcript")? {
-            conn.execute_batch(
-                "ALTER TABLE agents_history ADD COLUMN transcript TEXT NOT NULL DEFAULT '';",
-            )
-            .context("failed to add agents_history.transcript")?;
-        }
-        if !column_exists(conn, "agents_history", "last_role")? {
-            conn.execute_batch("ALTER TABLE agents_history ADD COLUMN last_role TEXT;")
-                .context("failed to add agents_history.last_role")?;
-        }
         conn.pragma_update(None, "user_version", 5)?;
     }
     if current < 6 {

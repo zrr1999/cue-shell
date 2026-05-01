@@ -25,9 +25,9 @@ scope、chain、cron 这些持久化原语上。
 
 早期它确实承载过一条把 agent 也塞进 shell 的路线，也曾把
 `:ask` / `:spawn` / `:agents` / `:confirm` / `:probe`、planner/executor
-模型、ACP backend、agent transcript 放进 shell 这一层。现在这部分被
-明确收缩成迁移期兼容桥接：cue-shell 负责 process substrate，weft 负责
-agent runtime 与策略。
+模型、ACP backend、agent transcript 放进 shell 这一层。现在这部分已经从
+cue-shell 的命令与模式表面移除：cue-shell 负责 process substrate，weft
+负责 agent runtime 与策略。
 
 ## 产品/设计目标
 
@@ -81,7 +81,7 @@ cue-shell 在四仓库闭环里处于最底层：
 
 - **prompt / schedule → loom → weft → warp → cue-shell**：上层链路最终都要把「实际跑的进程」落到 cue-shell 上。
 - **loom**：durable workflow runtime + automation kernel。多步、长时、需要重试和补偿的 workflow 留在 loom；loom 在需要「跑一个进程」的地方调用 cue-shell。
-- **weft**：agent runtime / control plane + superagent CLI。所有 agent 一等原语（AGENT mode、planner/executor、ACP backend lifecycle、agent transcript、agent wake/escalation、`:ask` / `:spawn` / `:agents` / `:confirm` / `:probe`）从 cue-shell 迁出到 weft。cue-shell 里剩余的 agent 面向命令只是兼容桥接，不是核心产品承诺。
+- **weft**：agent runtime / control plane + superagent CLI。所有 agent 一等原语（AGENT mode、planner/executor、ACP backend lifecycle、agent transcript、agent wake/escalation、`:ask` / `:spawn` / `:agents` / `:confirm` / `:probe`）都迁出到 weft。cue-shell 不再对外暴露这些能力。
 - **warp**：项目执行基础层 CLI。对 cue-shell 来说，warp 是一个**普通可执行**——cue-shell 不为 warp 加专门的 builtin，也不感知它的项目模型。
 - **bash / zsh / fish 等传统 shell**：cue-shell 不替代它们做交互式通用 shell；它替代的是「把进程长期、可观察、可恢复地跑在某台机器上」这一段。
 - **tmux / zellij**：cue-shell 不做终端复用层；TUI 只是 process runtime 的一个 view。
@@ -91,7 +91,7 @@ cue-shell 在四仓库闭环里处于最底层：
 ## 什么不是本项目要做的（Non-goals）
 
 - **不再把 agent 作为一等原语**：移除 / 迁出 AGENT mode、planner/executor 权限模型、agent transcript 持久化、agent wake events。
-- **不承担 agent-policy 命令**：`:ask` / `:spawn` / `:agents` / `:confirm` / `:escalate` / `:probe` 等不再属于 cue-shell，最多只保留兼容桥接。
+- **不承担 agent-policy 命令**：`:ask` / `:spawn` / `:agents` / `:confirm` / `:escalate` / `:probe` 等不再属于 cue-shell，也不再保留兼容命令面。
 - **不管理 ACP backend lifecycle**：哪个 backend、哪个 model、什么时候启动/重连，由 weft 决定；cue-shell 只把它当普通子进程。
 - **不做 workflow / DAG runtime**：多步、补偿、长时编排留在 loom；cue-shell 的 chain 只到最小依赖图。
 - **不做项目级命令登记簿**：justfile / warp 的角色不接管。

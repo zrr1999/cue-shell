@@ -1,7 +1,10 @@
 # Cue Shell — 基础命令与模式最终设计方案 v2
 
 > 已完成三轮评审、竞品调研和命名调研后的最终设计。
-> 关键变更（v1→v2）：`:` 前缀替代 `cmd:` 分隔符、去掉 CMD 模式、`:cron` 内部语法、新增 `:probe`/`:confirm`/`:escalate`。
+> **Update:** current cue-shell ships only **JOB** and **CRON** modes. Earlier
+> AGENT-mode / compatibility-bridge sections in this document are historical
+> design context; the live command surface no longer includes `:ask`,
+> `:spawn`, `:agents`, `:confirm`, `:escalate`, or `:probe`.
 
 ---
 
@@ -25,7 +28,7 @@
 - `:` 在所有模式下零冲突：shell 命令、自然语言、cron 表达式都不以 `:` 开头
 - Vim/Helix/lazygit 用户有肌肉记忆（TUI 文化一致）
 - `/` 在 JOB 模式下与绝对路径 `/usr/bin/...` 冲突
-- Agent 友好：`:` 不是任何编程语言的转义字符
+- 脚本友好：`:` 不是常见 shell 命令前缀，便于和 bare input 区分
 - 解析规则极简：**首字符 `:` → 内建命令，否则 → 模式默认包装**
 
 **冒号后空格可选**：`:run cargo build` 和 `:run  cargo build` 都合法（trim）。
@@ -36,17 +39,14 @@
 
 ## 二、模式设计
 
-### 两个主模式 + 兼容桥接
+### 两个主模式
 
 | 模式 | 默认包装 | 含义 | 定位 |
 |------|---------|------|------|
 | **JOB** ⚡ | → `:run <input>` | 输入即执行 | 核心 |
 | **CRON** ⏰ | → `:cron <input>` | 输入即调度 | 核心 |
-| **AGENT** 🤖 | → `:ask <input>` | 输入即转发到 weft | 兼容桥接 |
-
-- Shift+Tab 循环切换：JOB → CRON → AGENT → JOB
+- Shift+Tab 循环切换：JOB → CRON → JOB
 - `:` 前缀在任何模式下都能直接执行内建命令
-- AGENT 仅保留为迁移期兼容入口，不作为产品承诺的第一类模式
 
 ### 解析规则
 
@@ -70,21 +70,20 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
     match mode {
         Mode::JOB   => Ok(Action::Builtin { cmd: "run", args: input }),
         Mode::CRON  => Ok(Action::Builtin { cmd: "cron", args: input }),
-        Mode::AGENT => Ok(Action::Builtin { cmd: "ask", args: input }),
     }
 }
 ```
 
 ### 模式转换示例
 
-| 输入 | JOB ⚡ | CRON ⏰ | AGENT 🤖 (compat) |
-|------|--------|---------|-------------------|
-| `cargo build` | `:run cargo build` | `:cron cargo build` | `:ask cargo build` |
-| `run the tests` | `:run run the tests` | `:cron run the tests` | `:ask run the tests` |
-| `:kill J1` | 内建 kill ✅ | 内建 kill ✅ | 内建 kill ✅ |
-| `:jobs` | 内建 jobs ✅ | 内建 jobs ✅ | 内建 jobs ✅ |
-| `/usr/bin/python a.py` | `:run /usr/bin/python a.py` ✅ | `:cron /usr/bin/python a.py` | `:ask /usr/bin/python a.py` |
-| `every 5m cargo test` | `:run every 5m cargo test` | `:cron every 5m cargo test` ✅ | `:ask every 5m cargo test` |
+| 输入 | JOB ⚡ | CRON ⏰ |
+|------|--------|---------|
+| `cargo build` | `:run cargo build` | `:cron cargo build` |
+| `run the tests` | `:run run the tests` | `:cron run the tests` |
+| `:kill J1` | 内建 kill ✅ | 内建 kill ✅ |
+| `:jobs` | 内建 jobs ✅ | 内建 jobs ✅ |
+| `/usr/bin/python a.py` | `:run /usr/bin/python a.py` ✅ | `:cron /usr/bin/python a.py` |
+| `every 5m cargo test` | `:run every 5m cargo test` | `:cron every 5m cargo test` ✅ |
 
 **零歧义**：`:` 开头 = 内建，否则 = 模式默认。没有命名冲突，没有 fallthrough，没有上下文依赖。
 
@@ -98,14 +97,14 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 |------|------|------|------|
 | `:run` | `:run <cmd> [chain...]` | 发射 job | 核心 |
 | `:jobs` | `:jobs [--json]` | 列出所有 job 摘要 | 核心 |
-| `:wait` | `:wait J1` / `:wait A1` | 等待 job/bridge session 进入终态 | 核心 |
+| `:wait` | `:wait J1` | 等待 job 进入终态 | 核心 |
 | `:out` | `:out J1` | 查看 job stdout snapshot | 核心 |
 | `:tail` | `:tail J1 [bytes]` | 打开并持续 follow job stdout | 核心 |
 | `:err` | `:err J1` | 查看 job stderr snapshot | 核心 |
-| `:send` | `:send J1 <input>` / `:send A1 <prompt>` | 向 running job 写 stdin；或向兼容 agent 会话发送 follow-up prompt | 核心 / 兼容 |
-| `:kill` | `:kill J1` / `:kill A1` | 终止 running job；或结束兼容 agent session | 核心 / 兼容 |
-| `:cancel` | `:cancel J3` / `:cancel A1` | 取消 queued job；或 abort 当前兼容 session turn | 核心 / 兼容 |
-| `:fg` | `:fg J2` / `:fg A1` | Job 进入前台 pty；兼容 agent 打开会话前台视图 | 核心 / 兼容 |
+| `:send` | `:send J1 <input>` | 向 running job 写 stdin | 核心 |
+| `:kill` | `:kill J1` | 终止 running job | 核心 |
+| `:cancel` | `:cancel J3` | 取消 queued job | 核心 |
+| `:fg` | `:fg J2` | Job 进入前台 pty | 核心 |
 
 `:run` / JOB bare input 在发射前会基于当前 scope snapshot 做**显式 word expansion**：支持前导 `~`、`$VAR`、`${VAR}`；仍保持 direct exec，不隐式走 shell，也不做 glob / command substitution / field splitting。
 
@@ -131,19 +130,7 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 | `:scope fork` | `:scope fork S1 [--name exp]` | 从 scope 派生（delta 存储） | 核心 |
 | `:scope close` | `:scope close S1` | 归档 scope | 核心 |
 
-### 3.3 兼容桥接
-
-`cue-shell` 的 agent 面向命令目前是通过 **weft** 代理的兼容层，不是
-核心 substrate 的第一类抽象。
-
-- `:ask` / `:spawn` / `:agents` 走 weft 代理路径
-- `:send` / `:cancel` 目前仍是部分实现：若 weft 未暴露对应能力，会返回 `NOT_SUPPORTED`
-- 这些命令保留是为了迁移期兼容，不代表 cue-shell 未来必须维持 planner/executor 语义
-
-如果你只关心 durable substrate，可把这些命令视为外部桥接，而不是
-进程 runtime 的核心语义。
-
-### 3.4 Cron/定时管理
+### 3.3 Cron/定时管理
 
 | 命令 | 语法 | 语义 | 定位 |
 |------|------|------|------|
@@ -196,7 +183,7 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 > 当前 runtime 已支持：`every <dur>`、`in <dur>`、`at <time> [on <days>]`、`on <days> at <time>`、`daily/hourly/weekly/monthly`、`cron <5f>`，以及 `<5-field-crontab> do <cmd>`。
 > 更自由的 `do` 回退（如 `every 30m 9am-5pm weekdays do ...` / 动态变量 schedule）目前仍显式保留为后续能力，不再假装已实现。
 
-### 3.5 通用命令
+### 3.4 通用命令
 
 | 命令 | 语法 | 语义 | 定位 |
 |------|------|------|------|
@@ -221,38 +208,12 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 
 ---
 
-## 四、兼容桥接说明
-
-cue-shell 不再把 planner/executor 作为产品级模型；agent 面向命令只是
-迁移期桥接到 weft。
-
-### 桥接范围
-
-```
-user_input:   用户输入
-bridge_call:  :ask / :spawn / :agents
-bridge_state: weft session 生命周期
-cron_trigger: 定时任务触发
-```
-
-### 桥接约束
-
-- 桥接是只读/最小副作用优先，不应成为新流程的默认设计中心
-- 所有 durable substrate 能力仍围绕 job / scope / cron / chain 展开
-- `:ask` / `:spawn` / `:agents` 可以继续存在，但语义上属于 weft 兼容层
-- 未来如果 weft 不再需要该层，文档应允许它被移除
-
-## 五、Scope 持久化策略
+## 四、Scope 持久化策略
 
 ### Delta 存储
 - fork 出的 scope 只存储 `parent_id` + `env_delta`
 - 读取时沿 parent 链合并得到完整 env
 - 大幅减少磁盘开销
-
-### Scope 继承（兼容会话间数据共享）
-- `:spawn --inherit-scope S1`：B 继承 A 的 scope（默认只读）
-- A 完成后 scope 冻结 → B 读取 A 的 env 数据
-- 桥接层只负责会话转发，不搬运大数据
 
 ### LRU 淘汰 + 引用保护
 - 配置 `max_persisted_scopes`
@@ -271,15 +232,13 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 ---
 
-## 六、模式参数 `()` 语法
+## 五、模式参数 `()` 语法
 
 > v2 新增：用括号分离内建配置与被执行命令的参数，消除歧义。
 
 ```
 :run(retry=3, timeout=30s) cargo test --release
 :cron(scope=S0@a3f1) every 5m cargo clippy
-:ask(model=gpt-4) explain this error
-:spawn(agent=acp) implement the next step
 ```
 
 - `()` 紧跟命令名 = 模式参数（执行行为配置）
@@ -287,40 +246,19 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 - Tokenizer 根据**位置规则**消歧（前一个 token 是 Command → 模式参数）
 - 模式参数可在 `server.toml`（迁移期仍兼容旧 `config.toml`）中设置默认值，调用时覆盖
 
-### 当前 AGENT bridge 配置落地
-
-当前实现先采用**配置选择 bridge backend**，并内建 Copilot CLI 的 ACP 配置作为默认值。`cued`
-优先读取 `server.toml`，迁移期仍兼容旧 `config.toml`：
-
-```toml
-[agent]
-default_backend = "copilot"
-
-[agent.backends.copilot]
-command = "copilot"
-args = ["--acp", "--stdio"]
-```
-
-- `:ask` / `:spawn` 默认走 weft bridge
-- `:ask(agent=copilot, model=...)` / `:spawn(agent=copilot, model=...)` 可覆盖默认 backend / model
-- 当前只支持 ACP backend profile，不再额外区分 `kind`
-- 当前 ACP 集成采用**多轮 session**：同一个 agent session 会在 `Running ↔ WaitingInput` 之间切换，而不是每轮 prompt 后立即退出
-
 ### 支持模式参数的命令
 
 | 命令 | 可用参数 |
 |------|---------|
 | `:run()` | `retry`, `timeout`, `shell`, `env`, `scope` |
-| `:ask()` | `model`, `temperature`, `max_tokens`, `agent`, `session` |
 | `:cron()` | `label`, `scope` |
-| `:spawn()` | `agent`, `inherit_scope`, `depth_limit`, `model`, `session` |
 | `:scope new()` | `profile` |
 
 其他命令只有位置/标志参数，无 `()` 语法。
 
 ---
 
-## 七、操作符（两层模型）
+## 六、操作符（两层模型）
 
 ### Pipeline（Job 内部的进程管道）
 
@@ -412,12 +350,9 @@ Pipeline 内退出码 = 最后一个进程的退出码
 │ :scope close   归档 scope                  │
 │ :scopes        列出所有 scope（简写）       │
 │ :cd <path>     修改默认 scope 的 cwd       │
-├── Bridge ─────────────────────────────────┤
-│ :ask <prompt>  转发到 weft                 │
-│ :spawn <plan>  转发到 weft                 │
-│ :agents        列出 bridge session         │
-│ :send <id>     bridge follow-up            │
-│ :cancel <id>   bridge cancel               │
+├── Control ────────────────────────────────┤
+│ :send J<n> <input>  向 job 写 stdin        │
+│ :cancel J<n>        取消 queued job        │
 ├── Cron ───────────────────────────────────┤
 │ :cron <sched> <cmd>  添加定时/延迟任务     │
 │ :crons         列出定时任务                │

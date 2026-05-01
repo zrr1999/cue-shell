@@ -68,22 +68,6 @@ pub enum SchedulerMsg {
         job_id: cue_core::JobId,
         exit_code: i32,
     },
-    /// An agent emitted a streamed text chunk.
-    AgentMessage {
-        agent_id: cue_core::AgentId,
-        role: String,
-        content: String,
-    },
-    /// An agent changed lifecycle state.
-    AgentStateChanged {
-        agent_id: cue_core::AgentId,
-        status: cue_core::agent::AgentStatus,
-    },
-    /// An agent has been bound to a concrete ACP session ID.
-    AgentSessionBound {
-        agent_id: cue_core::AgentId,
-        session_id: String,
-    },
     /// Graceful shutdown.
     Shutdown,
 }

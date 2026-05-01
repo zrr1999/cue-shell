@@ -8,8 +8,6 @@ pub enum Mode {
     /// Primary work mode: bare input → `:run`
     #[default]
     Job,
-    /// Legacy compatibility mode.
-    Agent,
     /// Scheduled work mode: bare input → `:cron`
     Cron,
 }
@@ -19,7 +17,6 @@ impl Mode {
     pub fn next(self) -> Self {
         match self {
             Self::Job => Self::Cron,
-            Self::Agent => Self::Job,
             Self::Cron => Self::Job,
         }
     }
@@ -28,7 +25,6 @@ impl Mode {
     pub fn indicator(self) -> &'static str {
         match self {
             Self::Job => "⚡ JOB",
-            Self::Agent => "⚡ JOB",
             Self::Cron => "⏰ CRON",
         }
     }
@@ -37,7 +33,6 @@ impl Mode {
     pub fn default_command(self) -> &'static str {
         match self {
             Self::Job => "run",
-            Self::Agent => "ask",
             Self::Cron => "cron",
         }
     }
@@ -47,7 +42,6 @@ impl fmt::Display for Mode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Job => "Job",
-            Self::Agent => "Job",
             Self::Cron => "Cron",
         })
     }
@@ -61,7 +55,6 @@ mod tests {
     fn mode_cycle() {
         assert_eq!(Mode::Job.next(), Mode::Cron);
         assert_eq!(Mode::Cron.next(), Mode::Job);
-        assert_eq!(Mode::Agent.next(), Mode::Job);
     }
 
     #[test]

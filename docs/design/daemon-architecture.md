@@ -4,8 +4,7 @@
 
 cued is a long-running background daemon that manages Jobs, Crons, Scopes, and
 chains. Clients (TUI, CLI, MCP) connect via Unix socket. cued owns the parser,
-scheduler, process manager, and all persistent state. Any agent-facing surface is
-treated as a transitional bridge to weft rather than a core product primitive.
+scheduler, process manager, and all persistent state for the durable process substrate.
 
 ## 2. Runtime Model
 
@@ -55,7 +54,7 @@ Responsibilities:
 - Route resolved requests to Scheduler
 - Manage per-client subscriptions (channel model)
 - Forward events from EventBus to subscribed clients
-- Handle :fg proxy mode (FgInput/FgOutput forwarding) and compatibility bridge requests
+- Handle :fg proxy mode (FgInput/FgOutput forwarding)
 - Serve Complete / Highlight editor requests
 
 State: per-client subscription sets, per-client fg attachment status
@@ -93,7 +92,7 @@ Responsibilities:
 - Apply Scope (env vars + cwd) when spawning processes
 - Capture end_scope (env snapshot after process exits, if applicable)
 
-State: running process table (pid, pty fd, ring buffer, job/session id mapping)
+State: running process table (pid, pty fd, ring buffer, job id mapping)
 
 ### 3.4 ScopeStore
 
@@ -124,10 +123,10 @@ State: subscriber registry (Gateway handles per-client routing)
 
 ### Layer 1: In-Memory (Real-time)
 
-- **Output ring buffer**: per-Job/bridge session, fixed size (default 1 MiB), circular overwrite
+- **Output ring buffer**: per-Job, fixed size (default 1 MiB), circular overwrite
   - Source of truth for OutputChunk events pushed to clients
   - Also serves `:out J1` tail queries for recent output
-- **Active state**: running Jobs, Chains, Crons, and bridge sessions (in respective Actors)
+- **Active state**: running Jobs, Chains, and Crons (in respective Actors)
 
 ### Layer 2: File System (Output Persistence)
 
@@ -135,7 +134,7 @@ State: subscriber registry (Gateway handles per-client routing)
   - Append-only write from ProcessManager as chunks arrive
   - Full historical output for `:out J1 --full` or :log queries
   - Auto-cleanup: configurable retention (by age or total size)
-- One file per Job/bridge session, plain text (binary-safe with raw bytes)
+- One file per Job, plain text (binary-safe with raw bytes)
 
 ### Layer 3: SQLite (Metadata Persistence)
 
@@ -181,22 +180,6 @@ CREATE TABLE jobs_history (
     started_at   TEXT,
     finished_at  TEXT NOT NULL,
     exit_code    INTEGER
-);
-
--- Compatibility-bridge history
-CREATE TABLE agents_history (
-    id          TEXT PRIMARY KEY,  -- A1, A2, ...
-    kind        TEXT NOT NULL,     -- legacy compatibility mirror of backend
-    backend     TEXT,              -- configured ACP backend/profile name
-    role        TEXT NOT NULL,     -- legacy session role / bridge metadata
-    status      TEXT NOT NULL,
-    session_id  TEXT,              -- ACP session id for resume/session-load
-    model       TEXT,              -- optional model override
-    scope_hash  BLOB,              -- scope snapshot used to relaunch the runtime
-    transcript  TEXT NOT NULL,     -- persisted session transcript for reconnect/restart hydration
-    last_role   TEXT,              -- last appended transcript role, used to continue chunk formatting
-    created_at  TEXT NOT NULL,
-    finished_at TEXT
 );
 
 -- Config overrides (mode param defaults from config.toml, cached)

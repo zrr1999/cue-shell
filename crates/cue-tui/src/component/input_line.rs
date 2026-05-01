@@ -365,7 +365,6 @@ impl Component for InputLine {
     fn render(&self, frame: &mut Frame, area: Rect) {
         let mode_style = match self.mode {
             Mode::Job => Style::default().fg(Color::Yellow),
-            Mode::Agent => Style::default().fg(Color::DarkGray),
             Mode::Cron => Style::default().fg(Color::Magenta),
         };
 

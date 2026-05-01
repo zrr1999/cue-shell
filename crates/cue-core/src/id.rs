@@ -6,10 +6,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct JobId(pub u32);
 
-/// Agent sequence number, displayed as A1, A2, ...
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AgentId(pub u32);
-
 /// Cron sequence number, displayed as C1, C2, ...
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CronId(pub u32);
@@ -26,7 +22,6 @@ pub struct ScopeHash(pub [u8; 32]);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntityRef {
     Job(JobId),
-    Agent(AgentId),
     Cron(CronId),
     Scope(ScopeHash),
 }
@@ -36,12 +31,6 @@ pub enum EntityRef {
 impl fmt::Display for JobId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "J{}", self.0)
-    }
-}
-
-impl fmt::Display for AgentId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "A{}", self.0)
     }
 }
 
@@ -75,7 +64,6 @@ impl fmt::Display for EntityRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Job(id) => write!(f, "{id}"),
-            Self::Agent(id) => write!(f, "{id}"),
             Self::Cron(id) => write!(f, "{id}"),
             Self::Scope(hash) => write!(f, "{hash}"),
         }
@@ -89,7 +77,6 @@ mod tests {
     #[test]
     fn display_ids() {
         assert_eq!(JobId(1).to_string(), "J1");
-        assert_eq!(AgentId(42).to_string(), "A42");
         assert_eq!(CronId(3).to_string(), "C3");
         assert_eq!(ChainId(7).to_string(), "CH7");
     }

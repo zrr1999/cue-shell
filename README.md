@@ -3,8 +3,8 @@
 Durable process substrate with a TUI for managing long-lived jobs, scopes, and schedules.
 
 > ⚠️ **Prototype stage** — core JOB / CRON flows are implemented, including
-> real `:fg` PTY attach; the remaining agent-facing surface is a transitional
-> compatibility bridge to weft, not a core product promise.
+> real `:fg` PTY attach. cue-shell no longer exposes agent commands or an
+> AGENT mode; agent runtime concerns live in weft.
 
 ## Overview
 
@@ -20,7 +20,6 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 - **Scope persistence**: Environment snapshots with delta storage and lifecycle management
 - **Chain syntax**: `->` serial · `~>` ignore-failure · `||` parallel · `||?` any-success
 - **Daemon durability**: persisted HEAD scope, job history, cron definitions, auto-reconnect TUI
-- **Compatibility bridge**: legacy agent commands can be forwarded to weft during migration, but that path is explicitly transitional
 
 ## Architecture
 
@@ -29,7 +28,7 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 │  L3 Frontend: TUI / MCP / REST API      │
 ├─────────────────────────────────────────┤
 │  L2 Core model (cue-core)                │
-│  Job · Session · Scope · Chain          │
+│  Job · Scope · Chain · Cron             │
 ├─────────────────────────────────────────┤
 │  L1 Process substrate (cued daemon)     │
 │  Unix socket · SQLite · Process mgmt    │
@@ -40,7 +39,7 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 
 ```
 crates/
-├── cue-core/   — Core types and logic: Job, Session, Scope, Chain
+├── cue-core/   — Core types and logic: Job, Scope, Chain, Cron
 ├── cued/       — Background daemon: Unix socket server, job orchestration
 ├── cue-tui/    — TUI frontend: mode switching, command input, job display
 └── cue-cli/    — CLI entry point: command parsing, mode dispatch
@@ -89,7 +88,7 @@ cue-shell now prefers a split config layout in the platform config dir:
 
 During migration, cue-shell still falls back to the legacy combined
 `config.toml`. If you keep using that file for now, put client transport under
-`[transport]` and server agent backend settings under `[agent]`.
+`[transport]`.
 
 ### Client transport config
 
@@ -128,36 +127,6 @@ cue
 
 If the remote daemon is not running (or its socket is missing), `cue` fails
 with a message that includes the profile's explicit `start_command`.
-
-### Transitional weft bridge
-
-`cued` now prefers `server.toml` (for example
-`$XDG_CONFIG_HOME/cue-shell/server.toml` on Linux/macOS with XDG set).
-
-The remaining agent-facing commands are forwarded to **weft** over its local
-Unix-socket API. This is a temporary compatibility shim, not part of cue-shell's
-core substrate scope. By default `cued` expects the weft socket at
-`./weft.sock`; override it in `server.toml` if needed:
-
-```toml
-[agent]
-transport = "weft"
-default_backend = "copilot"
-
-[weft]
-socket_path = "./weft.sock"
-
-[agent.backends.copilot]
-# The bridge forwards the backend name (`copilot`) to weft as the target agent id.
-# Legacy ACP fields remain available for transport = "legacy".
-command = "copilot"
-args = ["--acp", "--stdio"]
-```
-
-In this transitional bridge, `:ask`, `:spawn`, `:send A<n> ...`, `:cancel A<n>`,
-and `:agents` go through the weft proxy path. `:send` / `:cancel` currently
-return explicit `NOT_SUPPORTED` errors until weft exposes follow-up and
-cancellation endpoints.
 
 ## Project Status
 

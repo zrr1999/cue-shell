@@ -27,7 +27,7 @@ Client sends `Eval { input }` over IPC; cued runs the full pipeline.
 enum Token {
     // Command prefix
     Colon,                  // :
-    Command(String),        // run, kill, jobs, ask, cron, ...
+    Command(String),        // run, kill, jobs, cron, ...
 
     // Mode params (context: immediately after Command)
     ModeParenOpen,          // ( — mode params context
@@ -54,7 +54,7 @@ enum Token {
 
     // Content
     Word(String),           // command arguments, filenames, flags
-    IdRef(IdKind, u32),     // J1, A2, C3, S0
+    IdRef(IdKind, u32),     // J1, C3, S0
 
     // Whitespace (preserved for highlighting, stripped for parsing)
     Whitespace(String),
@@ -65,7 +65,7 @@ enum Token {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum IdKind { Job, Agent, Cron, Scope }
+enum IdKind { Job, Cron, Scope }
 
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
@@ -101,12 +101,12 @@ enum Ast {
 enum Argument {
     Chain(ChainNode),           // for :run, :cron's body, bare input in JOB/CRON mode
     IdRef(IdKind, u32),         // for :kill, :out, :fg, :retry, etc.
-    Text(String),               // for :ask, :confirm (everything after command)
+    Text(String),               // for :send and similar text-taking commands
     CronExpr {                  // for :cron
         schedule: CronSchedule,
         body: ChainNode,
     },
-    Empty,                      // for :jobs, :agents (compat), :crons, :scopes, :help
+    Empty,                      // for :jobs, :crons, :scopes, :help
 }
 
 /// Chain AST — tree structure
@@ -165,7 +165,7 @@ serial_op   = "->" | "~>"
 parallel_op = "||" | "||?"
 pipe_op     = "|>" | "|&>" | "|!>"
 
-id_ref      = [JACS] DIGITS
+id_ref      = [JCS] DIGITS
 word        = <non-operator, non-special token>
 
 cron_expr   = schedule "do" chain
@@ -181,13 +181,12 @@ The Resolver transforms `Ast` → `RequestPayload`:
 
 1. **Mode injection**: `BareInput` → wraps with default command per current mode
    - JOB ⚡ → `:run`
-    - AGENT 🤖 → `:ask` (compatibility bridge)
    - CRON ⏰ → `:cron`
 
 2. **Argument type validation**: ensures command gets correct argument type
-   - `:run` expects Chain, `:kill` expects IdRef, `:ask` expects Text, etc.
+    - `:run` expects Chain, `:kill` expects IdRef, `:send` expects Text, etc.
 
-3. **ID resolution**: validates J1/A2/C3 references exist (queries cued state)
+3. **ID resolution**: validates J1/C3/S0 references exist (queries cued state)
 
 4. **Mode params merge**: per-invocation params override config.toml defaults
 
@@ -272,24 +271,18 @@ Which argument type each command expects:
 | Command | Argument | Mode Params |
 |---|---|---|
 | `:run` | Chain | ✓ (retry, timeout, scope) |
-| `:ask` | Text | ✓ (model, agent/bridge) |
 | `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (scope) |
-| `:spawn` | Text | ✓ (agent, bridge) |
 | `:kill` | IdRef | ✗ |
 | `:retry` | IdRef | ✗ |
 | `:out` | IdRef | ✗ |
 | `:fg` | IdRef | ✗ |
 | `:jobs` | Empty | ✗ |
-| `:agents` | Empty | ✗ (compat bridge) |
 | `:crons` | Empty | ✗ |
 | `:scopes` | Empty | ✗ |
 | `:env` | Text (subcommand) | ✗ |
 | `:cd` | Text (path) | ✗ |
 | `:scope` | Text (subcommand) | ✓ (new/fork) |
 | `:help` | Empty or Text | ✗ |
-| `:confirm` | Text | ✗ (legacy) |
-| `:escalate` | Text | ✗ (legacy) |
-| `:probe` | Text | ✗ (legacy) |
 | `:pause` | IdRef | ✗ |
 | `:resume` | IdRef | ✗ |
 | `:config` | Text | ✗ |

@@ -251,7 +251,6 @@ impl Component for MainView {
         if visible_indices.is_empty() {
             let prompt_mode = match self.mode {
                 Mode::Job => "JOB",
-                Mode::Agent => "JOB",
                 Mode::Cron => "CRON",
             };
             let welcome = Paragraph::new(vec![
@@ -336,7 +335,6 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect) {
     let border_color = card.status.border_color();
     let mode = match card.mode {
         Mode::Job => "JOB",
-        Mode::Agent => "JOB",
         Mode::Cron => "CRON",
     };
 
