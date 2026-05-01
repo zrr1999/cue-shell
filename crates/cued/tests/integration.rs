@@ -1639,7 +1639,7 @@ async fn test_scopes_returns_scope_list() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_config_show_returns_backend_info() {
+async fn test_config_show_returns_weft_info() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("config-show");
         let mut child = env.spawn_daemon();
@@ -1658,8 +1658,8 @@ async fn test_config_show_returns_backend_info() {
         match resp {
             ResponsePayload::Ok(OkPayload::EvalText { text }) => {
                 assert!(
-                    text.contains("default_backend"),
-                    "expected 'default_backend' in config output, got: {text:?}"
+                    text.contains("weft.socket_path"),
+                    "expected 'weft.socket_path' in config output, got: {text:?}"
                 );
             }
             other => panic!("expected EvalText config response, got {other:?}"),
