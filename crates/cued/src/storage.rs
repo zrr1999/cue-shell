@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use cue_core::ScopeHash;
-use cue_core::agent::{AgentRole, AgentStatus};
 use cue_core::cron::CronStatus;
 use cue_core::job::{CancelReason, JobStatus};
 use cue_core::scope::Scope;
@@ -38,7 +37,7 @@ where
 // ── Schema migration ──
 
 /// Current schema version (bump when adding migrations).
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 const MIGRATION_V1: &str = r"
 CREATE TABLE IF NOT EXISTS scopes (
@@ -70,15 +69,6 @@ CREATE TABLE IF NOT EXISTS jobs_history (
     scope_hash  BLOB,
     start_scope BLOB,
     end_scope   BLOB,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    finished_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS agents_history (
-    id          TEXT PRIMARY KEY,    -- e.g. 'A1'
-    kind        TEXT NOT NULL,
-    role        TEXT NOT NULL,
-    status      TEXT NOT NULL,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     finished_at TEXT
 );
@@ -141,41 +131,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", 3)?;
     }
     if current < 4 {
-        if !column_exists(conn, "agents_history", "backend")? {
-            conn.execute_batch("ALTER TABLE agents_history ADD COLUMN backend TEXT;")
-                .context("failed to add agents_history.backend")?;
-        }
-        if !column_exists(conn, "agents_history", "session_id")? {
-            conn.execute_batch("ALTER TABLE agents_history ADD COLUMN session_id TEXT;")
-                .context("failed to add agents_history.session_id")?;
-        }
-        if !column_exists(conn, "agents_history", "model")? {
-            conn.execute_batch("ALTER TABLE agents_history ADD COLUMN model TEXT;")
-                .context("failed to add agents_history.model")?;
-        }
-        if !column_exists(conn, "agents_history", "scope_hash")? {
-            conn.execute_batch("ALTER TABLE agents_history ADD COLUMN scope_hash BLOB;")
-                .context("failed to add agents_history.scope_hash")?;
-        }
-        conn.execute_batch(
-            "UPDATE agents_history
-             SET backend = COALESCE(backend, kind)
-             WHERE backend IS NULL OR backend = '';",
-        )
-        .context("failed to backfill agents_history.backend")?;
         conn.pragma_update(None, "user_version", 4)?;
     }
     if current < 5 {
-        if !column_exists(conn, "agents_history", "transcript")? {
-            conn.execute_batch(
-                "ALTER TABLE agents_history ADD COLUMN transcript TEXT NOT NULL DEFAULT '';",
-            )
-            .context("failed to add agents_history.transcript")?;
-        }
-        if !column_exists(conn, "agents_history", "last_role")? {
-            conn.execute_batch("ALTER TABLE agents_history ADD COLUMN last_role TEXT;")
-                .context("failed to add agents_history.last_role")?;
-        }
         conn.pragma_update(None, "user_version", 5)?;
     }
     if current < 6 {
@@ -321,19 +279,6 @@ pub struct StoredCron {
     pub age_secs: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredAgent {
-    pub id: String,
-    pub backend: String,
-    pub role: AgentRole,
-    pub status: AgentStatus,
-    pub session_id: Option<String>,
-    pub model: Option<String>,
-    pub scope_hash: Option<ScopeHash>,
-    pub transcript: String,
-    pub last_role: Option<String>,
-}
-
 pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
     let status_json = serde_json::to_string(&job.status).context("serialize job status")?;
     let start_scope = job.start_scope.map(|hash| hash.0.to_vec());
@@ -433,117 +378,6 @@ pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
 
     jobs.sort_by_key(|job| parse_numeric_suffix(&job.id).unwrap_or(u32::MAX));
     Ok(jobs)
-}
-
-pub fn upsert_agent_history(conn: &Connection, agent: &StoredAgent) -> Result<()> {
-    let role_json = serde_json::to_string(&agent.role).context("serialize agent role")?;
-    let status_json = serde_json::to_string(&agent.status).context("serialize agent status")?;
-    let finished = if agent.status.is_terminal() { 1 } else { 0 };
-    let scope_hash = agent.scope_hash.map(|hash| hash.0.to_vec());
-
-    conn.execute(
-        "INSERT INTO agents_history (
-             id, kind, backend, role, status, session_id, model, scope_hash, transcript, last_role, finished_at
-         )
-         VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-             CASE WHEN ?11 THEN datetime('now') ELSE NULL END
-         )
-         ON CONFLICT(id) DO UPDATE SET
-             kind = excluded.kind,
-             backend = excluded.backend,
-             role = excluded.role,
-             status = excluded.status,
-             session_id = excluded.session_id,
-             model = excluded.model,
-             scope_hash = excluded.scope_hash,
-             transcript = excluded.transcript,
-             last_role = excluded.last_role,
-             finished_at = CASE WHEN ?11 THEN datetime('now') ELSE agents_history.finished_at END",
-        rusqlite::params![
-            agent.id,
-            agent.backend,
-            agent.backend,
-            role_json,
-            status_json,
-            agent.session_id.as_deref(),
-            agent.model.as_deref(),
-            scope_hash,
-            agent.transcript.as_str(),
-            agent.last_role.as_deref(),
-            finished,
-        ],
-    )?;
-    Ok(())
-}
-
-pub fn load_agent_history(conn: &Connection) -> Result<Vec<StoredAgent>> {
-    let mut stmt = conn.prepare(
-        "SELECT id,
-                COALESCE(backend, kind) AS backend,
-                role,
-                status,
-                session_id,
-                model,
-                scope_hash,
-                COALESCE(transcript, '') AS transcript,
-                last_role
-         FROM agents_history",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        let id: String = row.get(0)?;
-        let backend: String = row.get(1)?;
-        let role_text: String = row.get(2)?;
-        let status_text: String = row.get(3)?;
-        let session_id: Option<String> = row.get(4)?;
-        let model: Option<String> = row.get(5)?;
-        let scope_hash_blob: Option<Vec<u8>> = row.get(6)?;
-        let transcript: String = row.get(7)?;
-        let last_role: Option<String> = row.get(8)?;
-        Ok((
-            id,
-            backend,
-            role_text,
-            status_text,
-            session_id,
-            model,
-            scope_hash_blob,
-            transcript,
-            last_role,
-        ))
-    })?;
-
-    let mut agents = Vec::new();
-    for row in rows {
-        let (
-            id,
-            backend,
-            role_text,
-            status_text,
-            session_id,
-            model,
-            scope_hash_blob,
-            transcript,
-            last_role,
-        ) = row?;
-        agents.push(StoredAgent {
-            id,
-            backend,
-            role: parse_agent_role(&role_text)?,
-            status: parse_agent_status(&status_text)?,
-            session_id,
-            model,
-            scope_hash: scope_hash_blob
-                .as_deref()
-                .map(blob_to_scope_hash)
-                .transpose()?,
-            transcript,
-            last_role,
-        });
-    }
-
-    agents.sort_by_key(|agent| parse_numeric_suffix(&agent.id).unwrap_or(u32::MAX));
-    Ok(agents)
 }
 
 pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
@@ -661,36 +495,6 @@ fn parse_cron_status(text: &str) -> Result<CronStatus> {
         "expired" => Ok(CronStatus::Expired),
         other => anyhow::bail!("unknown cron status {other:?}"),
     }
-}
-
-fn parse_agent_status(text: &str) -> Result<AgentStatus> {
-    if let Ok(status) = serde_json::from_str(text) {
-        return Ok(status);
-    }
-
-    let legacy = match text {
-        "running" => AgentStatus::Running,
-        "waiting" | "waiting_input" => AgentStatus::WaitingInput,
-        "done" => AgentStatus::Done,
-        "failed" => AgentStatus::Failed,
-        _ => {
-            return Err(anyhow::anyhow!("unknown agent status encoding: {text}"));
-        }
-    };
-    Ok(legacy)
-}
-
-fn parse_agent_role(text: &str) -> Result<AgentRole> {
-    if let Ok(role) = serde_json::from_str(text) {
-        return Ok(role);
-    }
-
-    let legacy = match text {
-        "planner" => AgentRole::Planner,
-        "executor" => AgentRole::Executor,
-        _ => return Err(anyhow::anyhow!("unknown agent role encoding: {text}")),
-    };
-    Ok(legacy)
 }
 
 fn parse_numeric_suffix(id: &str) -> Option<u32> {
@@ -826,27 +630,6 @@ mod tests {
         assert_eq!(loaded[0].command, cron.command);
         assert_eq!(loaded[0].status, cron.status);
         assert_eq!(loaded[0].scope_hash, cron.scope_hash);
-    }
-
-    #[test]
-    fn agent_history_roundtrip() {
-        let conn = in_memory_db();
-        let agent = StoredAgent {
-            id: "A7".into(),
-            backend: "copilot".into(),
-            role: AgentRole::Executor,
-            status: AgentStatus::WaitingInput,
-            session_id: Some("sess_123".into()),
-            model: Some("gpt-5.4".into()),
-            scope_hash: Some(ScopeHash([11; 32])),
-            transcript: "[system] ACP session: sess_123\n\nhello".into(),
-            last_role: Some("assistant".into()),
-        };
-
-        upsert_agent_history(&conn, &agent).unwrap();
-        let loaded = load_agent_history(&conn).unwrap();
-
-        assert_eq!(loaded, vec![agent]);
     }
 
     #[test]

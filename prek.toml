@@ -31,7 +31,7 @@ hooks = [
 
 [[repos]]
 repo = "https://github.com/zrr1999/zendev"
-rev = "e2a5243899467d0df1cb1ab0ddcb18f3ef33d97b"
+rev = "v0.0.5"
 hooks = [
   { id = "zendev-commit-msg" },
 ]

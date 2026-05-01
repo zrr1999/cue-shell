@@ -251,7 +251,6 @@ impl Component for MainView {
         if visible_indices.is_empty() {
             let prompt_mode = match self.mode {
                 Mode::Job => "JOB",
-                Mode::Agent => "AGENT",
                 Mode::Cron => "CRON",
             };
             let welcome = Paragraph::new(vec![
@@ -262,8 +261,8 @@ impl Component for MainView {
                     "  Use the upper display tabs for `:out`, `:tail`, `:err`, and previews.",
                 ),
                 Line::raw(""),
-                Line::raw(format!("  Current prompt mode: {prompt_mode}")),
-                Line::raw("  Shift+Tab: switch mode   Ctrl+B: toggle sidebar"),
+                Line::raw(format!("  Current mode: {prompt_mode}")),
+                Line::raw("  Shift+Tab: switch job/cron mode   Ctrl+B: toggle sidebar"),
                 Line::raw("  Tab: complete   Ctrl+C: running jobs   Ctrl+D: quit   Ctrl+L: clear"),
             ])
             .style(Style::default().fg(Color::DarkGray));
@@ -336,7 +335,6 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect) {
     let border_color = card.status.border_color();
     let mode = match card.mode {
         Mode::Job => "JOB",
-        Mode::Agent => "AGENT",
         Mode::Cron => "CRON",
     };
 

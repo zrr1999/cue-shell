@@ -1,21 +1,20 @@
 # cue-shell
 
-An async process runtime with TUI for human-agent collaboration.
+Durable process substrate with a TUI for managing long-lived jobs, scopes, and schedules.
 
-> ⚠️ **Prototype stage** — core JOB / AGENT / CRON flows are implemented, including
-> multi-turn agents and real `:fg` PTY attach; remaining work is mainly mode-specific UI polish.
+> ⚠️ **Prototype stage** — core JOB / CRON flows are implemented, including
+> real `:fg` PTY attach. cue-shell no longer exposes agent commands or an
+> AGENT mode; agent runtime concerns live in weft.
 
 ## Overview
 
-cue-shell (`cue`) is a terminal-native runtime for orchestrating async processes, designed for seamless human-agent collaboration. It is **not** a traditional shell — it's a structured environment where jobs, sessions, and scopes are first-class primitives.
+cue-shell (`cue`) is a terminal-native runtime for durable async processes. It is **not** a traditional shell — it's a structured environment where jobs, scopes, chains, and crons are first-class primitives.
 
 ### Key Features
 
-- **Three-layer architecture**: Execution Backend (`cued` daemon) → Session Runtime (core) → Frontend (TUI/MCP/API)
-- **Three interaction modes**: JOB ⚡ · AGENT 🤖 · CRON ⏰ — switch with `Shift+Tab`
-- **`:` prefix commands**: Vim-style builtin access (`:run`, `:kill`, `:jobs`, `:ask`, `:cron`, ...)
-- **Planner/Executor model**: Structured AI collaboration with `:ask`, `:spawn`, `:agents`
-- **Multi-turn agents**: follow-up via `:send A<n> ...`, abort current turn via `:cancel A<n>`, terminate session via `:kill A<n>`
+- **Three-layer architecture**: Process substrate (`cued` daemon) → Core model → Frontends (TUI/MCP/API)
+- **Primary interaction modes**: JOB ⚡ · CRON ⏰ — switch with `Shift+Tab`
+- **`:` prefix commands**: Vim-style builtin access (`:run`, `:kill`, `:jobs`, `:cron`, ...)
 - **Foreground PTY attach**: `:fg J<n>` proxies a real terminal session with input, paste, and resize support
 - **Display tabs with clean semantics**: `:out J<n>` snapshots stdout, `:tail J<n>` follows live stdout, `:err J<n>` opens stderr
 - **Scope persistence**: Environment snapshots with delta storage and lifecycle management
@@ -28,10 +27,10 @@ cue-shell (`cue`) is a terminal-native runtime for orchestrating async processes
 ┌─────────────────────────────────────────┐
 │  L3 Frontend: TUI / MCP / REST API      │
 ├─────────────────────────────────────────┤
-│  L2 Session Runtime (cue-core)          │
-│  Job · Session · Scope · Chain          │
+│  L2 Core model (cue-core)                │
+│  Job · Scope · Chain · Cron             │
 ├─────────────────────────────────────────┤
-│  L1 Execution Backend (cued daemon)     │
+│  L1 Process substrate (cued daemon)     │
 │  Unix socket · SQLite · Process mgmt    │
 └─────────────────────────────────────────┘
 ```
@@ -40,7 +39,7 @@ cue-shell (`cue`) is a terminal-native runtime for orchestrating async processes
 
 ```
 crates/
-├── cue-core/   — Core types and logic: Job, Session, Scope, Chain
+├── cue-core/   — Core types and logic: Job, Scope, Chain, Cron
 ├── cued/       — Background daemon: Unix socket server, job orchestration
 ├── cue-tui/    — TUI frontend: mode switching, command input, job display
 └── cue-cli/    — CLI entry point: command parsing, mode dispatch
@@ -85,11 +84,11 @@ See [`docs/design/`](docs/design/) for the full design documentation:
 cue-shell now prefers a split config layout in the platform config dir:
 
 - `client.toml` — client-side transport/profile selection used by `cue`
-- `server.toml` — daemon-side agent backend defaults used by `cued`
+- `server.toml` — daemon-side runtime defaults used by `cued`
 
 During migration, cue-shell still falls back to the legacy combined
 `config.toml`. If you keep using that file for now, put client transport under
-`[transport]` and server agent backend settings under `[agent]`.
+`[transport]`.
 
 ### Client transport config
 
@@ -128,31 +127,6 @@ cue
 
 If the remote daemon is not running (or its socket is missing), `cue` fails
 with a message that includes the profile's explicit `start_command`.
-
-### Agent backend config
-
-`cued` now prefers `server.toml` (for example
-`$XDG_CONFIG_HOME/cue-shell/server.toml` on Linux/macOS with XDG set).
-
-Current AGENT runtime is **ACP-only**. By default, cue-shell starts GitHub
-Copilot CLI as an ACP server via `copilot --acp --stdio`. Override it in
-`server.toml` if you want a different ACP backend:
-
-```toml
-[agent]
-default_backend = "copilot"
-
-[agent.backends.copilot]
-command = "copilot"
-args = ["--acp", "--stdio"]
-# model = "your-model"
-```
-
-Per-command params like `:ask(model=gpt-5)` or `:spawn(agent=copilot)` override these
-defaults. `:ask` / `:spawn` start an ACP session, `:send A<n> ...` continues it
-via another `session/prompt`, `:cancel A<n>` maps to `session/cancel`, and
-`session=<id>` can be used to load an existing ACP session when the backend
-advertises `loadSession`.
 
 ## Project Status
 

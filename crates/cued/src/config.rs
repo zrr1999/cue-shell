@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -12,9 +12,9 @@ const LEGACY_CONFIG_FILE: &str = "config.toml";
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
-    pub agent: AgentConfig,
-    #[serde(default)]
     pub aliases: AliasConfig,
+    #[serde(default)]
+    pub weft: WeftConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -104,87 +104,26 @@ impl Config {
     }
 
     fn parse(text: &str, path: &Path) -> Result<Self> {
-        let mut config: Self =
-            toml::from_str(text).with_context(|| format!("parse config {}", path.display()))?;
-        config.agent.fill_defaults();
-        Ok(config)
+        toml::from_str(text).with_context(|| format!("parse config {}", path.display()))
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgentConfig {
-    #[serde(default = "default_backend_name")]
-    pub default_backend: String,
-    #[serde(default = "default_backends")]
-    pub backends: BTreeMap<String, AgentBackendConfig>,
+pub struct WeftConfig {
+    #[serde(default = "default_weft_socket_path")]
+    pub socket_path: PathBuf,
 }
 
-impl Default for AgentConfig {
+impl Default for WeftConfig {
     fn default() -> Self {
         Self {
-            default_backend: default_backend_name(),
-            backends: default_backends(),
+            socket_path: default_weft_socket_path(),
         }
     }
 }
 
-impl AgentConfig {
-    fn fill_defaults(&mut self) {
-        if self.default_backend.is_empty() {
-            self.default_backend = default_backend_name();
-        }
-        if self.backends.is_empty() {
-            self.backends = default_backends();
-        }
-    }
-
-    pub fn backend(&self, name: Option<&str>) -> Result<(String, AgentBackendConfig)> {
-        if self.backends.is_empty() {
-            anyhow::bail!(
-                "no ACP agent backend configured; add [agent.backends.<name>] with command = \"...\" to server.toml (or legacy config.toml)"
-            );
-        }
-        let backend_name = name.unwrap_or(&self.default_backend);
-        let backend = self
-            .backends
-            .get(backend_name)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown agent backend `{backend_name}`"))?;
-        Ok((backend_name.to_string(), backend))
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AgentBackendConfig {
-    #[serde(default = "default_agent_command")]
-    pub command: String,
-    #[serde(default = "default_agent_args")]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-}
-
-fn default_backend_name() -> String {
-    "copilot".into()
-}
-
-fn default_agent_command() -> String {
-    String::new()
-}
-
-fn default_agent_args() -> Vec<String> {
-    Vec::new()
-}
-
-fn default_backends() -> BTreeMap<String, AgentBackendConfig> {
-    BTreeMap::from([(
-        "copilot".into(),
-        AgentBackendConfig {
-            command: "copilot".into(),
-            args: vec!["--acp".into(), "--stdio".into()],
-            model: None,
-        },
-    )])
+fn default_weft_socket_path() -> PathBuf {
+    PathBuf::from("./weft.sock")
 }
 
 fn read_source(path: &Path) -> Result<Option<String>> {
@@ -203,12 +142,9 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn default_agent_config_starts_copilot_acp_server() {
+    fn default_config_sets_weft_socket() {
         let config = Config::default();
-        let (name, backend) = config.agent.backend(None).expect("default backend");
-        assert_eq!(name, "copilot");
-        assert_eq!(backend.command, "copilot");
-        assert_eq!(backend.args, vec!["--acp", "--stdio"]);
+        assert_eq!(config.weft.socket_path, PathBuf::from("./weft.sock"));
     }
 
     #[test]
@@ -217,51 +153,38 @@ mod tests {
             Some((
                 Path::new("server.toml"),
                 r#"
-[agent]
-default_backend = "server"
-
-[agent.backends.server]
-command = "server-backend"
+[weft]
+socket_path = "/tmp/server.sock"
 "#,
             )),
             Some((
                 Path::new("config.toml"),
                 r#"
-[agent]
-default_backend = "legacy"
-
-[agent.backends.legacy]
-command = "legacy-backend"
+[weft]
+socket_path = "/tmp/legacy.sock"
 "#,
             )),
         )
         .expect("load config");
 
-        let (name, backend) = config.agent.backend(None).expect("server backend");
-        assert_eq!(name, "server");
-        assert_eq!(backend.command, "server-backend");
+        assert_eq!(config.weft.socket_path, PathBuf::from("/tmp/server.sock"));
     }
 
     #[test]
-    fn legacy_config_toml_still_loads_server_agent_config() {
+    fn legacy_config_toml_still_loads_weft_config() {
         let config = Config::load_from_sources(
             None,
             Some((
                 Path::new("config.toml"),
                 r#"
-[agent]
-default_backend = "legacy"
-
-[agent.backends.legacy]
-command = "legacy-backend"
+[weft]
+socket_path = "/tmp/legacy.sock"
 "#,
             )),
         )
         .expect("load config");
 
-        let (name, backend) = config.agent.backend(None).expect("legacy backend");
-        assert_eq!(name, "legacy");
-        assert_eq!(backend.command, "legacy-backend");
+        assert_eq!(config.weft.socket_path, PathBuf::from("/tmp/legacy.sock"));
     }
 
     #[test]
@@ -336,5 +259,22 @@ pip = "uv pip"
             config.aliases.apply("pip install foo"),
             "uv pip install foo"
         );
+    }
+
+    #[test]
+    fn parses_weft_socket_path() {
+        let config = Config::load_from_sources(
+            Some((
+                Path::new("server.toml"),
+                r#"
+[weft]
+socket_path = "/var/run/weft.sock"
+"#,
+            )),
+            None,
+        )
+        .expect("load config");
+
+        assert_eq!(config.weft.socket_path, PathBuf::from("/var/run/weft.sock"));
     }
 }

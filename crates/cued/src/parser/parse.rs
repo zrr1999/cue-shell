@@ -275,7 +275,7 @@ impl Parser {
                 } else {
                     Err(ParseError {
                         span: self.peek_span(),
-                        message: format!(":{name} requires an ID (e.g. J1, A2)"),
+                        message: format!(":{name} requires an ID (e.g. J1, C1)"),
                         kind: ParseErrorKind::InvalidIdRef,
                         suggestions: vec![format!(":{name} J1")],
                     })
@@ -283,18 +283,13 @@ impl Parser {
             }
 
             // Text argument
-            "ask" | "confirm" | "escalate" | "spawn" | "send" | "probe" => {
+            "send" => {
                 let text = self.consume_remaining_text();
                 if text.is_empty() {
                     return Err(ParseError {
                         span: self.peek_span(),
                         message: match name {
-                            "ask" => "`:ask` requires a prompt".into(),
                             "send" => "`:send` requires a target and input".into(),
-                            "probe" => "`:probe` requires a query".into(),
-                            "confirm" => "`:confirm` requires a prompt".into(),
-                            "escalate" => "`:escalate` requires a message".into(),
-                            "spawn" => "`:spawn` requires a prompt".into(),
                             _ => format!(":{name} requires an argument"),
                         },
                         kind: ParseErrorKind::MissingArgument,
@@ -329,9 +324,7 @@ impl Parser {
             }
 
             // Empty or text subcommands
-            "jobs" | "agents" | "crons" | "scopes" | "clear" | "quit" | "exit" => {
-                Ok(Argument::Empty)
-            }
+            "jobs" | "crons" | "scopes" | "clear" | "quit" | "exit" => Ok(Argument::Empty),
 
             "help" | "config" | "env" | "scope" | "cd" => {
                 let text = self.consume_remaining_text();
@@ -498,8 +491,8 @@ pub(super) fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
 fn suggest_command(name: &str) -> Vec<String> {
     let commands = [
         "run", "kill", "retry", "out", "tail", "err", "fg", "wait", "send", "cancel", "jobs",
-        "agents", "crons", "scopes", "ask", "spawn", "confirm", "escalate", "probe", "cron", "env",
-        "cd", "scope", "help", "config", "log", "pause", "resume", "clear", "quit", "exit",
+        "crons", "scopes", "cron", "env", "cd", "scope", "help", "config", "log", "pause",
+        "resume", "clear", "quit", "exit",
     ];
     commands
         .iter()
@@ -644,24 +637,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_ask() {
-        let ast = Parser::parse(":ask explain this error").unwrap();
-        match ast {
-            Ast::Command { name, argument, .. } => {
-                assert_eq!(name, "ask");
-                assert_eq!(argument, Argument::Text("explain this error".into()));
-            }
-            _ => panic!("expected Command"),
-        }
-    }
-
-    #[test]
     fn parse_send_text() {
-        let ast = Parser::parse(":send A1 continue with the fix").unwrap();
+        let ast = Parser::parse(":send J1 continue with the fix").unwrap();
         match ast {
             Ast::Command { name, argument, .. } => {
                 assert_eq!(name, "send");
-                assert_eq!(argument, Argument::Text("A1 continue with the fix".into()));
+                assert_eq!(argument, Argument::Text("J1 continue with the fix".into()));
             }
             _ => panic!("expected Command"),
         }
@@ -674,18 +655,6 @@ mod tests {
             Ast::Command { name, argument, .. } => {
                 assert_eq!(name, "cron");
                 assert!(matches!(argument, Argument::Chain(ChainNode::Leaf(_))));
-            }
-            _ => panic!("expected Command"),
-        }
-    }
-
-    #[test]
-    fn parse_probe_query() {
-        let ast = Parser::parse(":probe status J1").unwrap();
-        match ast {
-            Ast::Command { name, argument, .. } => {
-                assert_eq!(name, "probe");
-                assert_eq!(argument, Argument::Text("status J1".into()));
             }
             _ => panic!("expected Command"),
         }

@@ -443,28 +443,6 @@ async fn route_request(
                 .await?;
         }
 
-        RequestPayload::AgentPrompt { id, prompt } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::Send { id, data: prompt },
-                })
-                .await
-                .context("send agent prompt to scheduler")?;
-        }
-
-        RequestPayload::AgentCancel { id } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::Cancel { id },
-                })
-                .await
-                .context("send agent cancel to scheduler")?;
-        }
-
         RequestPayload::Ping {} => {
             sys.gateway
                 .send(GatewayMsg::SendResponse {

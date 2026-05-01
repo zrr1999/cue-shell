@@ -1,7 +1,10 @@
 # Cue Shell — 基础命令与模式最终设计方案 v2
 
 > 已完成三轮评审、竞品调研和命名调研后的最终设计。
-> 关键变更（v1→v2）：`:` 前缀替代 `cmd:` 分隔符、去掉 CMD 模式、`:cron` 内部语法、新增 `:probe`/`:confirm`/`:escalate`。
+> **Update:** current cue-shell ships only **JOB** and **CRON** modes. Earlier
+> AGENT-mode / compatibility-bridge sections in this document are historical
+> design context; the live command surface no longer includes `:ask`,
+> `:spawn`, `:agents`, `:confirm`, `:escalate`, or `:probe`.
 
 ---
 
@@ -25,7 +28,7 @@
 - `:` 在所有模式下零冲突：shell 命令、自然语言、cron 表达式都不以 `:` 开头
 - Vim/Helix/lazygit 用户有肌肉记忆（TUI 文化一致）
 - `/` 在 JOB 模式下与绝对路径 `/usr/bin/...` 冲突
-- Agent 友好：`:` 不是任何编程语言的转义字符
+- 脚本友好：`:` 不是常见 shell 命令前缀，便于和 bare input 区分
 - 解析规则极简：**首字符 `:` → 内建命令，否则 → 模式默认包装**
 
 **冒号后空格可选**：`:run cargo build` 和 `:run  cargo build` 都合法（trim）。
@@ -34,19 +37,16 @@
 
 ---
 
-## 二、三模式设计
+## 二、模式设计
 
-### 只有三个模式（无 CMD）
+### 两个主模式
 
-| 模式 | 默认包装 | 含义 | 对应核心原语 |
-|------|---------|------|-------------|
-| **JOB** ⚡ | → `:run <input>` | 输入即执行 | Job |
-| **AGENT** 🤖 | → `:ask <input>` | 输入即对话 | Agent |
-| **CRON** ⏰ | → `:cron <input>` | 输入即调度 | Cron |
-
-- Shift+Tab 循环切换：JOB → AGENT → CRON → JOB
-- **不需要 CMD 模式**：`:` 前缀在任何模式下都能直接执行内建命令
-- 想"纯手动"？在任意模式下全用 `:` 前缀即可
+| 模式 | 默认包装 | 含义 | 定位 |
+|------|---------|------|------|
+| **JOB** ⚡ | → `:run <input>` | 输入即执行 | 核心 |
+| **CRON** ⏰ | → `:cron <input>` | 输入即调度 | 核心 |
+- Shift+Tab 循环切换：JOB → CRON → JOB
+- `:` 前缀在任何模式下都能直接执行内建命令
 
 ### 解析规则
 
@@ -69,7 +69,6 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
     // Rule 2: 模式默认包装
     match mode {
         Mode::JOB   => Ok(Action::Builtin { cmd: "run", args: input }),
-        Mode::AGENT => Ok(Action::Builtin { cmd: "ask", args: input }),
         Mode::CRON  => Ok(Action::Builtin { cmd: "cron", args: input }),
     }
 }
@@ -77,14 +76,14 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 
 ### 模式转换示例
 
-| 输入 | JOB ⚡ | AGENT 🤖 | CRON ⏰ |
-|------|--------|----------|---------|
-| `cargo build` | `:run cargo build` | `:ask cargo build` | `:cron cargo build` |
-| `run the tests` | `:run run the tests` | `:ask run the tests` | `:cron run the tests` |
-| `:kill J1` | 内建 kill ✅ | 内建 kill ✅ | 内建 kill ✅ |
-| `:jobs` | 内建 jobs ✅ | 内建 jobs ✅ | 内建 jobs ✅ |
-| `/usr/bin/python a.py` | `:run /usr/bin/python a.py` ✅ | `:ask /usr/bin/python a.py` | — |
-| `every 5m cargo test` | `:run every 5m cargo test` | `:ask every 5m cargo test` | `:cron every 5m cargo test` ✅ |
+| 输入 | JOB ⚡ | CRON ⏰ |
+|------|--------|---------|
+| `cargo build` | `:run cargo build` | `:cron cargo build` |
+| `run the tests` | `:run run the tests` | `:cron run the tests` |
+| `:kill J1` | 内建 kill ✅ | 内建 kill ✅ |
+| `:jobs` | 内建 jobs ✅ | 内建 jobs ✅ |
+| `/usr/bin/python a.py` | `:run /usr/bin/python a.py` ✅ | `:cron /usr/bin/python a.py` |
+| `every 5m cargo test` | `:run every 5m cargo test` | `:cron every 5m cargo test` ✅ |
 
 **零歧义**：`:` 开头 = 内建，否则 = 模式默认。没有命名冲突，没有 fallthrough，没有上下文依赖。
 
@@ -94,18 +93,18 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 
 ### 3.1 Job 管理
 
-| 命令 | 语法 | 语义 | Planner | Executor |
-|------|------|------|---------|----------|
-| `:run` | `:run <cmd> [chain...]` | 发射 job | ❌ | ✅ |
-| `:jobs` | `:jobs [--json]` | 列出所有 job 摘要 | ✅ | ✅ |
-| `:wait` | `:wait J1` / `:wait A1` | 等待 job/agent 进入终态 | ❌ | ✅ |
-| `:out` | `:out J1` | 查看 job stdout snapshot | ❌ | ✅ |
-| `:tail` | `:tail J1 [bytes]` | 打开并持续 follow job stdout | ❌ | ✅ |
-| `:err` | `:err J1` | 查看 job stderr snapshot | ❌ | ✅ |
-| `:send` | `:send J1 <input>` / `:send A1 <prompt>` | 向 running job 写 stdin；或向 waiting agent 发送 follow-up prompt | ❌ | ✅ |
-| `:kill` | `:kill J1` / `:kill A1` | 终止 running job；或结束整个 agent session | ❌ | ✅ |
-| `:cancel` | `:cancel J3` / `:cancel A1` | 取消 queued job；或 abort 当前 agent turn | ❌ | ✅ |
-| `:fg` | `:fg J2` / `:fg A1` | Job 进入前台 pty；Agent 打开会话前台视图 | ❌ | ✅ |
+| 命令 | 语法 | 语义 | 定位 |
+|------|------|------|------|
+| `:run` | `:run <cmd> [chain...]` | 发射 job | 核心 |
+| `:jobs` | `:jobs [--json]` | 列出所有 job 摘要 | 核心 |
+| `:wait` | `:wait J1` | 等待 job 进入终态 | 核心 |
+| `:out` | `:out J1` | 查看 job stdout snapshot | 核心 |
+| `:tail` | `:tail J1 [bytes]` | 打开并持续 follow job stdout | 核心 |
+| `:err` | `:err J1` | 查看 job stderr snapshot | 核心 |
+| `:send` | `:send J1 <input>` | 向 running job 写 stdin | 核心 |
+| `:kill` | `:kill J1` | 终止 running job | 核心 |
+| `:cancel` | `:cancel J3` | 取消 queued job | 核心 |
+| `:fg` | `:fg J2` | Job 进入前台 pty | 核心 |
 
 `:run` / JOB bare input 在发射前会基于当前 scope snapshot 做**显式 word expansion**：支持前导 `~`、`$VAR`、`${VAR}`；仍保持 direct exec，不隐式走 shell，也不做 glob / command substitution / field splitting。
 
@@ -123,62 +122,20 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 
 ### 3.2 Scope 管理
 
-| 命令 | 语法 | 语义 | Planner | Executor |
-|------|------|------|---------|----------|
-| `:scope list` | `:scope list [--tree]` | 列出所有 scope | ✅ | ✅ |
-| `:scope new` | `:scope new [--profile rust]` | 创建新 scope | ❌ | ✅ |
-| `:scope env` | `:scope env S1` | 查看 scope env | ❌ | ✅ |
-| `:scope fork` | `:scope fork S1 [--name exp]` | 从 scope 派生（delta 存储） | ❌ | ✅ |
-| `:scope close` | `:scope close S1` | 归档 scope | ❌ | ✅ |
+| 命令 | 语法 | 语义 | 定位 |
+|------|------|------|------|
+| `:scope list` | `:scope list [--tree]` | 列出所有 scope | 核心 |
+| `:scope new` | `:scope new [--profile rust]` | 创建新 scope | 核心 |
+| `:scope env` | `:scope env S1` | 查看 scope env | 核心 |
+| `:scope fork` | `:scope fork S1 [--name exp]` | 从 scope 派生（delta 存储） | 核心 |
+| `:scope close` | `:scope close S1` | 归档 scope | 核心 |
 
-### 3.3 Agent 管理
+### 3.3 Cron/定时管理
 
-| 命令 | 语法 | 语义 | Planner | Executor |
-|------|------|------|---------|----------|
-| `:ask` | `:ask 帮我跑完整个 CI` | 用户→Planner 入口 | N/A (用户) | N/A |
-| `:spawn` | `:spawn --plan <json> [--inherit-scope S1]` | Planner→Executor | ✅ | ✅(sub) |
-| `:agents` | `:agents` | 列出活跃 agent | ✅ | ✅ |
-| `:confirm` | `:confirm "是否继续部署 production？"` | Planner→用户确认 | ✅ | ❌ |
-| `:escalate` | `:escalate "任务超出范围，需要改 CI 配置"` | Executor→Planner 上报 | ❌ | ✅ |
-| `:probe` | `:probe out J1 --tail 50` | Planner 轻量只读窥探 | ✅ | N/A |
-
-**`:probe` 约束**：
-- 只读，绝对没有副作用
-- 硬性输出上限（4KB），超出自动截断
-- 不阻塞（不能 `:probe wait`）
-- 同步返回，不创建 scope
-- 当前可用子命令：`status`, `out`, `err`, `env`
-- `out` / `err` 目前都读取 phase-1 PTY 合并日志；`err` 暂时不是独立 stderr ring
-- `env` 当前支持 `head` 或 job ID（读取 job 的 start/end scope 快照），暂不支持任意 `S@...` 查找
-
-**`:spawn` 新增 `--inherit-scope`**：
-- Executor B 继承 Executor A 的 scope（默认只读）
-- A 完成后 scope 冻结，B 读取 A 写入的 env 数据
-- 避免 Planner 成为大数据中转站
-
-**Executor 可 spawn sub-executor**（深度限制，默认最多 3 层）
-
-**当前 AGENT follow-up 语义**：
-- `:ask` / `:spawn` 会启动一个长寿命 ACP backend session
-- backend 每完成一轮输出后进入 `WaitingInput`
-- `:send A1 ...` 会在同一 session 上追加下一轮 prompt
-- `:fg A1` 会把该 agent session 带入前台会话视图；此时 Enter 直接提交下一轮 prompt，Ctrl+C 只取消当前轮，Ctrl+Z 仅做本地 detach
-- TUI 中点击侧边栏 AGENT 行会直接请求进入该前台会话
-- `:cancel A1` 会向 backend 发送 `session/cancel`，只中断当前轮，不销毁整个 session
-- `:kill A1` 会终止整个 agent session
-- `:ask(session=sess_xxx) ...` / `:spawn(session=sess_xxx) ...` 会在 backend 声明 `loadSession` capability 时续传已有 ACP session
-- daemon 重启时会基于持久化的 `backend / scope_hash / session_id` 尝试恢复未终态 agent；恢复失败会把该 agent 标记为 `Failed`，而不是让它静默从 `:agents` / UI 中消失
-- agent transcript 现在也会随 daemon 一起持久化；因此退出 `cue-tui` 后重新连接，或 `cued` 重启恢复后，前台/侧栏里的 agent 会话内容会继续存在，而不只是剩一个空的 `A<n>` 条目
-- 终态 agent 现在也会保留在 `:agents` 历史里；daemon 重启后仍可见，不再只恢复活跃 session
-- `:confirm <msg>` 当前返回结构化 `ConfirmRequest { prompt }` 给 client，由前端决定如何展示/回填
-- `:escalate <msg>` 当前会新建一个 Planner agent，并把消息作为 escalation prompt 转发过去
-
-### 3.4 Cron/定时管理
-
-| 命令 | 语法 | 语义 | Planner | Executor |
-|------|------|------|---------|----------|
-| `:cron` | `:cron <schedule> <cmd>` | 添加定时/延迟任务 | ❌ | ✅ |
-| `:crons` | `:crons` | 列出所有定时任务 | ✅ | ✅ |
+| 命令 | 语法 | 语义 | 定位 |
+|------|------|------|------|
+| `:cron` | `:cron <schedule> <cmd>` | 添加定时/延迟任务 | 核心 |
+| `:crons` | `:crons` | 列出所有定时任务 | 核心 |
 
 - `:crons` 现在展示**持久化 cron 历史**，而不只是在内存中的活跃注册项
 - one-shot cron 触发后会保留为 `completed`；daemon 重启时已错过的 one-shot 会保留为 `expired`，都不会再补跑
@@ -226,16 +183,16 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 > 当前 runtime 已支持：`every <dur>`、`in <dur>`、`at <time> [on <days>]`、`on <days> at <time>`、`daily/hourly/weekly/monthly`、`cron <5f>`，以及 `<5-field-crontab> do <cmd>`。
 > 更自由的 `do` 回退（如 `every 30m 9am-5pm weekdays do ...` / 动态变量 schedule）目前仍显式保留为后续能力，不再假装已实现。
 
-### 3.5 通用命令
+### 3.4 通用命令
 
-| 命令 | 语法 | 语义 | Planner | Executor |
-|------|------|------|---------|----------|
-| `:env` | `:env` | 查看当前持久化 HEAD env | ✅(只读) | ✅ |
-| `:env set` | `:env set FOO=bar` | 设置 env 并打印实际副作用 | ❌ | ✅ |
-| `:help` | `:help` / `:help run` | 帮助 | ✅ | ✅ |
-| `?` | `?` | 当前 mode 的详细帮助 | ✅ | ✅ |
-| `:config` | `:config` / `:config show` | 查看配置 | ✅ | ✅ |
-| `:exit` | `:exit` | 退出 TUI | N/A | N/A |
+| 命令 | 语法 | 语义 | 定位 |
+|------|------|------|------|
+| `:env` | `:env` | 查看当前持久化 HEAD env | 核心 |
+| `:env set` | `:env set FOO=bar` | 设置 env 并打印实际副作用 | 核心 |
+| `:help` | `:help` / `:help run` | 帮助 | 核心 |
+| `?` | `?` | 当前 mode 的详细帮助 | 核心 |
+| `:config` | `:config` / `:config show` | 查看配置 | 核心 |
+| `:exit` | `:exit` | 退出 TUI | 核心 |
 
 这里需要区分：
 
@@ -251,90 +208,12 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 
 ---
 
-## 四、Planner vs Executor 权限边界
-
-### 设计原则
-- **Planner 是事件驱动的决策器**，不轮询，不阻塞
-- **Planner 看全景 + 可窥探细节**（通过 `:probe`，有输出上限）
-- **Planner 不产生副作用**（`:spawn` 和 `:confirm` 除外）
-- **写操作全部通过 Executor**
-
-### Planner 唤醒事件
-
-```
-user_input:     用户的新请求或追问
-executor_done:  Executor 完成（带结构化摘要）
-executor_error: Executor 异常退出
-escalate:       Executor 上报需要决策
-cron_trigger:   定时任务触发
-```
-
-### Planner 可执行
-
-```
-# 宏观摘要（只读）
-:jobs           — job 列表摘要
-:agents         — agent 列表
-:crons          — 定时任务列表
-:scope list     — scope 列表
-:env            — 当前 env（只读）
-:help           — 帮助
-?               — 当前 mode 的详细帮助
-:config         — 配置查看
-
-# 轻量窥探（只读，4KB 上限）
-:probe out J1 --tail 50
-:probe err J1 --grep ERROR
-:probe status J1
-:probe env head PATH HOME
-:probe env J1 PATH HOME
-
-# 决策动作
-:spawn          — 创建 Executor（唯一的"写"操作）
-:confirm        — 请求用户确认（高风险操作前）
-```
-
-### Executor 可执行
-
-```
-# 在自己的 scope 内的全部读写操作
-:run  :wait  :out  :tail  :err  :send  :kill  :cancel  :fg
-:scope new/env/fork/close
-:env set
-:cron
-
-# 分治与上报
-:spawn          — sub-executor（深度限制 ≤3）
-:escalate       — 上报 Planner 做决策
-```
-
-### Executor 结构化上报
-
-Executor 完成时向 Planner 上报结构化摘要（而非让 Planner 自己读 stdout）：
-
-```json
-{
-  "status": "failed",
-  "category": "test_failure",
-  "failed_tests": ["test_auth_login", "test_db_connect"],
-  "error_summary": "2/47 tests failed, both in auth module",
-  "suggestion": "auth module regression"
-}
-```
-
----
-
-## 五、Scope 持久化策略
+## 四、Scope 持久化策略
 
 ### Delta 存储
 - fork 出的 scope 只存储 `parent_id` + `env_delta`
 - 读取时沿 parent 链合并得到完整 env
 - 大幅减少磁盘开销
-
-### Scope 继承（Executor 间数据共享）
-- `:spawn --inherit-scope S1`：B 继承 A 的 scope（默认只读）
-- A 完成后 scope 冻结 → B 读取 A 的 env 数据
-- Planner 只做调度，不搬运大数据
 
 ### LRU 淘汰 + 引用保护
 - 配置 `max_persisted_scopes`
@@ -353,15 +232,13 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 ---
 
-## 六、模式参数 `()` 语法
+## 五、模式参数 `()` 语法
 
 > v2 新增：用括号分离内建配置与被执行命令的参数，消除歧义。
 
 ```
 :run(retry=3, timeout=30s) cargo test --release
-:ask(model=gpt-4) explain this error
 :cron(scope=S0@a3f1) every 5m cargo clippy
-:spawn(agent=acp, role=executor) implement the next step
 ```
 
 - `()` 紧跟命令名 = 模式参数（执行行为配置）
@@ -369,41 +246,19 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 - Tokenizer 根据**位置规则**消歧（前一个 token 是 Command → 模式参数）
 - 模式参数可在 `server.toml`（迁移期仍兼容旧 `config.toml`）中设置默认值，调用时覆盖
 
-### 当前 AGENT backend 配置落地
-
-当前实现先采用**配置选择 backend**，并内建 Copilot CLI 的 ACP 配置作为默认值。`cued`
-优先读取 `server.toml`，迁移期仍兼容旧 `config.toml`：
-
-```toml
-[agent]
-default_backend = "copilot"
-
-[agent.backends.copilot]
-command = "copilot"
-args = ["--acp", "--stdio"]
-```
-
-- `:ask` 默认使用 planner 角色
-- `:spawn` 默认使用 executor 角色
-- `:ask(agent=copilot, model=...)` / `:spawn(agent=copilot, model=...)` 可覆盖默认 backend / model
-- 当前只支持 ACP backend profile，不再额外区分 `kind`
-- 当前 ACP 集成采用**多轮 session**：同一个 agent session 会在 `Running ↔ WaitingInput` 之间切换，而不是每轮 prompt 后立即退出
-
 ### 支持模式参数的命令
 
 | 命令 | 可用参数 |
 |------|---------|
 | `:run()` | `retry`, `timeout`, `shell`, `env`, `scope` |
-| `:ask()` | `model`, `temperature`, `max_tokens`, `agent`, `session` |
 | `:cron()` | `label`, `scope` |
-| `:spawn()` | `agent`, `role`, `inherit_scope`, `depth_limit`, `model`, `session` |
 | `:scope new()` | `profile` |
 
 其他命令只有位置/标志参数，无 `()` 语法。
 
 ---
 
-## 七、操作符（两层模型）
+## 六、操作符（两层模型）
 
 ### Pipeline（Job 内部的进程管道）
 
@@ -487,8 +342,6 @@ Pipeline 内退出码 = 最后一个进程的退出码
 │ :fg <id>       前台（pty）                 │
 │ :retry <id>    重试 failed job             │
 │ :log [id]      查看 job 历史日志           │
-│ :pause <id>    暂停 cron/agent             │
-│ :resume <id>   恢复 cron/agent             │
 ├── Scope ──────────────────────────────────┤
 │ :scope list    列出 scope                  │
 │ :scope new     创建 scope                  │
@@ -497,13 +350,9 @@ Pipeline 内退出码 = 最后一个进程的退出码
 │ :scope close   归档 scope                  │
 │ :scopes        列出所有 scope（简写）       │
 │ :cd <path>     修改默认 scope 的 cwd       │
-├── Agent ──────────────────────────────────┤
-│ :ask <prompt>  用户→Planner                │
-│ :spawn <plan>  Planner→Executor            │
-│ :agents        列出 agent                  │
-│ :confirm <msg> Planner→用户确认            │
-│ :escalate <msg> Executor→Planner 上报      │
-│ :probe <sub>   Planner 轻量窥探（4KB 限）  │
+├── Control ────────────────────────────────┤
+│ :send J<n> <input>  向 job 写 stdin        │
+│ :cancel J<n>        取消 queued job        │
 ├── Cron ───────────────────────────────────┤
 │ :cron <sched> <cmd>  添加定时/延迟任务     │
 │ :crons         列出定时任务                │

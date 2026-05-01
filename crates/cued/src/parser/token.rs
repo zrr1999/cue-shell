@@ -51,7 +51,7 @@ pub enum Token {
     // Content
     /// A word (command argument, filename, flag, etc.)
     Word(String),
-    /// An entity ID reference like J1, A2, C3, S0.
+    /// An entity ID reference like J1, C3, S0.
     IdRef(IdKind, u32),
 
     // Whitespace (preserved for highlighting, skipped during parsing)
@@ -65,7 +65,6 @@ pub enum Token {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdKind {
     Job,
-    Agent,
     Cron,
     Scope,
 }
@@ -103,7 +102,6 @@ impl fmt::Display for IdKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Job => "J",
-            Self::Agent => "A",
             Self::Cron => "C",
             Self::Scope => "S",
         })

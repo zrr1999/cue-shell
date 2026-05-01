@@ -7,7 +7,6 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::AgentStatus;
 use crate::cron::CronStatus;
 use crate::job::JobStatus;
 use crate::mode::Mode;
@@ -56,14 +55,6 @@ pub enum RequestPayload {
         cols: u16,
         rows: u16,
     },
-    AgentPrompt {
-        id: String,
-        prompt: String,
-    },
-    AgentCancel {
-        id: String,
-    },
-
     // Editor services
     Complete {
         input: String,
@@ -103,9 +94,6 @@ pub enum OkPayload {
         job_ids: Vec<String>,
         chain: ChainInfo,
     },
-    AgentSpawned {
-        agent_id: String,
-    },
     CronAdded {
         cron_id: String,
     },
@@ -117,8 +105,6 @@ pub enum OkPayload {
 
     JobInfo(JobInfo),
     JobList(Vec<JobInfo>),
-    AgentInfo(AgentInfo),
-    AgentList(Vec<AgentInfo>),
     CronList(Vec<CronInfo>),
     ScopeInfo(ScopeInfo),
     ScopeList(Vec<ScopeInfo>),
@@ -130,9 +116,6 @@ pub enum OkPayload {
 
     EvalText {
         text: String,
-    },
-    ConfirmRequest {
-        prompt: String,
     },
 
     CompletionList {
@@ -182,18 +165,6 @@ pub enum EventPayload {
     },
     JobRemoved {
         job_id: String,
-    },
-
-    // Agents channel
-    AgentStateChanged {
-        agent_id: String,
-        old_state: AgentStatus,
-        new_state: AgentStatus,
-    },
-    AgentMessage {
-        agent_id: String,
-        role: String,
-        content: String,
     },
 
     // Crons channel
@@ -276,18 +247,6 @@ pub struct JobInfo {
     pub chain_id: Option<String>,
     pub chain_index: Option<usize>,
     pub chain_total: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentInfo {
-    pub id: String,
-    pub status: AgentStatus,
-    pub backend: String,
-    pub role: String,
-    #[serde(default)]
-    pub transcript: String,
-    #[serde(default)]
-    pub last_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

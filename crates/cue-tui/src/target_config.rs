@@ -513,8 +513,8 @@ default_profile = "local"
 [transport.profiles.local]
 transport = "unix"
 
-[agent.backends.copilot]
-command = "copilot"
+[weft]
+socket_path = "./weft.sock"
 "#,
         )
         .unwrap();
@@ -531,15 +531,11 @@ command = "copilot"
         );
         assert_eq!(
             document
-                .get("agent")
+                .get("weft")
                 .and_then(Value::as_table)
-                .and_then(|agent| agent.get("backends"))
-                .and_then(Value::as_table)
-                .and_then(|backends| backends.get("copilot"))
-                .and_then(Value::as_table)
-                .and_then(|backend| backend.get("command"))
+                .and_then(|weft| weft.get("socket_path"))
                 .and_then(Value::as_str),
-            Some("copilot")
+            Some("./weft.sock")
         );
     }
 
