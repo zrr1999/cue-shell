@@ -97,6 +97,8 @@ pub enum ProcessMgrMsg {
         scope_hash: ScopeHash,
         /// Override the scope's cwd for this specific invocation.
         cwd_override: Option<std::path::PathBuf>,
+        /// Whether the wrapper binary should be prepended to the command.
+        wrapper_enabled: bool,
     },
     /// Kill a running job.
     KillJob { job_id: cue_core::JobId },

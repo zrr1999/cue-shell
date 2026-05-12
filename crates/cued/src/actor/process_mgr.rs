@@ -74,6 +74,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     command_line,
                     scope_hash,
                     cwd_override,
+                    wrapper_enabled,
                 } => {
                     info!(%job_id, cmd = ?command_line, %scope_hash, "process_mgr: spawn");
 
@@ -118,8 +119,8 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     let expanded_command_line =
                         expand_command_line(&command_line, effective_snapshot.as_ref());
 
-                    // 2. Build the tokio Command.
-                    let Some(program) = expanded_command_line.first().filter(|program| !program.is_empty()) else {
+                    // Guard: command must be non-empty after expansion.
+                    let Some(first_prog) = expanded_command_line.first().filter(|p| !p.is_empty()) else {
                         error!(
                             %job_id,
                             raw_cmd = ?command_line,
@@ -127,6 +128,23 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             "process_mgr: expanded command is empty"
                         );
                         continue;
+                    };
+
+                    // Apply wrapper prefix (if enabled and not denied).
+                    let (program, args): (String, Vec<String>) = if wrapper_enabled {
+                        let wbin = &sys.config.wrapper.binary;
+                        if !wbin.is_empty()
+                            && sys.config.wrapper.should_wrap(first_prog, false, Some(true))
+                        {
+                            let mut wargs = Vec::with_capacity(expanded_command_line.len());
+                            wargs.push(first_prog.clone());
+                            wargs.extend_from_slice(&expanded_command_line[1..]);
+                            (wbin.clone(), wargs)
+                        } else {
+                            (first_prog.clone(), expanded_command_line[1..].to_vec())
+                        }
+                    } else {
+                        (first_prog.clone(), expanded_command_line[1..].to_vec())
                     };
 
                     // Resolve effective cwd: explicit override wins, else scope cwd.
@@ -155,9 +173,9 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
                     clear_output_log(job_id).await;
 
-                    let mut cmd = tokio::process::Command::new(program);
-                    if expanded_command_line.len() > 1 {
-                        cmd.args(&expanded_command_line[1..]);
+                    let mut cmd = tokio::process::Command::new(&program);
+                    if !args.is_empty() {
+                        cmd.args(&args);
                     }
                     if let Some(ref snap) = effective_snapshot {
                         apply_env(&mut cmd, snap);
