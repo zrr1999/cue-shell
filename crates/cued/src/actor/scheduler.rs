@@ -86,7 +86,9 @@ struct ChainState {
 struct FlatLeaf {
     /// Index in the DFS-order leaf list.
     index: usize,
-    /// Command words for the first segment (used to spawn the job).
+    /// Full pipeline (may be multi-segment with pipe operators).
+    pipeline: cue_core::pipeline::Pipeline,
+    /// Command words for the first segment (convenience copy).
     command: Vec<String>,
     /// Human-readable pipeline text.
     pipeline_text: String,
@@ -1705,6 +1707,7 @@ fn flatten_leaves_inner(node: &ChainNode, out: &mut Vec<FlatLeaf>) {
             let pipeline_text = pipeline_to_text(pipeline);
             out.push(FlatLeaf {
                 index: idx,
+                pipeline: pipeline.clone(),
                 command,
                 pipeline_text,
             });
@@ -3134,7 +3137,7 @@ async fn spawn_chain(
                     .process_mgr
                     .send(ProcessMgrMsg::SpawnJob {
                         job_id: jid,
-                        command_line: leaf.command.clone(),
+                        pipeline: leaf.pipeline.clone(),
                         scope_hash,
                         cwd_override: cwd_override.clone(),
                         wrapper_enabled,
@@ -3381,7 +3384,7 @@ async fn process_chain_advance(
                     .process_mgr
                     .send(ProcessMgrMsg::SpawnJob {
                         job_id: jid,
-                        command_line: leaves[idx].command.clone(),
+                        pipeline: leaves[idx].pipeline.clone(),
                         scope_hash: start_scope,
                         cwd_override: cwd_override.clone(),
                         wrapper_enabled,

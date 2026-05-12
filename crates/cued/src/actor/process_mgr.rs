@@ -71,12 +71,12 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     match msg {
                 ProcessMgrMsg::SpawnJob {
                     job_id,
-                    command_line,
+                    pipeline,
                     scope_hash,
                     cwd_override,
                     wrapper_enabled,
                 } => {
-                    info!(%job_id, cmd = ?command_line, %scope_hash, "process_mgr: spawn");
+                    info!(%job_id, segments = pipeline.segments.len(), %scope_hash, "process_mgr: spawn");
 
                     // 1. Query ScopeStore for the environment snapshot.
                     let snapshot = {
@@ -116,36 +116,6 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     };
 
                     let effective_snapshot = snapshot.as_ref().map(effective_snapshot);
-                    let expanded_command_line =
-                        expand_command_line(&command_line, effective_snapshot.as_ref());
-
-                    // Guard: command must be non-empty after expansion.
-                    let Some(first_prog) = expanded_command_line.first().filter(|p| !p.is_empty()) else {
-                        error!(
-                            %job_id,
-                            raw_cmd = ?command_line,
-                            expanded_cmd = ?expanded_command_line,
-                            "process_mgr: expanded command is empty"
-                        );
-                        continue;
-                    };
-
-                    // Apply wrapper prefix (if enabled and not denied).
-                    let (program, args): (String, Vec<String>) = if wrapper_enabled {
-                        let wbin = &sys.config.wrapper.binary;
-                        if !wbin.is_empty()
-                            && sys.config.wrapper.should_wrap(first_prog, false, Some(true))
-                        {
-                            let mut wargs = Vec::with_capacity(expanded_command_line.len());
-                            wargs.push(first_prog.clone());
-                            wargs.extend_from_slice(&expanded_command_line[1..]);
-                            (wbin.clone(), wargs)
-                        } else {
-                            (first_prog.clone(), expanded_command_line[1..].to_vec())
-                        }
-                    } else {
-                        (first_prog.clone(), expanded_command_line[1..].to_vec())
-                    };
 
                     // Resolve effective cwd: explicit override wins, else scope cwd.
                     let effective_cwd = cwd_override.as_ref().or_else(|| {
@@ -173,36 +143,70 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
                     clear_output_log(job_id).await;
 
-                    let mut cmd = tokio::process::Command::new(&program);
-                    if !args.is_empty() {
-                        cmd.args(&args);
-                    }
-                    if let Some(ref snap) = effective_snapshot {
-                        apply_env(&mut cmd, snap);
-                    }
-                    // Apply cwd override after apply_env (which also sets cwd).
-                    if let Some(ref cwd) = cwd_override {
-                        cmd.current_dir(cwd);
+                    // ── Build expanded commands for each segment ──
+                    let mut segment_commands: Vec<(String, Vec<String>)> = Vec::new();
+                    for segment in &pipeline.segments {
+                        let expanded = expand_command_line(&segment.command, effective_snapshot.as_ref());
+                        let Some(prog) = expanded.first().filter(|p| !p.is_empty()) else {
+                            error!(%job_id, cmd = ?segment.command, "process_mgr: segment command is empty");
+                            break;
+                        };
+                        // Apply wrapper prefix per-segment.
+                        let (program, args) = if wrapper_enabled {
+                            let wbin = &sys.config.wrapper.binary;
+                            if !wbin.is_empty()
+                                && sys.config.wrapper.should_wrap(prog, false, Some(true))
+                            {
+                                let mut wargs = Vec::with_capacity(expanded.len());
+                                wargs.push(prog.clone());
+                                wargs.extend_from_slice(&expanded[1..]);
+                                (wbin.clone(), wargs)
+                            } else {
+                                (prog.clone(), expanded[1..].to_vec())
+                            }
+                        } else {
+                            (prog.clone(), expanded[1..].to_vec())
+                        };
+                        segment_commands.push((program, args));
                     }
 
-                    let pty_pair = match crate::pty::open_pty() {
-                        Ok(pair) => pair,
-                        Err(error) => {
-                            error!(%job_id, err = %error, "process_mgr: open pty failed");
-                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
-                                .await;
-                            let _ = sys
-                                .scheduler
-                                .send(SchedulerMsg::JobFinished {
-                                    job_id,
-                                    exit_code: -1,
-                                })
-                                .await;
-                            continue;
+                    if segment_commands.is_empty() {
+                        error!(%job_id, "process_mgr: all segment commands empty");
+                        continue;
+                    }
+
+                    // ── Single segment: spawn via PTY (unchanged path) ──
+                    if segment_commands.len() == 1 {
+                        let (program, args) = segment_commands.into_iter().next().unwrap();
+                        let mut cmd = tokio::process::Command::new(&program);
+                        if !args.is_empty() {
+                            cmd.args(&args);
                         }
-                    };
-                    let master_file = std::fs::File::from(pty_pair.master);
-                    let slave = pty_pair.slave;
+                        if let Some(snap) = effective_snapshot {
+                            apply_env(&mut cmd, &snap);
+                        }
+                        if let Some(ref cwd) = cwd_override {
+                            cmd.current_dir(cwd);
+                        }
+
+                        let pty_pair = match crate::pty::open_pty() {
+                            Ok(pair) => pair,
+                            Err(error) => {
+                                error!(%job_id, err = %error, "process_mgr: open pty failed");
+                                emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
+                                    .await;
+                                let _ = sys
+                                    .scheduler
+                                    .send(SchedulerMsg::JobFinished {
+                                        job_id,
+                                        exit_code: -1,
+                                    })
+                                    .await;
+                                continue;
+                            }
+                        };
+                        let master_file = std::fs::File::from(pty_pair.master);
+                        let slave = pty_pair.slave;
                     if let Err(error) = set_nonblocking(master_file.as_raw_fd()) {
                         error!(%job_id, err = %error, "process_mgr: set pty nonblocking failed");
                         emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
@@ -307,7 +311,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             error!(
                                 %job_id,
                                 program = %program,
-                                expanded_cmd = ?expanded_command_line,
+                                expanded_cmd = ?pipeline.segments.first().map(|s| &s.command),
                                 cwd = %snapshot
                                     .as_ref()
                                     .map(|snap| snap.cwd.display().to_string())
@@ -406,6 +410,21 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             fg_owner,
                         },
                     );
+                    } else {
+                        // ── Multi-segment: native pipe spawn ──
+                        spawn_native_pipeline(
+                            job_id,
+                            segment_commands,
+                            pipeline,
+                            effective_snapshot.as_ref(),
+                            effective_cwd,
+                            cwd_override.as_ref(),
+                            &sys,
+                            &mut children,
+                            &cleanup_tx,
+                        )
+                        .await;
+                    }
                 }
 
                 ProcessMgrMsg::KillJob { job_id } => {
@@ -685,6 +704,418 @@ async fn clear_output_log(job_id: JobId) {
         }
     })
     .await;
+}
+
+/// Spawn a multi-segment pipeline natively via pipe(2).
+///
+/// Segments 0..N-2 get their stdout connected to the next segment's stdin
+/// via a Unix pipe.  Only the last segment gets a PTY for interactive
+/// output.  Each intermediate segment captures stderr separately.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_native_pipeline(
+    job_id: JobId,
+    segment_commands: Vec<(String, Vec<String>)>,
+    pipeline: cue_core::pipeline::Pipeline,
+    effective_snapshot: Option<&EnvSnapshot>,
+    _effective_cwd: Option<&std::path::PathBuf>,
+    cwd_override: Option<&std::path::PathBuf>,
+    sys: &ActorSystem,
+    children: &mut HashMap<u32, ProcessEntry>,
+    cleanup_tx: &mpsc::Sender<JobId>,
+) {
+    use std::os::fd::FromRawFd;
+
+    let n = segment_commands.len();
+    info!(%job_id, segments = n, "process_mgr: spawning native pipeline");
+
+    // 1. Open PTY for the last segment.
+    let pty_pair = match crate::pty::open_pty() {
+        Ok(pair) => pair,
+        Err(error) => {
+            error!(%job_id, err = %error, "process_mgr: open pty for pipeline failed");
+            emit_state_change(sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
+            let _ = sys
+                .scheduler
+                .send(SchedulerMsg::JobFinished {
+                    job_id,
+                    exit_code: -1,
+                })
+                .await;
+            return;
+        }
+    };
+    let master_file = std::fs::File::from(pty_pair.master);
+    let last_slave = pty_pair.slave;
+    if let Err(error) = set_nonblocking(master_file.as_raw_fd()) {
+        error!(%job_id, err = %error, "process_mgr: set pty nonblocking failed");
+        emit_state_change(sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
+        let _ = sys
+            .scheduler
+            .send(SchedulerMsg::JobFinished {
+                job_id,
+                exit_code: -1,
+            })
+            .await;
+        return;
+    }
+    if let Err(error) = set_winsize(last_slave.as_raw_fd(), DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS) {
+        warn!(%job_id, err = %error, "process_mgr: set initial pty size failed");
+    }
+
+    // 2. Build pipes between segments.
+    let mut pipes: Vec<(std::fs::File, std::fs::File)> = Vec::new(); // (read_end, write_end)
+    for _ in 0..n.saturating_sub(1) {
+        let mut fds = [-1i32; 2];
+        // SAFETY: libc::pipe fills fds with two file descriptors.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+            let error = std::io::Error::last_os_error();
+            error!(%job_id, err = %error, "process_mgr: pipe() failed");
+            emit_state_change(sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
+            let _ = sys
+                .scheduler
+                .send(SchedulerMsg::JobFinished {
+                    job_id,
+                    exit_code: -1,
+                })
+                .await;
+            return;
+        } else {
+            // SAFETY: pipe() returns valid fds.
+            let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+            let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+            pipes.push((read_end, write_end));
+        }
+    }
+
+    // 3. Spawn each segment.
+    let mut spawned_children: Vec<tokio::process::Child> = Vec::with_capacity(n);
+    let mut stderr_buffers: Vec<Arc<Mutex<RingBuffer>>> = Vec::new();
+
+    for (i, (program, args)) in segment_commands.iter().enumerate() {
+        let is_last = i == n - 1;
+        let _pipe_to_next = pipeline.segments.get(i).and_then(|s| s.pipe_to_next);
+
+        let mut cmd = tokio::process::Command::new(program);
+        if !args.is_empty() {
+            cmd.args(args);
+        }
+        if let Some(snap) = effective_snapshot {
+            apply_env(&mut cmd, snap);
+        }
+        if let Some(ref cwd) = cwd_override {
+            cmd.current_dir(cwd);
+        }
+
+        // stdin: previous segment's pipe read end (or null for first segment).
+        if i > 0 {
+            let stdin_fd = pipes[i - 1].0.as_raw_fd();
+            // SAFETY: pipe fd is valid; the child will inherit it.
+            unsafe {
+                cmd.stdin(Stdio::from_raw_fd(stdin_fd));
+            }
+        } else {
+            cmd.stdin(Stdio::null());
+        }
+
+        if is_last {
+            // Last segment: stdout and stderr → PTY slave.
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            let slave_fd = last_slave.as_raw_fd();
+            let master_fd = master_file.as_raw_fd();
+            // SAFETY: the child process is single-threaded after fork.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    #[cfg(target_os = "macos")]
+                    let tiocsctty = libc::TIOCSCTTY.into();
+                    #[cfg(not(target_os = "macos"))]
+                    let tiocsctty = libc::TIOCSCTTY;
+                    if libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                        if libc::dup2(slave_fd, target) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    if slave_fd > libc::STDERR_FILENO {
+                        libc::close(slave_fd);
+                    }
+                    if master_fd > libc::STDERR_FILENO {
+                        libc::close(master_fd);
+                    }
+                    Ok(())
+                });
+            }
+            cmd.kill_on_drop(true);
+
+            stderr_buffers.push(Arc::new(Mutex::new(RingBuffer::default())));
+
+            let child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(%job_id, seg = i, program = %program, err = %e, "process_mgr: pipeline segment spawn failed");
+                    // Kill already-spawned children.
+                    for mut prev in spawned_children {
+                        let _ = prev.start_kill();
+                    }
+                    emit_state_change(sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
+                    let _ = sys
+                        .scheduler
+                        .send(SchedulerMsg::JobFinished {
+                            job_id,
+                            exit_code: -1,
+                        })
+                        .await;
+                    return;
+                }
+            };
+            let pid = child.id().unwrap_or(0);
+            info!(%job_id, pid, seg = i, "process_mgr: pipeline last segment spawned");
+            spawned_children.push(child);
+        } else {
+            // Intermediate segment: stdout → pipe write end, stderr → ring buffer.
+            let pipe_write_fd = pipes[i].1.as_raw_fd();
+            // SAFETY: pipe fd is valid; the child will inherit it.
+            unsafe {
+                cmd.stdout(Stdio::from_raw_fd(pipe_write_fd));
+            }
+            cmd.stderr(Stdio::piped());
+            cmd.kill_on_drop(true);
+
+            // If this segment pipes stderr-only, we need to adjust.
+            // For now, stderr goes to a ring buffer for inspection.
+            let stderr_buf = Arc::new(Mutex::new(RingBuffer::default()));
+            stderr_buffers.push(stderr_buf.clone());
+
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(%job_id, seg = i, program = %program, err = %e, "process_mgr: pipeline segment spawn failed");
+                    for mut prev in spawned_children {
+                        let _ = prev.start_kill();
+                    }
+                    emit_state_change(sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
+                    let _ = sys
+                        .scheduler
+                        .send(SchedulerMsg::JobFinished {
+                            job_id,
+                            exit_code: -1,
+                        })
+                        .await;
+                    return;
+                }
+            };
+            let pid = child.id().unwrap_or(0);
+            info!(%job_id, pid, seg = i, "process_mgr: pipeline intermediate segment spawned");
+
+            // Spawn a task to drain stderr.
+            let seg_stderr_buf = stderr_buf.clone();
+            if let Some(stderr_reader) = child.stderr.take() {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut reader = stderr_reader;
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        match reader.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                seg_stderr_buf.lock().unwrap().push(&buf[..n]);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+
+            spawned_children.push(child);
+        }
+    }
+
+    // Close pipe ends in the parent (children have their copies).
+    drop(pipes);
+
+    // 4. Set up PTY reader for last segment output.
+    let reader_file = match master_file.try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            error!(%job_id, err = %error, "process_mgr: clone pty reader failed");
+            for mut child in spawned_children {
+                let _ = child.start_kill();
+            }
+            emit_state_change(sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
+            let _ = sys
+                .scheduler
+                .send(SchedulerMsg::JobFinished {
+                    job_id,
+                    exit_code: -1,
+                })
+                .await;
+            return;
+        }
+    };
+    let input_file = match master_file.try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            error!(%job_id, err = %error, "process_mgr: clone pty input failed");
+            for mut child in spawned_children {
+                let _ = child.start_kill();
+            }
+            emit_state_change(sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
+            let _ = sys
+                .scheduler
+                .send(SchedulerMsg::JobFinished {
+                    job_id,
+                    exit_code: -1,
+                })
+                .await;
+            return;
+        }
+    };
+    let resize_file = match master_file.try_clone() {
+        Ok(file) => Arc::new(file),
+        Err(error) => {
+            error!(%job_id, err = %error, "process_mgr: clone pty resize failed");
+            for mut child in spawned_children {
+                let _ = child.start_kill();
+            }
+            emit_state_change(sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
+            let _ = sys
+                .scheduler
+                .send(SchedulerMsg::JobFinished {
+                    job_id,
+                    exit_code: -1,
+                })
+                .await;
+            return;
+        }
+    };
+
+    // 5. Emit Pending → Running.
+    emit_state_change(sys, job_id, JobStatus::Pending, JobStatus::Running).await;
+
+    // 6. Open log file.
+    let log_file = open_log_file(job_id).await;
+
+    let input = match AsyncFd::new(input_file) {
+        Ok(file) => Arc::new(file),
+        Err(error) => {
+            error!(%job_id, err = %error, "process_mgr: async pty input failed");
+            for mut child in spawned_children {
+                let _ = child.start_kill();
+            }
+            emit_state_change(sys, job_id, JobStatus::Running, JobStatus::Failed).await;
+            let _ = sys
+                .scheduler
+                .send(SchedulerMsg::JobFinished {
+                    job_id,
+                    exit_code: -1,
+                })
+                .await;
+            return;
+        }
+    };
+    let reader = match AsyncFd::new(reader_file) {
+        Ok(file) => file,
+        Err(error) => {
+            error!(%job_id, err = %error, "process_mgr: async pty reader failed");
+            for mut child in spawned_children {
+                let _ = child.start_kill();
+            }
+            emit_state_change(sys, job_id, JobStatus::Running, JobStatus::Failed).await;
+            let _ = sys
+                .scheduler
+                .send(SchedulerMsg::JobFinished {
+                    job_id,
+                    exit_code: -1,
+                })
+                .await;
+            return;
+        }
+    };
+
+    // 7. Spawn pipeline watcher task.
+    let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
+    let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
+    let ring_clone = ring_buffer.clone();
+    let fg_owner = Arc::new(Mutex::new(None));
+    let fg_owner_clone = fg_owner.clone();
+    let sys_clone = sys.clone();
+    let cleanup_tx_clone = cleanup_tx.clone();
+    let reader_handle = tokio::spawn(pipeline_watcher_task(
+        job_id,
+        spawned_children,
+        reader,
+        log_file,
+        kill_rx,
+        sys_clone,
+        ring_clone,
+        fg_owner_clone,
+        cleanup_tx_clone,
+        stderr_buffers,
+    ));
+
+    children.insert(
+        job_id.0,
+        ProcessEntry {
+            job_id,
+            status: JobStatus::Running,
+            _reader_handle: reader_handle,
+            kill_tx,
+            ring_buffer,
+            stderr_ring: None,
+            input,
+            resize: resize_file,
+            fg_owner,
+        },
+    );
+}
+
+/// Watcher task for native multi-segment pipelines.
+///
+/// Reads PTY output from the last segment (same as `reader_task`),
+/// waits for all children to exit, and reports the last segment's exit code
+/// as the pipeline's exit code.
+#[allow(clippy::too_many_arguments)]
+async fn pipeline_watcher_task(
+    job_id: JobId,
+    mut children: Vec<tokio::process::Child>,
+    reader: AsyncFd<std::fs::File>,
+    log_file: Option<std::fs::File>,
+    kill_rx: mpsc::Receiver<()>,
+    sys: ActorSystem,
+    ring: Arc<Mutex<RingBuffer>>,
+    fg_owner: Arc<Mutex<Option<u64>>>,
+    cleanup_tx: mpsc::Sender<JobId>,
+    _stderr_buffers: Vec<Arc<Mutex<RingBuffer>>>,
+) {
+    // Use the existing reader_task for the last child's PTY output.
+    // Intermediate children are tracked for exit but their output is
+    // routed through pipes, not PTY.
+    if children.is_empty() {
+        return;
+    }
+
+    // Take the last child (PTY-connected) for the main reader task.
+    let last_child = children.pop().unwrap();
+
+    // Spawn a background task to wait for intermediate children.
+    let intermediate_watcher = tokio::spawn(async move {
+        for mut child in children {
+            let _ = child.wait().await;
+        }
+    });
+
+    // Use existing reader_task for last child.
+    reader_task(
+        job_id, last_child, reader, log_file, kill_rx, sys, ring, fg_owner, cleanup_tx,
+    )
+    .await;
+
+    // Ensure intermediate children are done.
+    let _ = intermediate_watcher.await;
 }
 
 /// Background task that reads PTY output, populates the ring buffer,

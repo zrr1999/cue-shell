@@ -90,14 +90,18 @@ pub enum SchedulerMsg {
 
 /// Messages handled by the ProcessManager actor.
 pub enum ProcessMgrMsg {
-    /// Spawn a child process for the given job.
+    /// Spawn a child process (or a native pipeline) for the given job.
+    ///
+    /// Single-segment pipelines spawn one child via PTY.
+    /// Multi-segment pipelines spawn N children connected by pipe(2),
+    /// with only the last segment using a PTY for interactive output.
     SpawnJob {
         job_id: cue_core::JobId,
-        command_line: Vec<String>,
+        pipeline: cue_core::pipeline::Pipeline,
         scope_hash: ScopeHash,
         /// Override the scope's cwd for this specific invocation.
         cwd_override: Option<std::path::PathBuf>,
-        /// Whether the wrapper binary should be prepended to the command.
+        /// Whether the wrapper binary should be prepended to each segment.
         wrapper_enabled: bool,
     },
     /// Kill a running job.
