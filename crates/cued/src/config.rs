@@ -191,12 +191,21 @@ impl WrapperConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct WrapperDenylist {
     #[serde(default)]
     pub commands: Vec<String>,
     #[serde(default = "default_true")]
     pub interactive: bool,
+}
+
+impl Default for WrapperDenylist {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            interactive: true,
+        }
+    }
 }
 
 impl WrapperDenylist {
