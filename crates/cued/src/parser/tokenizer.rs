@@ -304,11 +304,15 @@ impl<'a> Tokenizer<'a> {
             return self.tokenize_single_quoted_string();
         }
 
-        // Regular word: gobble until delimiter
+        // Regular word: gobble until delimiter or operator.
         while self.pos < self.bytes.len()
             && !is_delimiter(self.bytes[self.pos])
             && !(self.in_mode_params && self.bytes[self.pos] == b'=')
         {
+            // Stop before any cue-shell operator (longest-match-first).
+            if starts_with_operator(self.bytes, self.pos).is_some() {
+                break;
+            }
             self.pos += 1;
         }
 
@@ -402,6 +406,38 @@ impl<'a> Tokenizer<'a> {
         self.last_significant = Some(TokenClass::Other);
         Ok(Token::Word(s))
     }
+}
+
+/// Check whether `bytes[pos..]` starts with a cue-shell operator.
+/// Operators are checked longest-match-first so `||?` is not split into `||` + `?`.
+fn starts_with_operator(bytes: &[u8], pos: usize) -> Option<Token> {
+    let tail = &bytes[pos..];
+    if tail.len() < 2 {
+        return None;
+    }
+    // longest match first
+    if tail.starts_with(b"|&>") {
+        return Some(Token::PipeAll);
+    }
+    if tail.starts_with(b"|!>") {
+        return Some(Token::PipeStderr);
+    }
+    if tail.len() >= 3 && tail.starts_with(b"||?") {
+        return Some(Token::ParallelRace);
+    }
+    if tail.starts_with(b"->") {
+        return Some(Token::SerialThen);
+    }
+    if tail.starts_with(b"~>") {
+        return Some(Token::SerialAlways);
+    }
+    if tail.starts_with(b"|>") {
+        return Some(Token::PipeStdout);
+    }
+    if tail.starts_with(b"||") {
+        return Some(Token::ParallelAll);
+    }
+    None
 }
 
 fn is_ident_char(b: u8) -> bool {
@@ -656,6 +692,161 @@ mod tests {
                 Token::ParallelAll,
                 Token::Word("cargo".into()),
                 Token::Word("clippy".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn chain_with_dash_args() {
+        // `-A` should be a word, not confused with `->`
+        let toks = tokens("git add -A -> git commit -m \"fix\"");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("git".into()),
+                Token::Word("add".into()),
+                Token::Word("-A".into()),
+                Token::SerialThen,
+                Token::Word("git".into()),
+                Token::Word("commit".into()),
+                Token::Word("-m".into()),
+                Token::Word("fix".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn chain_with_colon_in_quoted_arg() {
+        // `:wrap` inside quotes should be a word, not a command
+        let toks = tokens("echo \":wrap on\" -> echo done");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word(":wrap on".into()),
+                Token::SerialThen,
+                Token::Word("echo".into()),
+                Token::Word("done".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn chain_operator_no_space_left() {
+        // `-A->` — no space before `->` should still work
+        let toks = tokens("cmd -A-> cmd2");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("cmd".into()),
+                Token::Word("-A".into()),
+                Token::SerialThen,
+                Token::Word("cmd2".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn chain_operator_no_space_right() {
+        // `->cmd` — no space after `->` should still work
+        let toks = tokens("cmd1 ->cmd2");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("cmd1".into()),
+                Token::SerialThen,
+                Token::Word("cmd2".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn pipe_operator_inside_word() {
+        // `|>` immediately after a word should still be detected
+        let toks = tokens("a|>b");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("a".into()),
+                Token::PipeStdout,
+                Token::Word("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn parallel_operator_inside_word() {
+        // `||` immediately after a word should still be detected
+        let toks = tokens("a||b");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("a".into()),
+                Token::ParallelAll,
+                Token::Word("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn pipe_stderr_operator_inside_word() {
+        // `|!>` immediately after a word should still be detected
+        let toks = tokens("a|!>b");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("a".into()),
+                Token::PipeStderr,
+                Token::Word("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn serial_always_operator_inside_word() {
+        let toks = tokens("a~>b");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("a".into()),
+                Token::SerialAlways,
+                Token::Word("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn parallel_race_operator_inside_word() {
+        let toks = tokens("a||?b");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("a".into()),
+                Token::ParallelRace,
+                Token::Word("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn pipe_all_operator_inside_word() {
+        let toks = tokens("a|&>b");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("a".into()),
+                Token::PipeAll,
+                Token::Word("b".into()),
                 Token::Eof,
             ]
         );
