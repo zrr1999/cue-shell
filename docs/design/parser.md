@@ -289,22 +289,29 @@ Which argument type each command expects:
 
 | Command | Argument | Mode Params |
 |---|---|---|
-| `:run` | Chain | ✓ (cwd, retry, retry_delay) |
-| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd) |
+| `:run` | Chain | ✓ (cwd, retry, retry_delay, timeout, wrapper) |
+| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, retry, retry_delay, timeout, wrapper) |
 | `:kill` | IdRef | ✗ |
 | `:retry` | IdRef | ✗ |
 | `:out` | IdRef | ✗ |
+| `:tail` | IdRef + optional bytes | ✗ |
+| `:err` | IdRef | ✗ |
 | `:fg` | IdRef | ✗ |
+| `:wait` | IdRef | ✗ |
+| `:send` | Text (`J<n> <input>`) | ✗ |
+| `:cancel` | IdRef | ✗ |
 | `:jobs` | Empty | ✗ |
 | `:crons` | Empty | ✗ |
 | `:scopes` | Empty | ✗ |
 | `:env` | Text (subcommand) | ✗ |
 | `:cd` | Text (path) | ✗ |
-| `:scope` | Text (subcommand) | ✓ (new/fork) |
+| `:scope` | Text (subcommand) | ✓ |
 | `:help` | Empty or Text | ✗ |
 | `:pause` | IdRef | ✗ |
 | `:resume` | IdRef | ✗ |
 | `:config` | Text | ✗ |
+| `:wrap` | Text (`on`, `off`, `status`) | ✗ |
 | `:log` | IdRef or Empty | ✗ |
 | `:clear` | Empty | ✗ |
 | `:quit` | Empty | ✗ |
+| `:exit` | Empty | ✗ |

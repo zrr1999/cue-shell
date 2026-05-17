@@ -4,6 +4,7 @@
 //! and clients (cue-tui, cue-cli). It contains no runtime logic.
 
 pub mod command;
+pub mod command_spec;
 pub mod cron;
 pub mod id;
 pub mod ipc;

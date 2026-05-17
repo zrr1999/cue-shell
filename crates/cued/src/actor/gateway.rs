@@ -11,12 +11,14 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use cue_core::command_spec::{MODE_PARAM_SPECS, command_names, command_spec};
 use cue_core::ipc::{
-    EventPayload, MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload, ResponsePayload,
-    encode_message, error_code,
+    CompletionItem, CompletionKind, EventPayload, HighlightKind, HighlightSpan, MAX_MESSAGE_SIZE,
+    Message, OkPayload, RequestPayload, ResponsePayload, encode_message, error_code,
 };
 
-use crate::parser::{Parser, Resolver};
+use crate::parser::token::Token;
+use crate::parser::{Parser, Resolver, Tokenizer};
 
 use super::{ActorSystem, CLIENT_EVENT_CAP, EventBusMsg, GatewayMsg, SchedulerMsg};
 
@@ -284,6 +286,7 @@ async fn route_request(
 ) -> Result<()> {
     match payload {
         RequestPayload::Eval { input, mode } => {
+            let input = sys.config.bash_compat.apply(&input);
             let input = sys.config.aliases.apply(&input);
             // Parse → resolve → send to scheduler.
             match Parser::parse(&input) {
@@ -443,6 +446,34 @@ async fn route_request(
                 .await?;
         }
 
+        RequestPayload::Complete {
+            input,
+            cursor,
+            mode: _,
+        } => {
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload: ResponsePayload::Ok(OkPayload::CompletionList {
+                        items: complete_input(&input, cursor),
+                    }),
+                })
+                .await?;
+        }
+
+        RequestPayload::Highlight { input } => {
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload: ResponsePayload::Ok(OkPayload::HighlightResult {
+                        spans: highlight_input(&input),
+                    }),
+                })
+                .await?;
+        }
+
         RequestPayload::Ping {} => {
             sys.gateway
                 .send(GatewayMsg::SendResponse {
@@ -467,23 +498,110 @@ async fn route_request(
                 libc::kill(std::process::id() as i32, libc::SIGTERM);
             }
         }
-
-        // Stubs for unimplemented request types.
-        _ => {
-            sys.gateway
-                .send(GatewayMsg::SendResponse {
-                    client_id,
-                    request_id,
-                    payload: ResponsePayload::err(
-                        error_code::NOT_SUPPORTED,
-                        "request type not yet implemented",
-                    ),
-                })
-                .await?;
-        }
     }
 
     Ok(())
+}
+
+fn complete_input(input: &str, cursor: usize) -> Vec<CompletionItem> {
+    let prefix = input
+        .get(..cursor.min(input.len()))
+        .unwrap_or(input)
+        .trim_start();
+
+    if let Some(param_prefix) = mode_param_key_prefix(prefix) {
+        return MODE_PARAM_SPECS
+            .iter()
+            .filter(|param| param.name.starts_with(param_prefix))
+            .map(|param| CompletionItem {
+                label: param.name.into(),
+                insert_text: format!("{}={}", param.name, param.value_hint),
+                kind: CompletionKind::Param,
+                detail: Some(param.detail.into()),
+            })
+            .collect();
+    }
+
+    if let Some(command_prefix) = prefix.strip_prefix(':') {
+        let word = command_prefix
+            .rsplit_once(char::is_whitespace)
+            .map(|(_, word)| word)
+            .unwrap_or(command_prefix);
+        return command_names()
+            .filter_map(command_spec)
+            .filter(|spec| spec.name.starts_with(word))
+            .map(|spec| CompletionItem {
+                label: format!(":{}", spec.name),
+                insert_text: format!(":{}", spec.name),
+                kind: CompletionKind::Command,
+                detail: Some(spec.detail.into()),
+            })
+            .collect();
+    }
+
+    Vec::new()
+}
+
+fn mode_param_key_prefix(prefix: &str) -> Option<&str> {
+    let open = prefix.rfind('(')?;
+    let command = prefix[..open].strip_prefix(':')?;
+    let command = command.split_whitespace().next().unwrap_or(command);
+    if !command_spec(command)?.accepts_mode_params {
+        return None;
+    }
+    let params = &prefix[open + 1..];
+    if params.contains(')') {
+        return None;
+    }
+    let current = params
+        .rsplit_once([',', ' ', '\t'])
+        .map(|(_, current)| current)
+        .unwrap_or(params);
+    if current.contains('=') {
+        return None;
+    }
+    Some(current)
+}
+
+fn highlight_input(input: &str) -> Vec<HighlightSpan> {
+    match Tokenizer::tokenize(input) {
+        Ok(tokens) => tokens
+            .into_iter()
+            .filter_map(|spanned| {
+                let kind = match spanned.token {
+                    Token::Command(_) => HighlightKind::CommandName,
+                    Token::ModeParenOpen
+                    | Token::ModeParenClose
+                    | Token::ParamKey(_)
+                    | Token::ParamEq
+                    | Token::ParamValue(_)
+                    | Token::Comma => HighlightKind::ModeParam,
+                    Token::SerialThen
+                    | Token::SerialAlways
+                    | Token::ParallelAll
+                    | Token::ParallelRace
+                    | Token::PipeStdout
+                    | Token::PipeAll
+                    | Token::PipeStderr => HighlightKind::Operator,
+                    Token::IdRef(_, _) => HighlightKind::IdRef,
+                    Token::Word(_) => HighlightKind::Word,
+                    Token::Colon => HighlightKind::CommandPrefix,
+                    Token::GroupOpen | Token::GroupClose => HighlightKind::Word,
+                    Token::Whitespace(_) | Token::Newline | Token::Eof => return None,
+                };
+                Some(HighlightSpan {
+                    start: spanned.span.start,
+                    end: spanned.span.end,
+                    kind,
+                })
+            })
+            .collect(),
+        Err(error) => vec![HighlightSpan {
+            start: error.pos,
+            end: error.pos.saturating_add(1).min(input.len()),
+            kind: HighlightKind::Error,
+        }],
+    }
 }
 
 #[cfg(test)]
@@ -530,5 +648,33 @@ mod tests {
                 payload: ResponsePayload::Ok(OkPayload::Pong {}),
             }
         ));
+    }
+
+    #[test]
+    fn completion_uses_shared_command_specs() {
+        let items = complete_input(":ta", 3);
+        assert!(items.iter().any(|item| item.label == ":tail"));
+    }
+
+    #[test]
+    fn completion_uses_shared_mode_param_specs() {
+        let items = complete_input(":run(re", 7);
+        assert!(items.iter().any(|item| item.label == "retry"));
+        assert!(items.iter().any(|item| item.label == "retry_delay"));
+    }
+
+    #[test]
+    fn highlight_tokenizes_command_and_operator_spans() {
+        let spans = highlight_input(":run cargo test -> :jobs");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.kind == HighlightKind::CommandName)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.kind == HighlightKind::Operator)
+        );
     }
 }

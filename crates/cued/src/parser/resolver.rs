@@ -730,6 +730,8 @@ fn mode_help_topic(mode: Mode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use cue_core::command_spec::{COMMAND_SPECS, CommandArgKind};
+
     use super::super::parse::Parser as CueParser;
     use super::*;
 
@@ -965,6 +967,34 @@ mod tests {
                 assert!(matches!(schedule, CronSchedule::Crontab(e) if e == "*/5 * * * *"));
             }
             _ => panic!("expected Cron"),
+        }
+    }
+
+    #[test]
+    fn resolver_covers_all_registered_commands() {
+        for spec in COMMAND_SPECS {
+            let input = match spec.arg_kind {
+                CommandArgKind::Chain => format!(":{} echo ok", spec.name),
+                CommandArgKind::Cron => format!(":{} every 5m echo ok", spec.name),
+                CommandArgKind::Id => format!(":{} J1", spec.name),
+                CommandArgKind::Tail => format!(":{} J1 1024", spec.name),
+                CommandArgKind::Text => format!(":{} J1 hello", spec.name),
+                CommandArgKind::OptionalId => format!(":{} J1", spec.name),
+                CommandArgKind::OptionalText => format!(":{} status", spec.name),
+                CommandArgKind::Empty => format!(":{}", spec.name),
+            };
+            let ast = CueParser::parse(&input).unwrap_or_else(|error| {
+                panic!(
+                    "registered command `{}` failed to parse: {error}",
+                    spec.name
+                )
+            });
+            Resolver::resolve(ast, Mode::Job).unwrap_or_else(|error| {
+                panic!(
+                    "registered command `{}` failed to resolve from `{input}`: {error}",
+                    spec.name
+                )
+            });
         }
     }
 }

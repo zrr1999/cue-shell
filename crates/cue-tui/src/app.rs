@@ -15,6 +15,7 @@ use crossterm::event::{
 };
 
 use cue_core::Mode;
+use cue_core::command_spec::command_names;
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
     CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload, ResponsePayload,
@@ -1410,9 +1411,8 @@ impl AppState {
             return;
         }
 
-        if let FgSessionKind::Job { card_index, parser } = session.kind
-            && let Some(card_index) = card_index
-        {
+        let FgSessionKind::Job { card_index, parser } = session.kind;
+        if let Some(card_index) = card_index {
             let status = if reason == "done" || reason == "detached" {
                 CardStatus::Success
             } else {
@@ -3261,14 +3261,9 @@ fn card_status_for_job(status: &JobStatus) -> CardStatus {
 }
 
 fn builtin_command_candidates(word: &str) -> Vec<String> {
-    const COMMANDS: &[&str] = &[
-        "run", "cron", "kill", "retry", "out", "err", "fg", "wait", "send", "cancel", "pause",
-        "resume", "log", "jobs", "crons", "scopes", "env", "cd", "scope", "help", "config",
-        "clear", "quit", "exit", "restart",
-    ];
     let prefix = word.strip_prefix(':').unwrap_or(word);
-    COMMANDS
-        .iter()
+    command_names()
+        .chain(["restart"])
         .filter(|command| command.starts_with(prefix))
         .map(|command| format!(":{command}"))
         .collect()

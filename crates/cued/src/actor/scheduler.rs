@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use cue_core::command_spec::{COMMAND_SPECS, CommandCategory, CommandSpec, command_spec};
 use cue_core::cron::{
     CronPreset, CronSchedule, CronStatus, DayFilter, Weekday, parse_day_filter, parse_time_of_day,
 };
@@ -25,7 +26,7 @@ use cue_core::pipeline::{ChainNode, ParallelOp, SerialOp};
 use cue_core::scope::EnvSnapshot;
 use cue_core::{ChainId, CronId, JobId, ScopeHash, ScriptId};
 
-use crate::config::Config;
+use crate::config::{BlockDecision, Config};
 use crate::parser::parse::Parser as CueParser;
 use crate::parser::resolver::{ResolvedCommand, Resolver};
 use crate::parser::token::Token;
@@ -1873,13 +1874,13 @@ async fn fire_due_crons(
 
 // ── Spawn chain / single job ────────────────────────────────────────────────
 
-/// Check whether any pipeline in the chain contains blocked command patterns.
-fn check_chain_blocked(chain: &ChainNode, config: &Config) -> Option<String> {
+/// Check whether any pipeline in the chain contains blocked or warned command patterns.
+fn check_chain_blocked(chain: &ChainNode, config: &Config) -> Option<BlockDecision> {
     let leaves = flatten_leaves(chain);
     for leaf in &leaves {
         for segment in &leaf.pipeline.segments {
-            if let Some(reason) = config.block.check(&segment.command) {
-                return Some(reason);
+            if let Some(decision) = config.block.check(&segment.command) {
+                return Some(decision);
             }
         }
     }
@@ -2371,8 +2372,13 @@ async fn handle_command(
                 Err(resp) => return resp,
             };
             // Check block rules before executing.
-            if let Some(reason) = check_chain_blocked(&chain, config) {
-                return ResponsePayload::err(error_code::BLOCKED, reason);
+            if let Some(decision) = check_chain_blocked(&chain, config) {
+                return match decision {
+                    BlockDecision::Block(reason) => {
+                        ResponsePayload::err(error_code::BLOCKED, reason)
+                    }
+                    BlockDecision::Warn(hint) => ResponsePayload::err(error_code::WARNED, hint),
+                };
             }
             let cwd_override = params.cwd();
             let wrapper_enabled = state.wrapper_enabled(config);
@@ -3248,9 +3254,9 @@ fn render_help_text(topic: Option<&str>) -> String {
         .map(|topic| topic.to_ascii_lowercase())
         .as_deref()
     {
-        None => general_help_text().into(),
-        Some(topic) if is_job_help_topic(topic) => job_help_text().into(),
-        Some(topic) if is_cron_help_topic(topic) => cron_help_text().into(),
+        None => general_help_text(),
+        Some(topic) if is_job_help_topic(topic) => job_help_text(),
+        Some(topic) if is_cron_help_topic(topic) => cron_help_text(),
         Some(topic) => format!(
             "Unknown help topic `{topic}`.\n\nAvailable help topics: job, cron.\nUse bare `?` to show detailed help for the current mode."
         ),
@@ -3258,85 +3264,98 @@ fn render_help_text(topic: Option<&str>) -> String {
 }
 
 fn is_job_help_topic(topic: &str) -> bool {
-    matches!(
-        topic,
-        "job"
-            | "jobs"
-            | "run"
-            | "out"
-            | "tail"
-            | "err"
-            | "fg"
-            | "wait"
-            | "retry"
-            | "scope"
-            | "scopes"
-            | "env"
-            | "cd"
-            | "log"
-    )
+    topic == "job"
+        || command_spec(topic).is_some_and(|spec| {
+            matches!(
+                spec.category,
+                CommandCategory::Job | CommandCategory::Scope | CommandCategory::System
+            )
+        })
 }
 
 fn is_cron_help_topic(topic: &str) -> bool {
-    matches!(topic, "cron" | "crons" | "pause" | "resume")
+    topic == "cron"
+        || command_spec(topic).is_some_and(|spec| spec.category == CommandCategory::Cron)
 }
 
-fn general_help_text() -> &'static str {
-    concat!(
-        "cue-shell help\n",
-        "\n",
-        "Modes:\n",
-        "- JOB: run shell commands and inspect output / scopes.\n",
-        "- CRON: define scheduled commands.\n",
-        "\n",
-        "Quick tips:\n",
-        "- Enter bare `?` to show detailed help for the current mode.\n",
-        "- Use `:help job` or `:help cron` for mode-specific help.\n",
-        "- Builtins start with `:` and are executed by `cued`.\n",
-        "- Modes only change how bare input is interpreted.\n"
+fn general_help_text() -> String {
+    format!(
+        concat!(
+            "cue-shell help\n",
+            "\n",
+            "Modes:\n",
+            "- JOB: run shell commands and inspect output / scopes.\n",
+            "- CRON: define scheduled commands.\n",
+            "\n",
+            "Quick tips:\n",
+            "- Enter bare `?` to show detailed help for the current mode.\n",
+            "- Use `:help job` or `:help cron` for mode-specific help.\n",
+            "- Builtins start with `:` and are executed by `cued`.\n",
+            "- Modes only change how bare input is interpreted.\n",
+            "\n",
+            "Builtins:\n",
+            "{}"
+        ),
+        format_command_list(COMMAND_SPECS)
     )
 }
 
-fn job_help_text() -> &'static str {
-    concat!(
-        "JOB mode\n",
-        "\n",
-        "Bare input runs a job using the current scope.\n",
-        "Examples:\n",
-        "- `cargo test`\n",
-        "- `git status -> cargo test`\n",
-        "- `cargo test || cargo clippy`\n",
-        "\n",
-        "Useful builtins:\n",
-        "- `:out J<n>` snapshot stdout\n",
-        "- `:tail J<n> [bytes]` follow live stdout\n",
-        "- `:err J<n>` inspect stderr / error output\n",
-        "- `:fg J<n>` attach an interactive job in the foreground\n",
-        "- `:wait J<n>` block until the job finishes\n",
-        "- `:retry J<n>` rerun from the original start scope\n",
-        "- `:env`, `:env set ...`, `:cd ...` inspect or update the persisted HEAD scope\n"
+fn job_help_text() -> String {
+    format!(
+        concat!(
+            "JOB mode\n",
+            "\n",
+            "Bare input runs a job using the current scope.\n",
+            "Examples:\n",
+            "- `cargo test`\n",
+            "- `git status -> cargo test`\n",
+            "- `cargo test || cargo clippy`\n",
+            "\n",
+            "Useful builtins:\n",
+            "{}"
+        ),
+        format_command_list_by_category(&[
+            CommandCategory::Job,
+            CommandCategory::Scope,
+            CommandCategory::System,
+        ])
     )
 }
 
-fn cron_help_text() -> &'static str {
-    concat!(
-        "CRON mode\n",
-        "\n",
-        "Bare input defines a schedule plus command body.\n",
-        "Examples:\n",
-        "- `every 5m cargo test`\n",
-        "- `in 30s echo hello`\n",
-        "- `at 09:00 on weekdays cargo check`\n",
-        "- `on weekends at 10am backup.sh`\n",
-        "- `cron */5 * * * * do curl api/health`\n",
-        "\n",
-        "Useful builtins:\n",
-        "- `:cron <schedule> <command>` add a cron explicitly\n",
-        "- `:crons` list configured cron entries\n",
-        "- `:pause C<n>` temporarily disable a cron\n",
-        "- `:resume C<n>` re-enable a paused cron\n",
-        "- `:kill C<n>` remove a cron entry\n"
+fn cron_help_text() -> String {
+    format!(
+        concat!(
+            "CRON mode\n",
+            "\n",
+            "Bare input defines a schedule plus command body.\n",
+            "Examples:\n",
+            "- `every 5m cargo test`\n",
+            "- `in 30s echo hello`\n",
+            "- `at 09:00 on weekdays cargo check`\n",
+            "- `on weekends at 10am backup.sh`\n",
+            "- `cron */5 * * * * do curl api/health`\n",
+            "\n",
+            "Useful builtins:\n",
+            "{}"
+        ),
+        format_command_list_by_category(&[CommandCategory::Cron])
     )
+}
+
+fn format_command_list_by_category(categories: &[CommandCategory]) -> String {
+    let specs: Vec<&CommandSpec> = COMMAND_SPECS
+        .iter()
+        .filter(|spec| categories.contains(&spec.category))
+        .collect();
+    format_command_list(specs)
+}
+
+fn format_command_list<'a>(specs: impl IntoIterator<Item = &'a CommandSpec>) -> String {
+    specs
+        .into_iter()
+        .map(|spec| format!("- `{}` — {}", spec.usage, spec.detail))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Send `ListScopes` to the scope store and return a `ScopeList` response.

@@ -200,6 +200,7 @@ cat _typos.toml |> rg files
 | `:help` | `:help` / `:help run` | 帮助 | 核心 |
 | `?` | `?` | 当前 mode 的详细帮助 | 核心 |
 | `:config` | `:config` / `:config show` | 查看配置 | 核心 |
+| `:wrap` | `:wrap [on/off/status]` | 查看或临时覆盖 runtime wrapper | 核心 |
 | `:exit` | `:exit` | 退出 TUI | 核心 |
 
 这里需要区分：
@@ -388,6 +389,7 @@ Pipeline 内退出码 = 最后一个进程的退出码
 │ :help [cmd]    帮助                        │
 │ ?              当前 mode 详细帮助          │
 │ :config [sub]  查看/修改配置               │
+│ :wrap [sub]    查看/覆盖 runtime wrapper   │
 │ :clear         清空 REPL 区域              │
 │ :quit          退出 TUI                    │
 └───────────────────────────────────────────┘

@@ -303,7 +303,8 @@ impl<'a> Tokenizer<'a> {
         // Regular word: gobble until delimiter or operator.
         while self.pos < self.bytes.len()
             && !is_delimiter(self.bytes[self.pos])
-            && !(self.in_mode_params && self.bytes[self.pos] == b'=')
+            && !(self.in_mode_params
+                && (self.bytes[self.pos] == b'=' || self.bytes[self.pos] == b','))
         {
             // Stop before any cue-shell operator (longest-match-first).
             if starts_with_operator(self.bytes, self.pos).is_some() {
@@ -449,7 +450,10 @@ fn is_ident_char(b: u8) -> bool {
 }
 
 fn is_delimiter(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'(' | b')' | b'|' | b',' | b'"')
+    matches!(b, b' ' | b'\t' | b'\n' | b'(' | b')' | b'|' | b'"')
+    // Note: Comma is NOT a general delimiter.  It is part of words outside
+    // mode-params context.  Inside mode-params the while-loop condition
+    // explicitly stops at `,` so key=val pairs are split correctly.
     // Note: `-` and `~` are NOT delimiters here.
     // The main tokenize loop handles `->` and `~>` as operators before
     // falling through to word tokenization, so `-` inside words (e.g. `--release`)
@@ -935,6 +939,47 @@ mod tests {
         assert!(
             has_emoji_word,
             "emoji should survive mode param tokenization"
+        );
+    }
+
+    #[test]
+    fn comma_in_command_args_is_word() {
+        // Regression: commas outside mode-params should be part of the word.
+        let toks = tokens("gh search prs --json number,title,author");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("gh".into()),
+                Token::Word("search".into()),
+                Token::Word("prs".into()),
+                Token::Word("--json".into()),
+                Token::Word("number,title,author".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn comma_in_mode_params_still_separates() {
+        // Inside mode params, commas should still separate key=val pairs.
+        let toks = tokens(":run(retry=3,timeout=30s) cargo test");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Command("run".into()),
+                Token::ModeParenOpen,
+                Token::Word("retry".into()),
+                Token::ParamEq,
+                Token::ParamValue(Value::Int(3)),
+                Token::Comma,
+                Token::Word("timeout".into()),
+                Token::ParamEq,
+                Token::ParamValue(Value::Duration(std::time::Duration::from_secs(30))),
+                Token::GroupClose,
+                Token::Word("cargo".into()),
+                Token::Word("test".into()),
+                Token::Eof,
+            ]
         );
     }
 }

@@ -16,6 +16,7 @@
 //! pipe_op     = "|>" | "|&>" | "|!>"
 //! ```
 
+use cue_core::command_spec::{CommandArgKind, command_spec, command_suggestions};
 use cue_core::pipeline::{ParallelOp, PipeOp, SerialOp};
 
 use super::ast::{Argument, Ast, ChainNode, PipeSegment, Pipeline, ScriptItemAst};
@@ -281,24 +282,43 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
-    /// Determine argument type based on command name.
+    /// Determine argument type based on the shared command registry.
     fn parse_argument_for_command(&mut self, name: &str) -> Result<Argument, ParseError> {
-        match name {
-            // Chain argument
-            "run" => {
+        let Some(spec) = command_spec(name) else {
+            return Err(ParseError {
+                span: self.peek_span(),
+                message: format!("unknown command `:{name}`"),
+                kind: ParseErrorKind::UnknownCommand,
+                suggestions: suggest_command(name),
+            });
+        };
+
+        match spec.arg_kind {
+            CommandArgKind::Chain => {
                 if self.at_end() {
                     return Err(ParseError {
                         span: self.peek_span(),
-                        message: "`:run` requires a command".into(),
+                        message: format!("`:{name}` requires a command"),
                         kind: ParseErrorKind::MissingArgument,
-                        suggestions: vec![":run cargo test".into()],
+                        suggestions: vec![format!(":{name} cargo test")],
                     });
                 }
                 Ok(Argument::Chain(self.parse_chain()?))
             }
 
-            // Tail: IdRef + optional byte count
-            "tail" => {
+            CommandArgKind::Cron => {
+                if self.at_end() {
+                    return Err(ParseError {
+                        span: self.peek_span(),
+                        message: format!("`:{name}` requires a schedule expression"),
+                        kind: ParseErrorKind::MissingArgument,
+                        suggestions: vec![":cron every 5m cargo test".into()],
+                    });
+                }
+                Ok(Argument::Chain(self.parse_chain()?))
+            }
+
+            CommandArgKind::Tail => {
                 if let Token::IdRef(kind, n) = self.peek().clone() {
                     self.advance();
                     let bytes = match self.peek().clone() {
@@ -316,15 +336,14 @@ impl<'a> Parser<'a> {
                 } else {
                     Err(ParseError {
                         span: self.peek_span(),
-                        message: ":tail requires an ID (e.g. J1)".into(),
+                        message: format!(":{name} requires an ID (e.g. J1)"),
                         kind: ParseErrorKind::InvalidIdRef,
-                        suggestions: vec![":tail J1".into(), ":tail J1 1024".into()],
+                        suggestions: vec![format!(":{name} J1"), format!(":{name} J1 1024")],
                     })
                 }
             }
 
-            // IdRef argument
-            "kill" | "retry" | "out" | "err" | "fg" | "wait" | "cancel" | "pause" | "resume" => {
+            CommandArgKind::Id => {
                 if let Token::IdRef(kind, n) = self.peek().clone() {
                     self.advance();
                     Ok(Argument::IdRef(kind, n))
@@ -338,8 +357,7 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // Text argument (use raw text to preserve operator chars like ->)
-            "send" => {
+            CommandArgKind::Text => {
                 let text = self.consume_remaining_raw_text();
                 if text.is_empty() {
                     return Err(ParseError {
@@ -355,22 +373,7 @@ impl<'a> Parser<'a> {
                 Ok(Argument::Text(text))
             }
 
-            // Cron expression is parsed later by the resolver so richer schedule
-            // forms can share the same splitting logic as bare CRON mode.
-            "cron" => {
-                if self.at_end() {
-                    return Err(ParseError {
-                        span: self.peek_span(),
-                        message: "`:cron` requires a schedule expression".into(),
-                        kind: ParseErrorKind::MissingArgument,
-                        suggestions: vec![":cron every 5m cargo test".into()],
-                    });
-                }
-                Ok(Argument::Chain(self.parse_chain()?))
-            }
-
-            // Log: optional IdRef
-            "log" => {
+            CommandArgKind::OptionalId => {
                 if let Token::IdRef(kind, n) = self.peek().clone() {
                     self.advance();
                     Ok(Argument::IdRef(kind, n))
@@ -379,10 +382,9 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // Empty or text subcommands
-            "jobs" | "crons" | "scopes" | "clear" | "quit" | "exit" => Ok(Argument::Empty),
+            CommandArgKind::Empty => Ok(Argument::Empty),
 
-            "help" | "config" | "env" | "scope" | "cd" | "wrap" => {
+            CommandArgKind::OptionalText => {
                 let text = self.consume_remaining_text();
                 if text.is_empty() {
                     Ok(Argument::Empty)
@@ -390,13 +392,6 @@ impl<'a> Parser<'a> {
                     Ok(Argument::Text(text))
                 }
             }
-
-            _ => Err(ParseError {
-                span: self.peek_span(),
-                message: format!("unknown command `:{name}`"),
-                kind: ParseErrorKind::UnknownCommand,
-                suggestions: suggest_command(name),
-            }),
         }
     }
 
@@ -669,37 +664,10 @@ pub(super) fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
 }
 
 fn suggest_command(name: &str) -> Vec<String> {
-    let commands = [
-        "run", "kill", "retry", "out", "tail", "err", "fg", "wait", "send", "cancel", "jobs",
-        "crons", "scopes", "cron", "env", "cd", "scope", "help", "config", "log", "pause", "wrap",
-        "resume", "clear", "quit", "exit",
-    ];
-    commands
-        .iter()
-        .filter(|c| c.starts_with(&name[..1.min(name.len())]) || edit_distance(name, c) <= 2)
-        .map(|c| format!(":{c}"))
+    command_suggestions(name)
+        .into_iter()
+        .map(|command| format!(":{command}"))
         .collect()
-}
-
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut dp = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-    for (i, row) in dp.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, cell) in dp[0].iter_mut().enumerate() {
-        *cell = j;
-    }
-    for i in 1..=a.len() {
-        for j in 1..=b.len() {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            dp[i][j] = (dp[i - 1][j] + 1)
-                .min(dp[i][j - 1] + 1)
-                .min(dp[i - 1][j - 1] + cost);
-        }
-    }
-    dp[a.len()][b.len()]
 }
 
 #[cfg(test)]

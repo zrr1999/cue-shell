@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub aliases: AliasConfig,
     #[serde(default)]
+    pub bash_compat: BashCompatConfig,
+    #[serde(default)]
     pub retention: RetentionConfig,
     #[serde(default)]
     pub weft: WeftConfig,
@@ -110,43 +112,129 @@ fn token_spans(input: &str) -> Vec<(usize, usize)> {
 /// ```toml
 /// [block.commands]
 /// git = ["--no-verify", "--force"]
+///
+/// [block.warn_commands]
+/// cd = "Use `cwd` parameter or `cd /path -> cmd` chain syntax instead"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockConfig {
     /// Map from command name → list of forbidden argument substrings.
     #[serde(default)]
     pub commands: BTreeMap<String, Vec<String>>,
+    /// Map from command name → warning hint (requires user approval).
+    #[serde(default)]
+    pub warn_commands: BTreeMap<String, String>,
 }
 
 impl Default for BlockConfig {
     fn default() -> Self {
         let mut commands = BTreeMap::new();
         commands.insert("git".into(), vec!["--no-verify".into()]);
-        Self { commands }
+        let mut warn_commands = BTreeMap::new();
+        warn_commands.insert(
+            "cd".into(),
+            "Use `cwd` parameter or `cd /path -> cmd` chain syntax instead".into(),
+        );
+        Self {
+            commands,
+            warn_commands,
+        }
     }
 }
 
 impl BlockConfig {
     /// Check whether `command_line` is blocked.  Returns `None` if allowed,
-    /// or `Some(reason)` if the command matches a blocked pattern.
-    pub fn check(&self, command_line: &[String]) -> Option<String> {
+    /// `Some(BlockDecision::Block(reason))` if blocked,
+    /// `Some(BlockDecision::Warn(hint))` if the command needs approval.
+    pub fn check(&self, command_line: &[String]) -> Option<BlockDecision> {
         let cmd_name = command_line.first()?;
         let base = std::path::Path::new(cmd_name)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(cmd_name);
+
+        // Check warn-commands first (whole-command match).
+        if let Some(hint) = self.warn_commands.get(base) {
+            return Some(BlockDecision::Warn(hint.clone()));
+        }
+
+        // Check blocked arguments.
         let forbidden = self.commands.get(base)?;
         for arg in &command_line[1..] {
             for pattern in forbidden {
                 if arg == pattern || arg.starts_with(&format!("{pattern}=")) {
-                    return Some(format!(
+                    return Some(BlockDecision::Block(format!(
                         "blocked: `{cmd_name} {pattern}` is forbidden by server config\n  (see [block.commands] in server.toml)"
-                    ));
+                    )));
                 }
             }
         }
         None
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum BlockDecision {
+    Block(String),
+    Warn(String),
+}
+
+/// Bash compatibility transform configuration.
+///
+/// When enabled, `&&` is translated to cue-shell's `->` (serial on success).
+/// Other bash operators (`||`, `|`) intentionally stay as cue-shell native
+/// operators to avoid semantic conflicts:
+/// - `||` = cue-shell parallel-all (bash "or" is cue-shell's `~>`)
+/// - `|>` / `|&>` / `|!>` = cue-shell pipe operators
+///
+/// ```toml
+/// [bash_compat]
+/// enabled = true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BashCompatConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl BashCompatConfig {
+    /// Apply bash compatibility transformations to the input string.
+    /// Replaces bash-style operators with cue-shell equivalents.
+    pub fn apply(&self, input: &str) -> String {
+        if !self.enabled {
+            return input.to_string();
+        }
+        bash_compat_transform(input)
+    }
+}
+
+/// Pre-tokenization transform: `&&` → cue-shell's `->`.
+fn bash_compat_transform(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut result = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // `&&` → `->` (only when at word boundary: whitespace before and after)
+        if i + 1 < bytes.len()
+            && bytes[i] == b'&'
+            && bytes[i + 1] == b'&'
+            && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t')
+            && (i + 2 >= bytes.len()
+                || bytes[i + 2] == b' '
+                || bytes[i + 2] == b'\t'
+                || bytes[i + 2] == b'\n')
+        {
+            result.push_str("->");
+            i += 2;
+            continue;
+        }
+
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+
+    result
 }
 
 #[derive(Debug, Clone, Deserialize)]
