@@ -772,12 +772,11 @@ mod tests {
         );
     }
 
+    /// `->` and `~>` work without whitespace on either side.
     #[test]
-    fn chain_operator_no_space_left() {
-        // `-A->` — no space before `->` should still work
-        let toks = tokens("cmd -A-> cmd2");
+    fn chain_operators_no_whitespace() {
         assert_eq!(
-            toks,
+            tokens("cmd -A-> cmd2"),
             vec![
                 Token::Word("cmd".into()),
                 Token::Word("-A".into()),
@@ -786,14 +785,8 @@ mod tests {
                 Token::Eof,
             ]
         );
-    }
-
-    #[test]
-    fn chain_operator_no_space_right() {
-        // `->cmd` — no space after `->` should still work
-        let toks = tokens("cmd1 ->cmd2");
         assert_eq!(
-            toks,
+            tokens("cmd1 ->cmd2"),
             vec![
                 Token::Word("cmd1".into()),
                 Token::SerialThen,
@@ -803,91 +796,31 @@ mod tests {
         );
     }
 
+    /// All 7 operators recognized without whitespace (longest-match-first).
     #[test]
-    fn pipe_operator_inside_word() {
-        // `|>` immediately after a word should still be detected
-        let toks = tokens("a|>b");
-        assert_eq!(
-            toks,
-            vec![
-                Token::Word("a".into()),
-                Token::PipeStdout,
-                Token::Word("b".into()),
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn parallel_operator_inside_word() {
-        // `||` immediately after a word should still be detected
-        let toks = tokens("a||b");
-        assert_eq!(
-            toks,
-            vec![
-                Token::Word("a".into()),
-                Token::ParallelAll,
-                Token::Word("b".into()),
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn pipe_stderr_operator_inside_word() {
-        // `|!>` immediately after a word should still be detected
-        let toks = tokens("a|!>b");
-        assert_eq!(
-            toks,
-            vec![
-                Token::Word("a".into()),
-                Token::PipeStderr,
-                Token::Word("b".into()),
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn serial_always_operator_inside_word() {
-        let toks = tokens("a~>b");
-        assert_eq!(
-            toks,
-            vec![
-                Token::Word("a".into()),
-                Token::SerialAlways,
-                Token::Word("b".into()),
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn parallel_race_operator_inside_word() {
-        let toks = tokens("a||?b");
-        assert_eq!(
-            toks,
-            vec![
-                Token::Word("a".into()),
-                Token::ParallelRace,
-                Token::Word("b".into()),
-                Token::Eof,
-            ]
-        );
-    }
-
-    #[test]
-    fn pipe_all_operator_inside_word() {
-        let toks = tokens("a|&>b");
-        assert_eq!(
-            toks,
-            vec![
-                Token::Word("a".into()),
-                Token::PipeAll,
-                Token::Word("b".into()),
-                Token::Eof,
-            ]
-        );
+    fn all_operators_inside_words() {
+        let cases: &[(&str, Token)] = &[
+            ("a->b", Token::SerialThen),
+            ("a~>b", Token::SerialAlways),
+            ("a|>b", Token::PipeStdout),
+            ("a|&>b", Token::PipeAll),
+            ("a|!>b", Token::PipeStderr),
+            ("a||b", Token::ParallelAll),
+            ("a||?b", Token::ParallelRace),
+        ];
+        for (input, expected_op) in cases {
+            let toks = tokens(input);
+            assert_eq!(
+                toks,
+                vec![
+                    Token::Word("a".into()),
+                    expected_op.clone(),
+                    Token::Word("b".into()),
+                    Token::Eof,
+                ],
+                "failed for input: {input}"
+            );
+        }
     }
 
     #[test]

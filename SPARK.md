@@ -109,6 +109,8 @@ cue-shell 在四仓库闭环里处于最底层：
 - **保留原方案，把 agent / workflow 都留在 cue-shell**：上一版本就是这样。结果是策略和机制混在一起，AGENT mode 的需求反复挤压 process 层；新增 loom / weft 后这条线已经没必要继续。
 - **把 cron 做成「agent wake / scheduler」**：会把策略再次塞回底层。最终选择把 cron 限定为 mechanical timer-to-command，agent wake / schedule 由 loom 负责。
 - **把 chain 扩展为完整 DAG runtime（含重试、补偿、状态机）**：与 loom 的定位严重重叠，且会把 cue-shell 的复杂度拉到不可控范围。chain 因此被刻意限制在最小依赖图。
+- **在 process_mgr 中引入 `sh -c` 作为 multi-segment pipeline 的兜底**：以 shell 黑盒替代 native pipe，表面上兼容性好，但实际上破坏了 job 的可观测性（每个 segment 不再是一等对象）和 wrapper/forbid/replace 的逐 segment 作用。当前决策：multi-segment pipeline 不做兜底，直接走 native pipe(2) spawn；不支持 pipe semantics 的 segment 应拒绝执行而非退化。
+- **multi-segment pipeline 在 `sh -c` 中执行并静默丢弃 segment 信息**：同上一项，已确定不采用。
 
 ## 文档与源码索引
 
@@ -129,5 +131,6 @@ cue-shell 在四仓库闭环里处于最底层：
 
 ## 修订记录
 
+- 2026-05-17：新增「工程原则」章节——MSRV 即唯一测试目标、不写兜底策略、质量优于数量；已考虑的替代方案中明确拒绝 `sh -c` 作为 pipeline 兜底。
 - 2026-05-15：文档整理——原根目录长篇架构迁入 [`docs/design/conceptual-model.md`](docs/design/conceptual-model.md)；`ARCHITECTURE.md` 改为入口；README 设计文档链接对齐；补充 SPARK 与概念模型、设计索引的交叉引用。
 - 2026-04-26：初稿。从「agent+workflow shell」收缩为 bash-like durable process substrate；agent 一等原语、planner/executor、ACP backend lifecycle、agent transcript、agent wake/escalation、`:ask` / `:spawn` / `:agents` / `:confirm` / `:probe` 等迁出至 weft；多步 workflow 编排归 loom；warp 退化为被 cue-shell 跑起来的普通可执行。

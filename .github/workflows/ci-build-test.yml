@@ -15,17 +15,6 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  msrv:
-    name: msrv
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.90"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets
-
   test:
     name: test
     runs-on: ubuntu-latest
@@ -35,7 +24,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: "1.90"
           components: llvm-tools
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
