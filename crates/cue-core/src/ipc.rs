@@ -382,6 +382,7 @@ pub mod error_code {
     pub const NOT_SUPPORTED: &str = "NOT_SUPPORTED";
     pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
     pub const BLOCKED: &str = "BLOCKED";
+    pub const WARNED: &str = "WARNED";
     pub const INTERNAL: &str = "INTERNAL";
 }
 

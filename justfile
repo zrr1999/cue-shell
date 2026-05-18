@@ -34,8 +34,8 @@ clean:
     rm -rf target/
     rm -f lcov.info
 
-# Full CI check (format check + clippy + test)
-ci: check test
+# Full CI check (format check + clippy + test + MSRV)
+ci: check test msrv
 
 # Run pre-commit on all files
 pre-commit:

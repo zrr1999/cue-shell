@@ -15,6 +15,7 @@ use crossterm::event::{
 };
 
 use cue_core::Mode;
+use cue_core::command_spec::command_names;
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
     CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload, ResponsePayload,
@@ -1410,9 +1411,8 @@ impl AppState {
             return;
         }
 
-        if let FgSessionKind::Job { card_index, parser } = session.kind
-            && let Some(card_index) = card_index
-        {
+        let FgSessionKind::Job { card_index, parser } = session.kind;
+        if let Some(card_index) = card_index {
             let status = if reason == "done" || reason == "detached" {
                 CardStatus::Success
             } else {
@@ -2848,7 +2848,7 @@ fn decorate_submission_output(warnings: &[String], body: String) -> String {
 }
 
 fn operator_spacing_warnings(input: &str) -> Vec<String> {
-    const OPERATORS: [&str; 7] = ["|&>", "|!>", "||?", "->", "~>", "||", "|>"];
+    const OPERATORS: [&str; 4] = ["|||", "|?|", "->", "~>"];
 
     let mut warnings = Vec::new();
     let mut pos = 0;
@@ -3261,14 +3261,9 @@ fn card_status_for_job(status: &JobStatus) -> CardStatus {
 }
 
 fn builtin_command_candidates(word: &str) -> Vec<String> {
-    const COMMANDS: &[&str] = &[
-        "run", "cron", "kill", "retry", "out", "err", "fg", "wait", "send", "cancel", "pause",
-        "resume", "log", "jobs", "crons", "scopes", "env", "cd", "scope", "help", "config",
-        "clear", "quit", "exit", "restart",
-    ];
     let prefix = word.strip_prefix(':').unwrap_or(word);
-    COMMANDS
-        .iter()
+    command_names()
+        .chain(["restart"])
         .filter(|command| command.starts_with(prefix))
         .map(|command| format!(":{command}"))
         .collect()
@@ -3357,7 +3352,7 @@ fn shell_segment_completion_candidates(line_prefix: &str, word: &str) -> Vec<Str
 }
 
 fn is_chain_operator(token: &str) -> bool {
-    matches!(token, "->" | "~>" | "||" | "||?" | "|>" | "|&>" | "|!>")
+    matches!(token, "->" | "~>" | "|||" | "|?|")
 }
 
 fn command_completion_candidates(prefix: &str) -> Vec<String> {

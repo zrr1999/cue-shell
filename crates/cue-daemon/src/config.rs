@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub aliases: AliasConfig,
     #[serde(default)]
+    pub bash_compat: BashCompatConfig,
+    #[serde(default)]
     pub retention: RetentionConfig,
     #[serde(default)]
     pub weft: WeftConfig,
@@ -110,42 +112,89 @@ fn token_spans(input: &str) -> Vec<(usize, usize)> {
 /// ```toml
 /// [block.commands]
 /// git = ["--no-verify", "--force"]
+///
+/// [block.warn_commands]
+/// rm = "Careful: this removes files"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockConfig {
     /// Map from command name → list of forbidden argument substrings.
     #[serde(default)]
     pub commands: BTreeMap<String, Vec<String>>,
+    /// Map from command name → warning hint (requires user approval).
+    #[serde(default)]
+    pub warn_commands: BTreeMap<String, String>,
 }
 
 impl Default for BlockConfig {
     fn default() -> Self {
         let mut commands = BTreeMap::new();
         commands.insert("git".into(), vec!["--no-verify".into()]);
-        Self { commands }
+        let warn_commands = BTreeMap::new();
+        Self {
+            commands,
+            warn_commands,
+        }
     }
 }
 
 impl BlockConfig {
     /// Check whether `command_line` is blocked.  Returns `None` if allowed,
-    /// or `Some(reason)` if the command matches a blocked pattern.
-    pub fn check(&self, command_line: &[String]) -> Option<String> {
+    /// `Some(BlockDecision::Block(reason))` if blocked,
+    /// `Some(BlockDecision::Warn(hint))` if the command needs approval.
+    pub fn check(&self, command_line: &[String]) -> Option<BlockDecision> {
         let cmd_name = command_line.first()?;
         let base = std::path::Path::new(cmd_name)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(cmd_name);
+
+        // Check warn-commands first (whole-command match).
+        if let Some(hint) = self.warn_commands.get(base) {
+            return Some(BlockDecision::Warn(hint.clone()));
+        }
+
+        // Check blocked arguments.
         let forbidden = self.commands.get(base)?;
         for arg in &command_line[1..] {
             for pattern in forbidden {
                 if arg == pattern || arg.starts_with(&format!("{pattern}=")) {
-                    return Some(format!(
+                    return Some(BlockDecision::Block(format!(
                         "blocked: `{cmd_name} {pattern}` is forbidden by server config\n  (see [block.commands] in server.toml)"
-                    ));
+                    )));
                 }
             }
         }
         None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum BlockDecision {
+    Block(String),
+    Warn(String),
+}
+
+/// Deprecated bash compatibility transform configuration.
+///
+/// `&&` and `||` are now first-class job-local operators, so this option is
+/// kept only for config compatibility and intentionally performs no rewrite.
+///
+/// ```toml
+/// [bash_compat]
+/// enabled = true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BashCompatConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl BashCompatConfig {
+    /// Apply bash compatibility transformations to the input string.
+    pub fn apply(&self, input: &str) -> String {
+        let _ = self.enabled;
+        input.to_string()
     }
 }
 
@@ -499,6 +548,12 @@ socket_path = "/var/run/weft.sock"
         assert_eq!(config.weft.socket_path, PathBuf::from("/var/run/weft.sock"));
     }
 
+    #[test]
+    fn bash_compat_no_longer_rewrites_job_logical_operators() {
+        let compat = BashCompatConfig { enabled: true };
+        assert_eq!(compat.apply("a && b || c"), "a && b || c");
+    }
+
     // ── WrapperConfig ──
 
     #[test]
@@ -603,6 +658,7 @@ pip = "uv pip"
                 .is_some()
         );
         assert!(config.block.check(&["git".into(), "push".into()]).is_none());
+        assert!(config.block.check(&["cd".into(), "/tmp".into()]).is_none());
     }
 
     #[test]

@@ -7,18 +7,20 @@
 //! bare_input  = chain
 //!
 //! chain       = parallel (serial_op parallel)*
-//! parallel    = pipeline (parallel_op pipeline)*
+//! parallel    = job_expr (parallel_op job_expr)*
+//! job_expr    = pipeline (("&&" | "||") pipeline)*
 //! pipeline    = atom (pipe_op atom)*
 //! atom        = "(" chain ")" | word+
 //!
 //! serial_op   = "->" | "~>"
-//! parallel_op = "||" | "||?"
+//! parallel_op = "|||" | "|?|"
 //! pipe_op     = "|>" | "|&>" | "|!>"
 //! ```
 
+use cue_core::command_spec::{CommandArgKind, command_spec, command_suggestions};
 use cue_core::pipeline::{ParallelOp, PipeOp, SerialOp};
 
-use super::ast::{Argument, Ast, ChainNode, PipeSegment, Pipeline, ScriptItemAst};
+use super::ast::{Argument, Ast, ChainNode, JobExpr, PipeSegment, Pipeline, ScriptItemAst};
 use super::token::{Span, Spanned, Token, Value};
 use super::tokenizer::Tokenizer;
 
@@ -281,24 +283,43 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
-    /// Determine argument type based on command name.
+    /// Determine argument type based on the shared command registry.
     fn parse_argument_for_command(&mut self, name: &str) -> Result<Argument, ParseError> {
-        match name {
-            // Chain argument
-            "run" => {
+        let Some(spec) = command_spec(name) else {
+            return Err(ParseError {
+                span: self.peek_span(),
+                message: format!("unknown command `:{name}`"),
+                kind: ParseErrorKind::UnknownCommand,
+                suggestions: suggest_command(name),
+            });
+        };
+
+        match spec.arg_kind {
+            CommandArgKind::Chain => {
                 if self.at_end() {
                     return Err(ParseError {
                         span: self.peek_span(),
-                        message: "`:run` requires a command".into(),
+                        message: format!("`:{name}` requires a command"),
                         kind: ParseErrorKind::MissingArgument,
-                        suggestions: vec![":run cargo test".into()],
+                        suggestions: vec![format!(":{name} cargo test")],
                     });
                 }
                 Ok(Argument::Chain(self.parse_chain()?))
             }
 
-            // Tail: IdRef + optional byte count
-            "tail" => {
+            CommandArgKind::Cron => {
+                if self.at_end() {
+                    return Err(ParseError {
+                        span: self.peek_span(),
+                        message: format!("`:{name}` requires a schedule expression"),
+                        kind: ParseErrorKind::MissingArgument,
+                        suggestions: vec![":cron every 5m cargo test".into()],
+                    });
+                }
+                Ok(Argument::Chain(self.parse_chain()?))
+            }
+
+            CommandArgKind::Tail => {
                 if let Token::IdRef(kind, n) = self.peek().clone() {
                     self.advance();
                     let bytes = match self.peek().clone() {
@@ -316,15 +337,14 @@ impl<'a> Parser<'a> {
                 } else {
                     Err(ParseError {
                         span: self.peek_span(),
-                        message: ":tail requires an ID (e.g. J1)".into(),
+                        message: format!(":{name} requires an ID (e.g. J1)"),
                         kind: ParseErrorKind::InvalidIdRef,
-                        suggestions: vec![":tail J1".into(), ":tail J1 1024".into()],
+                        suggestions: vec![format!(":{name} J1"), format!(":{name} J1 1024")],
                     })
                 }
             }
 
-            // IdRef argument
-            "kill" | "retry" | "out" | "err" | "fg" | "wait" | "cancel" | "pause" | "resume" => {
+            CommandArgKind::Id => {
                 if let Token::IdRef(kind, n) = self.peek().clone() {
                     self.advance();
                     Ok(Argument::IdRef(kind, n))
@@ -338,8 +358,7 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // Text argument (use raw text to preserve operator chars like ->)
-            "send" => {
+            CommandArgKind::Text => {
                 let text = self.consume_remaining_raw_text();
                 if text.is_empty() {
                     return Err(ParseError {
@@ -355,22 +374,7 @@ impl<'a> Parser<'a> {
                 Ok(Argument::Text(text))
             }
 
-            // Cron expression is parsed later by the resolver so richer schedule
-            // forms can share the same splitting logic as bare CRON mode.
-            "cron" => {
-                if self.at_end() {
-                    return Err(ParseError {
-                        span: self.peek_span(),
-                        message: "`:cron` requires a schedule expression".into(),
-                        kind: ParseErrorKind::MissingArgument,
-                        suggestions: vec![":cron every 5m cargo test".into()],
-                    });
-                }
-                Ok(Argument::Chain(self.parse_chain()?))
-            }
-
-            // Log: optional IdRef
-            "log" => {
+            CommandArgKind::OptionalId => {
                 if let Token::IdRef(kind, n) = self.peek().clone() {
                     self.advance();
                     Ok(Argument::IdRef(kind, n))
@@ -379,10 +383,9 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // Empty or text subcommands
-            "jobs" | "crons" | "scopes" | "clear" | "quit" | "exit" => Ok(Argument::Empty),
+            CommandArgKind::Empty => Ok(Argument::Empty),
 
-            "help" | "config" | "env" | "scope" | "cd" | "wrap" => {
+            CommandArgKind::OptionalText => {
                 let text = self.consume_remaining_text();
                 if text.is_empty() {
                     Ok(Argument::Empty)
@@ -390,13 +393,6 @@ impl<'a> Parser<'a> {
                     Ok(Argument::Text(text))
                 }
             }
-
-            _ => Err(ParseError {
-                span: self.peek_span(),
-                message: format!("unknown command `:{name}`"),
-                kind: ParseErrorKind::UnknownCommand,
-                suggestions: suggest_command(name),
-            }),
         }
     }
 
@@ -452,9 +448,9 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// parallel = pipeline (parallel_op pipeline)*
+    /// parallel = job_expr (parallel_op job_expr)*
     fn parse_parallel(&mut self) -> Result<ChainNode, ParseError> {
-        let mut left = self.parse_pipeline()?;
+        let mut left = self.parse_job_expr()?;
         loop {
             let op = match self.peek() {
                 Token::ParallelAll => ParallelOp::All,
@@ -462,7 +458,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.advance();
-            let right = self.parse_pipeline()?;
+            let right = self.parse_job_expr()?;
             left = ChainNode::Parallel {
                 op,
                 left: Box::new(left),
@@ -472,8 +468,34 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// job_expr = pipeline (("&&" | "||") pipeline)*
+    fn parse_job_expr(&mut self) -> Result<ChainNode, ParseError> {
+        let mut left = self.parse_pipeline()?;
+        loop {
+            let is_and = match self.peek() {
+                Token::JobAnd => true,
+                Token::JobOr => false,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_pipeline()?;
+            left = if is_and {
+                JobExpr::And {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }
+            } else {
+                JobExpr::Or {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }
+            };
+        }
+        Ok(ChainNode::Leaf(left))
+    }
+
     /// pipeline = atom (pipe_op atom)*
-    fn parse_pipeline(&mut self) -> Result<ChainNode, ParseError> {
+    fn parse_pipeline(&mut self) -> Result<JobExpr, ParseError> {
         let first = self.parse_atom_words()?;
 
         // Check for pipe operators
@@ -513,7 +535,7 @@ impl<'a> Parser<'a> {
             });
         }
 
-        Ok(ChainNode::Leaf(Pipeline { segments }))
+        Ok(JobExpr::Pipeline(Pipeline { segments }))
     }
 
     /// Parse words for one atom in a pipeline (or a grouped chain).
@@ -525,7 +547,7 @@ impl<'a> Parser<'a> {
             self.advance(); // consume GroupOpen to avoid downstream confusion
             return Err(ParseError {
                 span,
-                message: "cannot nest a chain group `(...)` inside a pipeline. Use `|>` for process pipes, `->` / `||` for job chains.".into(),
+                message: "cannot nest a chain group `(...)` inside a pipeline. Use `|>` for process pipes, `->` / `|||` for job chains.".into(),
                 kind: ParseErrorKind::UnexpectedToken,
                 suggestions: vec![
                     "use |> for piping between processes".into(),
@@ -624,6 +646,8 @@ fn token_requires_continuation(token: &Token) -> bool {
             | Token::PipeStdout
             | Token::PipeAll
             | Token::PipeStderr
+            | Token::JobAnd
+            | Token::JobOr
     )
 }
 
@@ -669,43 +693,34 @@ pub(super) fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
 }
 
 fn suggest_command(name: &str) -> Vec<String> {
-    let commands = [
-        "run", "kill", "retry", "out", "tail", "err", "fg", "wait", "send", "cancel", "jobs",
-        "crons", "scopes", "cron", "env", "cd", "scope", "help", "config", "log", "pause", "wrap",
-        "resume", "clear", "quit", "exit",
-    ];
-    commands
-        .iter()
-        .filter(|c| c.starts_with(&name[..1.min(name.len())]) || edit_distance(name, c) <= 2)
-        .map(|c| format!(":{c}"))
+    command_suggestions(name)
+        .into_iter()
+        .map(|command| format!(":{command}"))
         .collect()
-}
-
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut dp = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-    for (i, row) in dp.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, cell) in dp[0].iter_mut().enumerate() {
-        *cell = j;
-    }
-    for i in 1..=a.len() {
-        for j in 1..=b.len() {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            dp[i][j] = (dp[i - 1][j] + 1)
-                .min(dp[i][j - 1] + 1)
-                .min(dp[i - 1][j - 1] + cost);
-        }
-    }
-    dp[a.len()][b.len()]
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::token::IdKind;
     use super::*;
+
+    fn leaf_pipeline(chain: &ChainNode) -> &Pipeline {
+        match chain {
+            ChainNode::Leaf(JobExpr::Pipeline(pipeline)) => pipeline,
+            other => panic!("expected leaf pipeline, got {other:?}"),
+        }
+    }
+
+    fn simple_command(expr: &JobExpr) -> Vec<&str> {
+        match expr {
+            JobExpr::Pipeline(pipeline) => pipeline.segments[0]
+                .command
+                .iter()
+                .map(String::as_str)
+                .collect(),
+            other => panic!("expected pipeline, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parse_simple_run() {
@@ -714,7 +729,8 @@ mod tests {
             Ast::Command { name, argument, .. } => {
                 assert_eq!(name, "run");
                 match argument {
-                    Argument::Chain(ChainNode::Leaf(p)) => {
+                    Argument::Chain(chain) => {
+                        let p = leaf_pipeline(&chain);
                         assert_eq!(p.segments.len(), 1);
                         assert_eq!(p.segments[0].command, vec!["cargo", "test"]);
                     }
@@ -730,7 +746,8 @@ mod tests {
         let ast = Parser::parse("cargo test --release").unwrap();
         match ast {
             Ast::BareInput { argument, .. } => match argument {
-                Argument::Chain(ChainNode::Leaf(p)) => {
+                Argument::Chain(chain) => {
+                    let p = leaf_pipeline(&chain);
                     assert_eq!(p.segments[0].command, vec!["cargo", "test", "--release"]);
                 }
                 _ => panic!("expected Chain"),
@@ -744,7 +761,8 @@ mod tests {
         let ast = Parser::parse("sleep 4").unwrap();
         match ast {
             Ast::BareInput { argument, .. } => match argument {
-                Argument::Chain(ChainNode::Leaf(p)) => {
+                Argument::Chain(chain) => {
+                    let p = leaf_pipeline(&chain);
                     assert_eq!(p.segments[0].command, vec!["sleep", "4"]);
                 }
                 _ => panic!("expected Chain"),
@@ -767,7 +785,7 @@ mod tests {
 
     #[test]
     fn parse_chain() {
-        let ast = Parser::parse(":run a -> b || c").unwrap();
+        let ast = Parser::parse(":run a -> b ||| c").unwrap();
         match ast {
             Ast::Command { argument, .. } => match argument {
                 Argument::Chain(ChainNode::Serial { op, left, right }) => {
@@ -782,11 +800,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_job_logical_expression_as_single_leaf() {
+        let ast = Parser::parse(":run false && echo no || echo yes").unwrap();
+        match ast {
+            Ast::Command { argument, .. } => match argument {
+                Argument::Chain(ChainNode::Leaf(JobExpr::Or { left, right })) => {
+                    match *left {
+                        JobExpr::And { left, right } => {
+                            assert_eq!(simple_command(&left), vec!["false"]);
+                            assert_eq!(simple_command(&right), vec!["echo", "no"]);
+                        }
+                        other => panic!("expected left-assoc AND, got {other:?}"),
+                    }
+                    assert_eq!(simple_command(&right), vec!["echo", "yes"]);
+                }
+                other => panic!("expected single job logical leaf, got {other:?}"),
+            },
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn parse_job_logical_binds_tighter_than_chain_operators() {
+        let ast = Parser::parse(":run a || b -> c ||| d").unwrap();
+        match ast {
+            Ast::Command { argument, .. } => match argument {
+                Argument::Chain(ChainNode::Serial { left, right, .. }) => {
+                    assert!(matches!(*left, ChainNode::Leaf(JobExpr::Or { .. })));
+                    assert!(matches!(*right, ChainNode::Parallel { .. }));
+                }
+                other => panic!("expected serial chain, got {other:?}"),
+            },
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
     fn parse_pipeline() {
         let ast = Parser::parse(":run a |> b |&> c").unwrap();
         match ast {
             Ast::Command { argument, .. } => match argument {
-                Argument::Chain(ChainNode::Leaf(p)) => {
+                Argument::Chain(chain) => {
+                    let p = leaf_pipeline(&chain);
                     assert_eq!(p.segments.len(), 3);
                     assert_eq!(p.segments[0].pipe_to_next, Some(PipeOp::Stdout));
                     assert_eq!(p.segments[1].pipe_to_next, Some(PipeOp::StdoutStderr));
@@ -829,16 +884,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_send_raw_preserves_operators() {
-        // `:send` should preserve `->` as literal text, not as chain operator.
-        let ast = Parser::parse(":send J1 replace a->b with c->d").unwrap();
+    fn parse_send_raw_preserves_quoted_operators() {
+        // Chain operators without whitespace must be quoted when passed as text.
+        let ast = Parser::parse(":send J1 replace 'a->b' with 'c->d'").unwrap();
         match ast {
             Ast::Command { name, argument, .. } => {
                 assert_eq!(name, "send");
-                assert_eq!(argument, Argument::Text("J1 replace a->b with c->d".into()));
+                assert_eq!(
+                    argument,
+                    Argument::Text("J1 replace 'a->b' with 'c->d'".into())
+                );
             }
             _ => panic!("expected Command"),
         }
+    }
+
+    #[test]
+    fn parse_send_raw_rejects_unquoted_chain_operator_without_boundary() {
+        let err = Parser::parse(":send J1 replace a->b").unwrap_err();
+        assert!(err.message.contains("must be surrounded by whitespace"));
     }
 
     #[test]
@@ -880,14 +944,15 @@ mod tests {
 
     #[test]
     fn complex_chain_with_pipes() {
-        // cargo build |> grep error -> cargo test || cargo clippy
+        // cargo build |> grep error -> cargo test ||| cargo clippy
         let ast =
-            Parser::parse(":run cargo build |> grep error -> cargo test || cargo clippy").unwrap();
+            Parser::parse(":run cargo build |> grep error -> cargo test ||| cargo clippy").unwrap();
         match ast {
             Ast::Command { argument, .. } => match argument {
                 Argument::Chain(ChainNode::Serial { left, right, .. }) => {
                     // left = pipeline (cargo build |> grep error)
-                    if let ChainNode::Leaf(p) = *left {
+                    if let ChainNode::Leaf(_) = *left {
+                        let p = leaf_pipeline(&left);
                         assert_eq!(p.segments.len(), 2);
                         assert_eq!(p.segments[0].command, vec!["cargo", "build"]);
                         assert_eq!(p.segments[0].pipe_to_next, Some(PipeOp::Stdout));
@@ -895,7 +960,7 @@ mod tests {
                     } else {
                         panic!("expected Leaf pipeline");
                     }
-                    // right = parallel (cargo test || cargo clippy)
+                    // right = parallel (cargo test ||| cargo clippy)
                     assert!(matches!(*right, ChainNode::Parallel { .. }));
                 }
                 _ => panic!("expected Serial chain"),
@@ -912,7 +977,8 @@ mod tests {
         let ast = Parser::parse(":run tr '[:upper:]' '[:lower:]'").unwrap();
         match ast {
             Ast::Command { argument, .. } => match argument {
-                Argument::Chain(ChainNode::Leaf(p)) => {
+                Argument::Chain(chain) => {
+                    let p = leaf_pipeline(&chain);
                     assert_eq!(p.segments.len(), 1);
                     assert_eq!(p.segments[0].command, vec!["tr", "[:upper:]", "[:lower:]"]);
                 }
@@ -927,7 +993,8 @@ mod tests {
         let ast = Parser::parse(":run tr [:upper:] [:lower:]").unwrap();
         match ast {
             Ast::Command { argument, .. } => match argument {
-                Argument::Chain(ChainNode::Leaf(p)) => {
+                Argument::Chain(chain) => {
+                    let p = leaf_pipeline(&chain);
                     assert_eq!(p.segments.len(), 1);
                     assert_eq!(p.segments[0].command, vec!["tr", "[:upper:]", "[:lower:]"]);
                 }
@@ -966,7 +1033,7 @@ mod tests {
 
     #[test]
     fn parse_multiline_chain_continues_before_operator() {
-        let ast = Parser::parse("cat a\n|| cat b").unwrap();
+        let ast = Parser::parse("cat a\n||| cat b").unwrap();
         match ast {
             Ast::BareInput { argument, .. } => {
                 assert!(matches!(
