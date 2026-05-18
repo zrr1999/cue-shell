@@ -83,6 +83,8 @@ struct ChainState {
     scope_enabled: bool,
     /// Whether the wrapper binary is enabled for this chain's jobs.
     wrapper_enabled: bool,
+    /// Whether to allocate a PTY for spawned leaf commands.
+    pty_enabled: bool,
 }
 
 /// Flattened representation of a chain leaf for easy lookup.
@@ -1877,6 +1879,7 @@ async fn fire_due_crons(
             cwd_override,
             scope_enabled,
             wrapper_enabled,
+            true,
             0,
             None,
             state,
@@ -1945,6 +1948,7 @@ async fn spawn_chain(
     cwd_override: Option<std::path::PathBuf>,
     scope_enabled: bool,
     wrapper_enabled: bool,
+    pty_enabled: bool,
     retry_max: u32,
     retry_delay: Option<std::time::Duration>,
     state: &mut SchedulerState,
@@ -2030,6 +2034,7 @@ async fn spawn_chain(
                         scope_hash,
                         cwd_override: cwd_override.clone(),
                         wrapper_enabled,
+                        pty_enabled: true,
                     })
                     .await;
             }
@@ -2082,6 +2087,7 @@ async fn spawn_chain(
         cwd_override: cwd_override.clone(),
         scope_enabled,
         wrapper_enabled,
+        pty_enabled,
     };
     state.chains.insert(chain_id, chain_state);
 
@@ -2172,7 +2178,7 @@ async fn process_chain_advance(
 ) -> Vec<JobId> {
     cancel_chain_leaves(chain_id, to_cancel, state, db, sys).await;
 
-    let (leaves, wrapper_enabled, scope_enabled) = {
+    let (leaves, wrapper_enabled, scope_enabled, pty_enabled) = {
         let Some(chain) = state.chains.get(&chain_id) else {
             return Vec::new();
         };
@@ -2180,6 +2186,7 @@ async fn process_chain_advance(
             flatten_leaves(&chain.node),
             chain.wrapper_enabled,
             chain.scope_enabled,
+            chain.pty_enabled,
         )
     };
 
@@ -2284,6 +2291,7 @@ async fn process_chain_advance(
                         scope_hash: start_scope,
                         cwd_override: cwd_override.clone(),
                         wrapper_enabled,
+                        pty_enabled,
                     })
                     .await;
             }
@@ -2443,6 +2451,7 @@ async fn handle_command(
             let cwd_override = params.cwd();
             let scope_enabled = params.scope().unwrap_or(false);
             let wrapper_enabled = state.wrapper_enabled(config);
+            let pty_enabled = params.pty_enabled();
             let retry_max = params.retry().unwrap_or(0);
             let retry_delay = params.retry_delay();
             spawn_chain(
@@ -2453,6 +2462,7 @@ async fn handle_command(
                 cwd_override,
                 scope_enabled,
                 wrapper_enabled,
+                pty_enabled,
                 retry_max,
                 retry_delay,
                 state,
@@ -3017,6 +3027,7 @@ async fn handle_command(
                 None,
                 false,
                 wrapper_enabled,
+                true,
                 0,
                 None,
                 state,
@@ -3858,6 +3869,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -3903,6 +3915,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -3946,6 +3959,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -3985,6 +3999,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4024,6 +4039,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4050,6 +4066,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4084,6 +4101,7 @@ mod tests {
             None,
             true,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4195,6 +4213,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4354,6 +4373,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4393,6 +4413,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4429,6 +4450,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4484,6 +4506,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4659,6 +4682,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4727,6 +4751,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4779,6 +4804,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,
@@ -4835,6 +4861,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             0,
             None,
             &mut state,

@@ -86,6 +86,16 @@ impl ModeParams {
             _ => None,
         }
     }
+
+    /// Whether to allocate a PTY for the spawned command.
+    /// Defaults to `true` (PTY). Set `pty=false` for non-interactive
+    /// commands that should run with plain pipes.
+    pub fn pty_enabled(&self) -> bool {
+        match self.get("pty") {
+            Some(ParamValue::Bool(b)) => *b,
+            _ => true, // default: PTY on
+        }
+    }
 }
 
 #[cfg(test)]

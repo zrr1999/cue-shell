@@ -85,6 +85,8 @@ pub enum ProcessMgrMsg {
         cwd_override: Option<std::path::PathBuf>,
         /// Whether the wrapper binary should be prepended to each segment.
         wrapper_enabled: bool,
+        /// Whether to allocate a PTY. `false` uses pipes (stdout/stderr).
+        pty_enabled: bool,
     },
     /// Kill a running job.
     KillJob { job_id: cue_core::JobId },

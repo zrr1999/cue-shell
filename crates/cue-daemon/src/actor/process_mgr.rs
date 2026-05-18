@@ -108,6 +108,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     scope_hash,
                     cwd_override,
                     wrapper_enabled,
+                    pty_enabled,
                 } => {
                     info!(%job_id, plan = %job_plan_to_text(&plan), %scope_hash, "process_mgr: spawn");
 
@@ -181,6 +182,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         effective_snapshot.as_ref(),
                         cwd_override.as_ref(),
                         wrapper_enabled,
+                        pty_enabled,
                         sys.clone(),
                         cleanup_tx.clone(),
                     )
@@ -574,12 +576,14 @@ fn pipeline_to_text(pipeline: &cue_core::pipeline::Pipeline) -> String {
         .join(" ")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_job_plan(
     job_id: JobId,
     plan: &JobPlan,
     snapshot: Option<&EnvSnapshot>,
     cwd_override: Option<&std::path::PathBuf>,
     wrapper_enabled: bool,
+    pty_enabled: bool,
     sys: ActorSystem,
     cleanup_tx: mpsc::Sender<JobId>,
 ) -> Result<ProcessEntry, ()> {
@@ -595,8 +599,21 @@ async fn spawn_job_plan(
             )
             .await
         }
-        JobPlan::Pipeline(pipeline) if pipeline.segments.len() == 1 => {
+        JobPlan::Pipeline(pipeline) if pipeline.segments.len() == 1 && pty_enabled => {
             spawn_single_pty_job(
+                job_id,
+                pipeline,
+                snapshot,
+                cwd_override,
+                wrapper_enabled,
+                sys,
+                cleanup_tx,
+            )
+            .await
+        }
+        // Single-segment without PTY → spawn with pipes.
+        JobPlan::Pipeline(pipeline) if pipeline.segments.len() == 1 => {
+            spawn_single_pipe_job(
                 job_id,
                 pipeline,
                 snapshot,
@@ -623,6 +640,150 @@ async fn spawn_job_plan(
             .await
         }
     }
+}
+
+/// Spawn a single-segment job with pipes (stdout/stderr piped, no PTY).
+/// Used when `pty=false` is specified — the child cannot detect a terminal.
+async fn spawn_single_pipe_job(
+    job_id: JobId,
+    pipeline: &cue_core::pipeline::Pipeline,
+    snapshot: Option<&EnvSnapshot>,
+    cwd_override: Option<&std::path::PathBuf>,
+    wrapper_enabled: bool,
+    sys: ActorSystem,
+    cleanup_tx: mpsc::Sender<JobId>,
+) -> Result<ProcessEntry, ()> {
+    use tokio::io::AsyncReadExt;
+
+    let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
+    let segment = &segments[0];
+    let (program, args) = wrap_single_command_if_enabled(&sys, wrapper_enabled, segment);
+
+    let mut cmd = tokio::process::Command::new(&program);
+    if !args.is_empty() {
+        cmd.args(&args);
+    }
+    if let Some(snap) = snapshot {
+        apply_env(&mut cmd, snap);
+    }
+    if let Some(ref cwd) = cwd_override {
+        cmd.current_dir(cwd);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        error!(%job_id, program = %program, err = %e, "process_mgr: pipe spawn failed");
+    })?;
+    let pid = child.id().unwrap_or(0);
+    info!(%job_id, pid, "process_mgr: pipe child spawned");
+
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+
+    let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
+    let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
+    let fg_owner = Arc::new(Mutex::new(None));
+    let sys_clone = sys.clone();
+    let ring_clone = ring_buffer.clone();
+    let stderr_clone = stderr_ring.clone();
+    let fg_clone = fg_owner.clone();
+    let cleanup_tx_clone = cleanup_tx.clone();
+
+    // Read stdout and stderr concurrently, wait for exit.
+    let log_file = open_output_log(job_id).await;
+    let reader_handle = tokio::spawn(async move {
+        let log = Arc::new(Mutex::new(log_file));
+        let log_clone = log.clone();
+        let sys_emit = sys_clone.clone();
+
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = buf[..n].to_vec();
+                        ring_clone.lock().unwrap().push(&chunk);
+                        if let Ok(mut guard) = log_clone.lock()
+                            && let Some(f) = guard.as_mut()
+                        {
+                            use std::io::Write;
+                            let _ = f.write_all(&chunk);
+                        }
+                        emit_output(&sys_emit, job_id, OutputStream::Stdout, &chunk).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let stderr_log = open_stderr_log(job_id).await;
+        let stderr_log = Arc::new(Mutex::new(stderr_log));
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = buf[..n].to_vec();
+                        stderr_clone.lock().unwrap().push(&chunk);
+                        if let Ok(mut guard) = stderr_log.lock()
+                            && let Some(f) = guard.as_mut()
+                        {
+                            use std::io::Write;
+                            let _ = f.write_all(&chunk);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+
+        let status = child.wait().await.ok();
+        let exit_code = status.and_then(|s| s.code()).unwrap_or(-1);
+        info!(%job_id, exit_code, "process_mgr: pipe child exited");
+
+        let _ = sys_clone
+            .event_bus
+            .send(EventBusMsg::Publish {
+                payload: EventPayload::OutputEof {
+                    id: job_id.to_string(),
+                },
+                channel: format!("output:{job_id}"),
+            })
+            .await;
+
+        let new_state = if exit_code == 0 {
+            JobStatus::Done
+        } else {
+            JobStatus::Failed
+        };
+        emit_state_change(&sys_clone, job_id, JobStatus::Running, new_state).await;
+        emit_fg_exit(&sys_clone, &fg_clone, job_id, &format!("exit {exit_code}")).await;
+        let _ = sys_clone
+            .scheduler
+            .send(SchedulerMsg::JobFinished { job_id, exit_code })
+            .await;
+        let _ = cleanup_tx_clone.send(job_id).await;
+    });
+
+    Ok(ProcessEntry {
+        job_id,
+        status: JobStatus::Running,
+        _reader_handle: reader_handle,
+        kill_tx: mpsc::channel::<()>(1).0,
+        ring_buffer,
+        stderr_ring: Some(stderr_ring),
+        input: None,
+        resize: None,
+        fg_owner,
+    })
 }
 
 async fn spawn_single_pty_job(
