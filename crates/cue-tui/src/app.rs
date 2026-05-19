@@ -1016,7 +1016,7 @@ impl AppState {
             && let Some(job) = self.jobs.iter().find(|j| j.id == job_id)
             && job.status.is_terminal()
         {
-            self.update(AppMsg::Submit(format!(":out {}", job.id)));
+            self.update(AppMsg::Submit(format!(":tail {}", job.id)));
             return;
         }
 
@@ -1712,7 +1712,7 @@ impl AppState {
                 let command = if matches!(job.status, JobStatus::Running) {
                     format!(":fg {}", job.id)
                 } else {
-                    format!(":out {}", job.id)
+                    format!(":tail {}", job.id)
                 };
                 self.update(AppMsg::Submit(command));
             }
@@ -3690,7 +3690,7 @@ mod tests {
     }
 
     #[test]
-    fn finished_job_sidebar_open_uses_out() {
+    fn finished_job_sidebar_open_uses_tail() {
         let mut state = AppState::new();
         state.jobs.push(JobRow {
             id: "J1".into(),
@@ -3704,7 +3704,7 @@ mod tests {
         state.activate_sidebar_row(0);
 
         let card = state.main_view.cards.last().unwrap();
-        assert_eq!(card.input, ":out J1");
+        assert_eq!(card.input, ":tail J1");
     }
 
     #[test]
