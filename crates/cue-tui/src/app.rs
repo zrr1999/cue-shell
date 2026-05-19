@@ -994,8 +994,7 @@ impl AppState {
             return;
         };
 
-        // For running jobs, route to the live view based on open_hint instead
-        // of showing a static preview.
+        // For running jobs: always foreground-attach.
         if let Some(job_id) = self
             .job_cards
             .iter()
@@ -1004,12 +1003,20 @@ impl AppState {
             && let Some(job) = self.jobs.iter().find(|j| j.id == job_id)
             && matches!(job.status, JobStatus::Running)
         {
-            let command = if matches!(job.open_hint, JobOpenHint::Fg) {
-                format!(":fg {}", job.id)
-            } else {
-                format!(":tail {}", job.id)
-            };
-            self.update(AppMsg::Submit(command));
+            self.update(AppMsg::Submit(format!(":fg {}", job.id)));
+            return;
+        }
+
+        // For finished jobs: open stdout.
+        if let Some(job_id) = self
+            .job_cards
+            .iter()
+            .find(|&(_, &card_idx)| card_idx == index)
+            .map(|(id, _)| id.clone())
+            && let Some(job) = self.jobs.iter().find(|j| j.id == job_id)
+            && job.status.is_terminal()
+        {
+            self.update(AppMsg::Submit(format!(":out {}", job.id)));
             return;
         }
 
@@ -1702,12 +1709,8 @@ impl AppState {
                 let Some(job) = self.jobs.get(idx) else {
                     return;
                 };
-                let command = if matches!(job.status, JobStatus::Running)
-                    && matches!(job.open_hint, JobOpenHint::Fg)
-                {
+                let command = if matches!(job.status, JobStatus::Running) {
                     format!(":fg {}", job.id)
-                } else if matches!(job.status, JobStatus::Running) {
-                    format!(":tail {}", job.id)
                 } else {
                     format!(":out {}", job.id)
                 };
@@ -3669,12 +3672,30 @@ mod tests {
     }
 
     #[test]
-    fn running_stream_job_sidebar_open_prefers_tail() {
+    fn running_stream_job_sidebar_open_prefers_fg() {
         let mut state = AppState::new();
         state.jobs.push(JobRow {
             id: "J1".into(),
             label: "sleep 5".into(),
             status: JobStatus::Running,
+            start_scope: None,
+            end_scope: None,
+            open_hint: JobOpenHint::Fg,
+        });
+
+        state.activate_sidebar_row(0);
+
+        let card = state.main_view.cards.last().unwrap();
+        assert_eq!(card.input, ":fg J1");
+    }
+
+    #[test]
+    fn finished_job_sidebar_open_uses_out() {
+        let mut state = AppState::new();
+        state.jobs.push(JobRow {
+            id: "J1".into(),
+            label: "cargo build".into(),
+            status: JobStatus::Done,
             start_scope: None,
             end_scope: None,
             open_hint: JobOpenHint::Stream,
@@ -3683,7 +3704,7 @@ mod tests {
         state.activate_sidebar_row(0);
 
         let card = state.main_view.cards.last().unwrap();
-        assert_eq!(card.input, ":tail J1");
+        assert_eq!(card.input, ":out J1");
     }
 
     #[test]
