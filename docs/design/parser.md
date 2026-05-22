@@ -208,7 +208,7 @@ The Resolver transforms `Ast` → `RequestPayload`:
 
 3. **ID resolution**: validates J1/C3/S0 references exist (queries cued state)
 
-4. **Mode params merge**: per-invocation params override config.toml defaults
+4. **Mode params merge**: per-invocation params override server.toml defaults
 
 5. **Scope resolution**: jobs start from HEAD; `cwd` mode params override process cwd without mutating HEAD
 

@@ -14,7 +14,7 @@ pub enum ParamValue {
 
 /// Mode parameters extracted from `:cmd(k=v, ...)` syntax.
 ///
-/// Per-invocation overrides merged with config.toml defaults by the Resolver.
+/// Per-invocation overrides merged with server.toml defaults by the Resolver.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModeParams {
     pub params: BTreeMap<String, ParamValue>,

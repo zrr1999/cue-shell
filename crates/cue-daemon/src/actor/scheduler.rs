@@ -22,7 +22,7 @@ use cue_core::ipc::{
 };
 use cue_core::job::{CancelReason, JobStatus};
 use cue_core::mode::Mode;
-use cue_core::pipeline::{ChainNode, ParallelOp, SerialOp};
+use cue_core::pipeline::{ChainNode, ParallelOp, SerialOp, command_prefers_foreground};
 use cue_core::scope::EnvSnapshot;
 use cue_core::{ChainId, CronId, JobId, ScopeHash, ScriptId};
 
@@ -135,6 +135,8 @@ struct CronEntry {
     cwd_override: Option<std::path::PathBuf>,
     /// Whether scope-transform leaves may derive a new scope for later leaves.
     scope_enabled: bool,
+    /// Whether the wrapper binary is enabled for jobs spawned by this cron.
+    wrapper_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -286,7 +288,7 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
                         SchedulerMsg::Shutdown => {
                             debug!("scheduler: shutting down");
 
-                            // FIX 4: Cancel all active chain jobs before shutting down.
+                            // Cancel all active chain jobs before shutting down.
                             let chain_ids: Vec<ChainId> =
                                 state.chains.keys().copied().collect();
                             for chain_id in chain_ids {
@@ -467,6 +469,7 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
                 scope_hash: cron.scope_hash,
                 cwd_override: cron.cwd_override.clone(),
                 scope_enabled: cron.scope_enabled,
+                wrapper_enabled: cron.wrapper_enabled,
                 age_secs: cron.age_secs,
             };
             if let Err(e) =
@@ -497,6 +500,7 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
                 next_trigger,
                 cwd_override: cron.cwd_override,
                 scope_enabled: cron.scope_enabled,
+                wrapper_enabled: cron.wrapper_enabled,
             },
         );
     }
@@ -604,6 +608,7 @@ fn persist_cron_entry(db: &storage::SharedConnection, entry: &CronEntry) {
             scope_hash: Some(entry.scope_hash),
             cwd_override: entry.cwd_override.clone(),
             scope_enabled: entry.scope_enabled,
+            wrapper_enabled: entry.wrapper_enabled,
             age_secs: 0,
         },
     );
@@ -848,7 +853,7 @@ fn advance_inner(
                 advance_inner(right, right_offset, finished_idx, statuses, ready, cancel);
             }
 
-            // FIX 3: For Race, check entire branch success (subtree terminal + all ok),
+            // For Race, check entire branch success (subtree terminal + all ok),
             // not individual leaf success.
             if *op == ParallelOp::Race {
                 let right_count = leaf_count(right);
@@ -1627,52 +1632,15 @@ async fn apply_scope_transform(
     derive_scope(sys, start_scope, delta).await
 }
 
-fn classify_job_open_hint(pipeline: &cue_core::pipeline::Pipeline) -> JobOpenHint {
-    if pipeline.segments.len() != 1 {
-        return JobOpenHint::Stream;
-    }
-    let command_line = &pipeline.segments[0].command;
-    let Some(command_word) = command_line.first() else {
-        return JobOpenHint::Stream;
-    };
-    let command = std::path::Path::new(command_word)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(command_word.as_str());
-    let args: Vec<&str> = command_line.iter().skip(1).map(String::as_str).collect();
-
-    let prefers_fg = match command {
-        "vim" | "nvim" | "vi" | "nano" | "less" | "more" | "man" | "top" | "htop" | "watch"
-        | "fzf" | "tig" | "lazygit" | "tmux" | "zellij" => true,
-        "bash" | "zsh" | "sh" | "fish" => {
-            args.is_empty()
-                || args.contains(&"-i")
-                || args.contains(&"--interactive")
-                || args.contains(&"-l")
-        }
-        "python" | "python3" | "node" | "ipython" | "bpython" | "irb" => {
-            args.is_empty()
-                || args
-                    .first()
-                    .is_some_and(|arg| matches!(*arg, "-i" | "--interactive"))
-        }
-        "ssh" | "psql" | "mysql" | "sqlite3" => true,
-        _ => false,
-    };
-
-    if prefers_fg {
-        JobOpenHint::Fg
-    } else {
-        JobOpenHint::Stream
-    }
-}
-
 fn classify_job_plan_open_hint(plan: &cue_core::pipeline::JobPlan) -> JobOpenHint {
     match plan {
-        cue_core::pipeline::JobPlan::Pipeline(pipeline) => classify_job_open_hint(pipeline),
-        cue_core::pipeline::JobPlan::And { .. } | cue_core::pipeline::JobPlan::Or { .. } => {
-            JobOpenHint::Stream
+        cue_core::pipeline::JobPlan::Pipeline(pipeline)
+            if pipeline.segments.len() == 1
+                && command_prefers_foreground(&pipeline.segments[0].command) =>
+        {
+            JobOpenHint::Fg
         }
+        _ => JobOpenHint::Stream,
     }
 }
 
@@ -1866,11 +1834,11 @@ async fn fire_due_crons(
         let is_oneshot = schedule.is_oneshot();
         let cwd_override = entry.cwd_override.clone();
         let scope_enabled = entry.scope_enabled;
+        let wrapper_enabled = entry.wrapper_enabled;
 
         info!(%cron_id, "scheduler: cron triggered");
 
         // Spawn the chain just like `:run`.
-        let wrapper_enabled = state.wrapper_enabled(&sys.config);
         let response = spawn_chain(
             chain,
             scope_hash,
@@ -2040,7 +2008,7 @@ async fn spawn_chain(
                         scope_hash,
                         cwd_override: cwd_override.clone(),
                         wrapper_enabled,
-                        pty_enabled: true,
+                        pty_enabled,
                     })
                     .await;
             }
@@ -2453,7 +2421,9 @@ async fn handle_command(
             };
             let cwd_override = params.cwd();
             let scope_enabled = params.scope().unwrap_or(false);
-            let wrapper_enabled = state.wrapper_enabled(config);
+            let wrapper_enabled = params
+                .wrapper_enabled()
+                .unwrap_or_else(|| state.wrapper_enabled(config));
             let pty_enabled = params.pty_enabled();
             let retry_max = params.retry().unwrap_or(0);
             let retry_delay = params.retry_delay();
@@ -2506,6 +2476,9 @@ async fn handle_command(
                 next_trigger,
                 cwd_override: params.cwd(),
                 scope_enabled: params.scope().unwrap_or(false),
+                wrapper_enabled: params
+                    .wrapper_enabled()
+                    .unwrap_or_else(|| state.wrapper_enabled(config)),
             };
             persist_cron_entry(db, &entry);
             state.crons.insert(cron_id, entry);
@@ -2846,7 +2819,7 @@ async fn handle_command(
                     } else {
                         "config"
                     };
-                    let mut lines = vec![
+                    let lines = [
                         format!(
                             "wrapper status: {}",
                             if effective { "enabled" } else { "disabled" }
@@ -2857,20 +2830,14 @@ async fn handle_command(
                         ),
                         format!("  source: {source}"),
                         format!(
-                            "  interactive bypass: {}",
-                            if config.wrapper.denylist.interactive {
-                                "enabled"
+                            "  allowlist: {}",
+                            if config.wrapper.allowlist.commands.is_empty() {
+                                "(empty; wraps nothing)".into()
                             } else {
-                                "disabled"
+                                config.wrapper.allowlist.commands.join(", ")
                             }
                         ),
                     ];
-                    if !config.wrapper.denylist.commands.is_empty() {
-                        lines.push(format!(
-                            "  denylist: {}",
-                            config.wrapper.denylist.commands.join(", ")
-                        ));
-                    }
                     ResponsePayload::Ok(OkPayload::EvalText {
                         text: lines.join("\n"),
                     })
@@ -4176,6 +4143,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_wrapper_param_overrides_session_and_config() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut config = Config::default();
+        config.wrapper.enabled = false;
+        let mut state = SchedulerState::new();
+        state.wrapper_enabled = Some(false);
+        let mut params = cue_core::command::ModeParams::new();
+        params.insert("wrapper", cue_core::command::ParamValue::Bool(true));
+
+        let resp = handle_command(
+            ResolvedCommand::Run {
+                chain: leaf("echo hi"),
+                params,
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::JobCreated { .. })
+        ));
+
+        let msg = pm_rx.try_recv().expect("spawn job");
+        match msg {
+            ProcessMgrMsg::SpawnJob {
+                wrapper_enabled, ..
+            } => assert!(wrapper_enabled),
+            _ => panic!("expected SpawnJob"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_wrapper_param_is_stored_on_entry() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut config = Config::default();
+        config.wrapper.enabled = false;
+        let mut state = SchedulerState::new();
+        let mut params = cue_core::command::ModeParams::new();
+        params.insert("wrapper", cue_core::command::ParamValue::Bool(true));
+        let cmd = ResolvedCommand::Cron {
+            schedule: CronSchedule::Interval(std::time::Duration::from_secs(300)),
+            chain: leaf("backup.sh"),
+            params,
+        };
+        let resp = handle_command(cmd, 0, &mut state, &conn, &config, &sys).await;
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::CronAdded { .. })
+        ));
+        assert!(state.crons[&CronId(1)].wrapper_enabled);
+    }
+
+    #[tokio::test]
     async fn cron_add_and_list() {
         let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
         spawn_fake_scope_store(ss_rx);
@@ -4352,6 +4382,7 @@ mod tests {
                 scope_hash: Some(ScopeHash([5; 32])),
                 cwd_override: Some(std::path::PathBuf::from("/tmp/cue-cron-cwd")),
                 scope_enabled: true,
+                wrapper_enabled: true,
                 age_secs: 0,
             },
         )
@@ -4371,6 +4402,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/cue-cron-cwd"))
         );
         assert!(state.crons[&CronId(4)].scope_enabled);
+        assert!(state.crons[&CronId(4)].wrapper_enabled);
     }
 
     #[test]
@@ -4387,6 +4419,7 @@ mod tests {
                 scope_hash: Some(ScopeHash([8; 32])),
                 cwd_override: None,
                 scope_enabled: false,
+                wrapper_enabled: false,
                 age_secs: 0,
             },
         )
@@ -4710,7 +4743,7 @@ mod tests {
         assert_eq!(ready, vec![0, 1]); // Both ready.
     }
 
-    // ── FIX 1 test: Race + Serial — cancelled leaf must not be re-spawned ──
+    // ── Race + Serial: cancelled leaf must not be re-spawned ──
 
     /// `(a -> b) |?| c` — when `c` succeeds, Race should cancel both `a`/`b`.
     /// When `a` also succeeds, `b` should NOT be spawned because it was cancelled.
@@ -4780,7 +4813,7 @@ mod tests {
         assert!(state.chains.is_empty(), "chain should be cleaned up");
     }
 
-    // ── FIX 3 test: Race waits for entire branch, not single leaf ──
+    // ── Race waits for entire branch, not single leaf ──
 
     /// `(compile -> test) |?| lint`
     /// When `compile` succeeds but `test` hasn't run yet, Race should NOT fire.
@@ -4840,7 +4873,7 @@ mod tests {
         );
     }
 
-    // ── FIX 2 test: :cancel updates chain leaf_status and advances chain ──
+    // ── :cancel updates chain leaf_status and advances chain ──
 
     #[tokio::test]
     async fn cancel_chain_leaf_updates_leaf_status() {
@@ -4903,7 +4936,7 @@ mod tests {
         );
     }
 
-    // ── FIX 2 test: :kill does not get overwritten by later JobFinished ──
+    // ── :kill does not get overwritten by later JobFinished ──
 
     #[tokio::test]
     async fn kill_status_not_overwritten_by_job_finished() {

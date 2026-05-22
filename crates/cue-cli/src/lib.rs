@@ -1,5 +1,7 @@
 #[cfg(feature = "tui")]
-mod config;
+pub mod config;
+#[cfg(feature = "tui")]
+pub mod path_lookup;
 #[cfg(feature = "tui")]
 mod tui;
 

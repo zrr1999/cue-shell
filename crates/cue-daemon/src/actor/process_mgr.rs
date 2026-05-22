@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 use cue_core::JobId;
 use cue_core::ipc::{EventPayload, Stream as OutputStream};
 use cue_core::job::JobStatus;
-use cue_core::pipeline::JobPlan;
+use cue_core::pipeline::{JobPlan, command_prefers_foreground};
 use cue_core::scope::EnvSnapshot;
 
 use super::{
@@ -38,7 +38,7 @@ struct ProcessEntry {
     _reader_handle: tokio::task::JoinHandle<()>,
     /// Send on this channel to request a kill.
     kill_tx: mpsc::Sender<()>,
-    /// Shared ring buffer holding the latest output bytes (FIX 7).
+    /// Shared ring buffer holding the latest output bytes for live-tail queries.
     ring_buffer: Arc<Mutex<RingBuffer>>,
     /// Separate stderr ring buffer.  `None` in PTY mode (streams are merged).
     stderr_ring: Option<Arc<Mutex<RingBuffer>>>,
@@ -94,7 +94,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
         let mut children: HashMap<u32, ProcessEntry> = HashMap::new();
 
-        // FIX 2: internal channel for reader tasks to request cleanup.
+        // Internal channel for reader tasks to request cleanup.
         let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<JobId>(super::ACTOR_CHANNEL_CAP);
 
         loop {
@@ -125,7 +125,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             .is_err()
                         {
                             error!(%job_id, "process_mgr: scope_store channel closed");
-                            // FIX 1: fail the job instead of continuing with daemon env.
+                            // Fail the job instead of continuing with the daemon environment.
                             emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
                             let _ = sys.scheduler.send(SchedulerMsg::JobFinished { job_id, exit_code: -1 }).await;
                             continue;
@@ -133,14 +133,14 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         match rx.await {
                             Ok(Some(scope)) => scope.snapshot,
                             Ok(None) => {
-                                // FIX 1: scope not found — fail the job.
+                                // Scope resolution failed, so the job cannot safely inherit env.
                                 error!(%job_id, %scope_hash, "process_mgr: scope not found");
                                 emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
                                 let _ = sys.scheduler.send(SchedulerMsg::JobFinished { job_id, exit_code: -1 }).await;
                                 continue;
                             }
                             Err(_) => {
-                                // FIX 1: oneshot dropped — fail the job.
+                                // Scope resolution failed, so the job cannot safely inherit env.
                                 error!(%job_id, "process_mgr: scope_store reply dropped");
                                 emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
                                 let _ = sys.scheduler.send(SchedulerMsg::JobFinished { job_id, exit_code: -1 }).await;
@@ -221,7 +221,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     }
                 }
 
-                // FIX 7: expose ring-buffer contents for live-tail queries.
+                // Expose ring-buffer contents for live-tail queries.
                 ProcessMgrMsg::GetOutput { job_id, tail_bytes, reply } => {
                     let result = children
                         .get(&job_id.0)
@@ -353,7 +353,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     debug!("process_mgr: shutting down — killing all children");
                     for entry in children.values() {
                         if !entry.status.is_terminal() {
-                            // FIX 4: non-blocking send so shutdown cannot stall.
+                            // Non-blocking send keeps shutdown from stalling on a full channel.
                             let _ = entry.kill_tx.try_send(());
                         }
                     }
@@ -364,7 +364,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     }
                 }
 
-                // FIX 2: reader task finished — remove the stale entry.
+                // Reader task finished; remove the stale entry.
                 Some(job_id) = cleanup_rx.recv() => {
                     debug!(%job_id, "process_mgr: cleaning up finished child");
                     children.remove(&job_id.0);
@@ -457,6 +457,7 @@ async fn write_job_input(input: &JobInput, data: &[u8]) -> std::io::Result<()> {
 
 #[derive(Clone)]
 struct ExpandedSegment {
+    command_line: Vec<String>,
     program: String,
     args: Vec<String>,
     pipe_to_next: Option<cue_core::pipeline::PipeOp>,
@@ -482,9 +483,11 @@ fn expand_pipeline_segments(
             );
             return Err(());
         };
+        let args = command_line.get(1..).unwrap_or(&[]).to_vec();
         expanded.push(ExpandedSegment {
+            command_line,
             program,
-            args: command_line.get(1..).unwrap_or(&[]).to_vec(),
+            args,
             pipe_to_next: segment.pipe_to_next,
         });
     }
@@ -594,6 +597,7 @@ async fn spawn_job_plan(
                 plan.clone(),
                 snapshot.cloned(),
                 cwd_override.cloned(),
+                wrapper_enabled,
                 sys,
                 cleanup_tx,
             )
@@ -625,8 +629,16 @@ async fn spawn_job_plan(
             .await
         }
         JobPlan::Pipeline(pipeline) => {
-            spawn_native_pipeline_job(job_id, pipeline, snapshot, cwd_override, sys, cleanup_tx)
-                .await
+            spawn_native_pipeline_job(
+                job_id,
+                pipeline,
+                snapshot,
+                cwd_override,
+                wrapper_enabled,
+                sys,
+                cleanup_tx,
+            )
+            .await
         }
         JobPlan::And { .. } | JobPlan::Or { .. } => {
             spawn_logical_job(
@@ -634,6 +646,7 @@ async fn spawn_job_plan(
                 plan.clone(),
                 snapshot.cloned(),
                 cwd_override.cloned(),
+                wrapper_enabled,
                 sys,
                 cleanup_tx,
             )
@@ -657,7 +670,7 @@ async fn spawn_single_pipe_job(
 
     let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
     let segment = &segments[0];
-    let (program, args) = wrap_single_command_if_enabled(&sys, wrapper_enabled, segment);
+    let (program, args) = wrap_segment_if_enabled(&sys, wrapper_enabled, segment);
 
     let mut cmd = tokio::process::Command::new(&program);
     if !args.is_empty() {
@@ -797,7 +810,7 @@ async fn spawn_single_pty_job(
 ) -> Result<ProcessEntry, ()> {
     let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
     let segment = &segments[0];
-    let (program, args) = wrap_single_command_if_enabled(&sys, wrapper_enabled, segment);
+    let (program, args) = wrap_segment_if_enabled(&sys, wrapper_enabled, segment);
 
     let mut cmd = tokio::process::Command::new(&program);
     if !args.is_empty() {
@@ -921,7 +934,7 @@ async fn spawn_single_pty_job(
     })
 }
 
-fn wrap_single_command_if_enabled(
+fn wrap_segment_if_enabled(
     sys: &ActorSystem,
     wrapper_enabled: bool,
     segment: &ExpandedSegment,
@@ -933,7 +946,8 @@ fn wrap_single_command_if_enabled(
     }
 
     let wrapper = &sys.config.wrapper;
-    if wrapper.binary.is_empty() || !wrapper.should_wrap(&program, false, Some(true)) {
+    let is_foreground = command_prefers_foreground(&segment.command_line);
+    if wrapper.binary.is_empty() || !wrapper.should_wrap(&program, is_foreground, Some(true)) {
         return (program, args);
     }
 
@@ -948,6 +962,7 @@ async fn spawn_native_pipeline_job(
     pipeline: &cue_core::pipeline::Pipeline,
     snapshot: Option<&EnvSnapshot>,
     cwd_override: Option<&std::path::PathBuf>,
+    wrapper_enabled: bool,
     sys: ActorSystem,
     cleanup_tx: mpsc::Sender<JobId>,
 ) -> Result<ProcessEntry, ()> {
@@ -957,7 +972,14 @@ async fn spawn_native_pipeline_job(
         input,
         stdout_sources,
         stderr_sources,
-    } = spawn_native_pipeline(job_id, &segments, snapshot, cwd_override)?;
+    } = spawn_native_pipeline(
+        job_id,
+        &segments,
+        snapshot,
+        cwd_override,
+        wrapper_enabled,
+        &sys,
+    )?;
 
     let pids: Vec<u32> = children
         .iter()
@@ -1004,6 +1026,7 @@ async fn spawn_logical_job(
     plan: JobPlan,
     snapshot: Option<EnvSnapshot>,
     cwd_override: Option<std::path::PathBuf>,
+    wrapper_enabled: bool,
     sys: ActorSystem,
     cleanup_tx: mpsc::Sender<JobId>,
 ) -> Result<ProcessEntry, ()> {
@@ -1021,6 +1044,7 @@ async fn spawn_logical_job(
         log_file,
         stderr_log,
         kill_rx,
+        wrapper_enabled,
         sys.clone(),
         ring_buffer.clone(),
         stderr_ring.clone(),
@@ -1046,6 +1070,8 @@ fn spawn_native_pipeline(
     segments: &[ExpandedSegment],
     snapshot: Option<&EnvSnapshot>,
     cwd_override: Option<&std::path::PathBuf>,
+    wrapper_enabled: bool,
+    sys: &ActorSystem,
 ) -> Result<NativePipelineSpawn, ()> {
     let mut children = Vec::with_capacity(segments.len());
     let mut stdout_sources = Vec::new();
@@ -1054,9 +1080,10 @@ fn spawn_native_pipeline(
     let mut next_stdin = None;
 
     for (idx, segment) in segments.iter().enumerate() {
-        let mut cmd = tokio::process::Command::new(&segment.program);
-        if !segment.args.is_empty() {
-            cmd.args(&segment.args);
+        let (program, args) = wrap_segment_if_enabled(sys, wrapper_enabled, segment);
+        let mut cmd = tokio::process::Command::new(&program);
+        if !args.is_empty() {
+            cmd.args(&args);
         }
         configure_command(&mut cmd, snapshot, cwd_override);
 
@@ -1104,7 +1131,7 @@ fn spawn_native_pipeline(
         }
 
         let mut child = cmd.spawn().map_err(|error| {
-            log_spawn_failure(job_id, &segment.program, &segment.args, snapshot, &error);
+            log_spawn_failure(job_id, &program, &args, snapshot, &error);
         })?;
         if idx == 0 {
             input = child
@@ -1147,8 +1174,8 @@ fn create_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
 
 /// Open (or create) the append-only log file for a job's output.
 ///
-/// FIX 5: runs on the blocking thread-pool so the tokio runtime thread is
-/// never stalled by filesystem syscalls.
+/// Runs on the blocking thread pool so filesystem syscalls do not stall the
+/// Tokio runtime thread.
 async fn open_output_log(job_id: JobId) -> Option<std::fs::File> {
     tokio::task::spawn_blocking(move || {
         let dir = crate::dirs::output_dir();
@@ -1230,7 +1257,7 @@ async fn reader_task(
     fg_owner: Arc<Mutex<Option<u64>>>,
     cleanup_tx: mpsc::Sender<JobId>,
 ) {
-    // FIX 5: wrap the log file so it can be shared with spawn_blocking.
+    // Wrap the log file so it can be shared with `spawn_blocking`.
     let log_file = Arc::new(Mutex::new(log_file));
     let mut pty_buf = vec![0u8; 8192];
     let mut pty_done = false;
@@ -1259,7 +1286,7 @@ async fn reader_task(
                 emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Killed).await;
                 emit_fg_exit(&sys, &fg_owner, job_id, "killed").await;
                 let _ = sys.scheduler.send(SchedulerMsg::JobFinished { job_id, exit_code: -1 }).await;
-                // FIX 2: tell the main loop to remove our entry.
+                // Tell the main loop to remove our entry.
                 let _ = cleanup_tx.send(job_id).await;
                 return;
             }
@@ -1291,7 +1318,7 @@ async fn reader_task(
         }
     }
 
-    // FIX 3: wait for exit status while still honouring late kill requests.
+    // Wait for exit status while still honoring late kill requests.
     let (exit_code, was_killed) = tokio::select! {
         status = child.wait() => {
             let code = match status {
@@ -1359,7 +1386,7 @@ async fn reader_task(
             .await;
     }
 
-    // FIX 2: tell the main loop to remove our entry.
+    // Tell the main loop to remove our entry.
     let _ = cleanup_tx.send(job_id).await;
 }
 
@@ -1490,6 +1517,7 @@ async fn logical_job_task(
     log_file: Option<std::fs::File>,
     stderr_log: Option<std::fs::File>,
     mut kill_rx: mpsc::Receiver<()>,
+    wrapper_enabled: bool,
     sys: ActorSystem,
     ring: Arc<Mutex<RingBuffer>>,
     stderr_ring: Arc<Mutex<RingBuffer>>,
@@ -1512,6 +1540,7 @@ async fn logical_job_task(
         &mut local_snapshot,
         &mut kill_rx,
         &mut was_killed,
+        wrapper_enabled,
         &sys,
         &ring,
         &stderr_ring,
@@ -1569,6 +1598,7 @@ async fn run_job_plan_streaming(
     snapshot: &mut EnvSnapshot,
     kill_rx: &mut mpsc::Receiver<()>,
     was_killed: &mut bool,
+    wrapper_enabled: bool,
     sys: &ActorSystem,
     ring: &Arc<Mutex<RingBuffer>>,
     stderr_ring: &Arc<Mutex<RingBuffer>>,
@@ -1586,6 +1616,7 @@ async fn run_job_plan_streaming(
                 snapshot,
                 kill_rx,
                 was_killed,
+                wrapper_enabled,
                 sys,
                 ring,
                 stderr_ring,
@@ -1601,6 +1632,7 @@ async fn run_job_plan_streaming(
                 snapshot,
                 kill_rx,
                 was_killed,
+                wrapper_enabled,
                 sys,
                 ring,
                 stderr_ring,
@@ -1615,6 +1647,7 @@ async fn run_job_plan_streaming(
                     snapshot,
                     kill_rx,
                     was_killed,
+                    wrapper_enabled,
                     sys,
                     ring,
                     stderr_ring,
@@ -1633,6 +1666,7 @@ async fn run_job_plan_streaming(
                 snapshot,
                 kill_rx,
                 was_killed,
+                wrapper_enabled,
                 sys,
                 ring,
                 stderr_ring,
@@ -1647,6 +1681,7 @@ async fn run_job_plan_streaming(
                     snapshot,
                     kill_rx,
                     was_killed,
+                    wrapper_enabled,
                     sys,
                     ring,
                     stderr_ring,
@@ -1668,6 +1703,7 @@ async fn run_pipeline_streaming(
     snapshot: &mut EnvSnapshot,
     kill_rx: &mut mpsc::Receiver<()>,
     was_killed: &mut bool,
+    wrapper_enabled: bool,
     sys: &ActorSystem,
     ring: &Arc<Mutex<RingBuffer>>,
     stderr_ring: &Arc<Mutex<RingBuffer>>,
@@ -1684,7 +1720,14 @@ async fn run_pipeline_streaming(
         Ok(segments) => segments,
         Err(()) => return -1,
     };
-    let mut spawn = match spawn_native_pipeline(job_id, &segments, Some(snapshot), None) {
+    let mut spawn = match spawn_native_pipeline(
+        job_id,
+        &segments,
+        Some(snapshot),
+        None,
+        wrapper_enabled,
+        sys,
+    ) {
         Ok(spawn) => spawn,
         Err(()) => return -1,
     };
@@ -1985,8 +2028,8 @@ async fn emit_fg_exit(
 
 /// Write a chunk to the log file (best-effort).
 ///
-/// FIX 5: offloaded to the blocking thread-pool so the async reader task
-/// never stalls the tokio runtime with synchronous I/O.
+/// Offloaded to the blocking thread pool so the async reader task never stalls
+/// the Tokio runtime with synchronous I/O.
 async fn write_log(file: &Arc<Mutex<Option<std::fs::File>>>, data: &[u8]) {
     let file = file.clone();
     let data = data.to_vec();

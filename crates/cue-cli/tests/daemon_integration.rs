@@ -205,6 +205,19 @@ fn write_executable_script(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).expect("chmod test script");
 }
 
+fn write_server_config(env: &TestEnv, text: &str) {
+    let config_dir = env.root.join("config/cue-shell");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::write(config_dir.join("server.toml"), text).expect("write server.toml");
+}
+
+fn job_id_from_created(resp: ResponsePayload) -> String {
+    match resp {
+        ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+        other => panic!("expected JobCreated, got {other:?}"),
+    }
+}
+
 /// Write a length-prefixed JSON message to the stream.
 async fn send<S>(stream: &mut S, msg: &Message)
 where
@@ -1979,6 +1992,166 @@ async fn test_native_stderr_only_pipeline_keeps_stdout_outside_pipe() {
             }
             other => panic!("expected stderr Output, got {other:?}"),
         }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wrapper_allowlist_wraps_single_pipeline_and_logical_jobs() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("wrapper-allowlist");
+        let wrapper_log = env.root.join("wrapper.log");
+        let wrapper = env.root.join("rtk-test");
+        write_executable_script(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\nexec \"$@\"\n",
+                wrapper_log.display()
+            ),
+        );
+        write_server_config(
+            &env,
+            &format!(
+                r#"
+[wrapper]
+enabled = true
+binary = "{}"
+
+[wrapper.allowlist]
+commands = ["printf", "sed", "true"]
+"#,
+                wrapper.display()
+            ),
+        );
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let single = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":run(pty=false) printf single".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let single_job = job_id_from_created(single);
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &single_job).await,
+            JobStatus::Done
+        );
+
+        let pipeline = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: ":run(pty=false) printf pipe |> sed s/pipe/wrapped/".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let pipeline_job = job_id_from_created(pipeline);
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 4, &pipeline_job).await,
+            JobStatus::Done
+        );
+
+        let logical = roundtrip(
+            &mut stream,
+            5,
+            RequestPayload::Eval {
+                input: ":run(pty=false) true && printf logical".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let logical_job = job_id_from_created(logical);
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 6, &logical_job).await,
+            JobStatus::Done
+        );
+
+        let log = fs::read_to_string(&wrapper_log).expect("read wrapper log");
+        assert!(
+            log.contains("printf\n"),
+            "expected printf wrap, got {log:?}"
+        );
+        assert!(log.contains("sed\n"), "expected sed wrap, got {log:?}");
+        assert!(log.contains("true\n"), "expected true wrap, got {log:?}");
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wrapper_non_allowlisted_and_param_disabled_do_not_wrap() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("wrapper-skip");
+        let wrapper_log = env.root.join("wrapper.log");
+        let wrapper = env.root.join("rtk-test");
+        write_executable_script(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\nexec \"$@\"\n",
+                wrapper_log.display()
+            ),
+        );
+        write_server_config(
+            &env,
+            &format!(
+                r#"
+[wrapper]
+enabled = true
+binary = "{}"
+
+[wrapper.allowlist]
+commands = ["printf"]
+"#,
+                wrapper.display()
+            ),
+        );
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let non_allowlisted = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":run(pty=false) echo plain".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let non_allowlisted_job = job_id_from_created(non_allowlisted);
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &non_allowlisted_job).await,
+            JobStatus::Done
+        );
+
+        let disabled = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: ":run(pty=false, wrapper=false) printf disabled".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let disabled_job = job_id_from_created(disabled);
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 4, &disabled_job).await,
+            JobStatus::Done
+        );
+
+        let log = fs::read_to_string(&wrapper_log).unwrap_or_default();
+        assert!(log.is_empty(), "wrapper should not have run, got {log:?}");
 
         shutdown_daemon(&mut stream, &mut child).await;
     })

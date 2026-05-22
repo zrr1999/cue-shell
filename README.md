@@ -122,7 +122,7 @@ cat _typos.toml |> rg files
 - canonical output still belongs to jobs (`:out J<n>`, `:tail J<n>`, `:err J<n>`)
 - the TUI shows one script card summarizing the `R -> C -> J` mapping
 
-### Client transport config
+### Client transport and extension config
 
 `cue` defaults to a local Unix socket profile, so local users do not need any
 config for the current flow. To make the split explicit:
@@ -147,15 +147,53 @@ over SSH, so the client speaks the same IPC through `cued gateway --stdio`.
 Remote daemon startup still stays explicit: `cue` will **not** run
 `start_command` for you.
 
-### Server retention config
+`cue` can also dispatch external CLI extensions from `client.toml`:
 
-`server.toml` can now cap persisted job/script history:
+```toml
+[extensions.commands.foo]
+command = "cue-foo"
+description = "Foo extension"
+```
+
+`command` is the executable path/name; extension arguments come from the `cue foo ...`
+invocation. Then `cue foo arg` runs `cue-foo arg`. Built-in subcommands such as
+`tui`, `help`, and `version` take precedence. Optional PATH lookup for unknown
+`cue-<name>` binaries can be enabled explicitly:
+
+```toml
+[extensions]
+path_lookup = true
+```
+
+### Server runtime config
+
+`server.toml` can cap persisted job/script history:
 
 ```toml
 [retention]
 max_job_history = 200
 max_script_runs = 100
 ```
+
+It can also enable a runtime wrapper such as `rtk`. Wrapping is allowlist-only:
+commands not listed under `[wrapper.allowlist]` are never wrapped, and an empty
+allowlist wraps nothing.
+Legacy `[wrapper.denylist]` config is rejected with a migration error because
+the old "wrap everything except..." behavior cannot be safely converted.
+
+```toml
+[wrapper]
+enabled = true
+binary = "rtk"
+
+[wrapper.allowlist]
+commands = ["cargo", "git", "pnpm", "node"]
+```
+
+`:wrap on/off/status` overrides only the session-level enablement. Per-command
+mode params such as `:run(wrapper=false) cargo test` and cron params such as
+`:cron(wrapper=true) every 5m cargo test` override enablement for that
+invocation, but still must match the allowlist.
 
 Typical remote flow:
 

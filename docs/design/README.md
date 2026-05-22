@@ -77,7 +77,7 @@ Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless o
 ```
 
 Parenthesized `key=value` pairs immediately after the command name configure
-execution behavior. They override `config.toml` defaults. Only launcher-style
+execution behavior. They override `server.toml` defaults. Only launcher-style
 commands support mode params: `:run`, `:cron`, `:scope new`.
 
 ## Scope Model
@@ -127,6 +127,7 @@ Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default sc
 |---|---|
 | [competitive-landscape.md](../research/competitive-landscape.md) | Competitive analysis of shells, TUIs, process managers |
 | [syntax-decisions.md](../research/syntax-decisions.md) | Prefix syntax selection process and cron grammar design |
+| [extensions-and-wrappers.md](../research/extensions-and-wrappers.md) | CLI extension registry and runtime wrapper design notes |
 
 ## Tech Stack
 

@@ -13,13 +13,12 @@ operations.
 
 ### Objects
 
-Stable job identities with an associated lifecycle state. See job types in
 Stable job identities with an associated lifecycle state. See [`core-types.md`](core-types.md) (§ Job / `JobStatus`).
 
 ### Morphisms
 
 **State transitions** — the daemon’s unidirectional job state machine
-(`transition: Job × Event → Job` in `cued/src/actor/scheduler.rs`):
+(`transition: Job × Event → Job` in `crates/cue-daemon/src/actor/scheduler.rs`):
 
 ```
                  ┌─────────┐
@@ -88,7 +87,7 @@ Deltas compose by overlay (right wins on keys, unset accumulates, last cwd wins)
 - **Immutable store**: scopes are not mutated in place — forking creates a new
   hash; HEAD moves, history does not rewrite.
 
-Implementation: `cued/src/actor/scope_store.rs`.
+Implementation: `crates/cue-daemon/src/actor/scope_store.rs`.
 
 ---
 

@@ -3708,6 +3708,7 @@ mod tests {
             start_scope: None,
             end_scope: None,
             open_hint: JobOpenHint::Fg,
+            warnings: Vec::new(),
         });
 
         state.activate_sidebar_row(0);

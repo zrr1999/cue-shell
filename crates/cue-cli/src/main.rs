@@ -1,11 +1,19 @@
 use anyhow::bail;
 use std::ffi::OsString;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "tui")]
+use anyhow::Context;
+#[cfg(feature = "tui")]
+use std::ffi::OsStr;
+#[cfg(feature = "tui")]
+use std::process::Command;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CueCommand {
     Help,
     Tui,
     Version,
+    Extension { name: String, args: Vec<OsString> },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -19,6 +27,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         CueCommand::Tui => run_tui(),
+        CueCommand::Extension { name, args } => run_extension(&name, &args),
     }
 }
 
@@ -45,7 +54,10 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cue
             }
             Ok(CueCommand::Tui)
         }
-        Some(other) => bail!("unknown cue subcommand `{other}`; supported: tui"),
+        Some(other) => Ok(CueCommand::Extension {
+            name: other.to_string(),
+            args: args.collect(),
+        }),
     }
 }
 
@@ -59,6 +71,45 @@ fn run_tui() -> anyhow::Result<()> {
     bail!("`cue tui` is unavailable because cue-cli was built without the `tui` feature")
 }
 
+#[cfg(feature = "tui")]
+fn run_extension(name: &str, args: &[OsString]) -> anyhow::Result<()> {
+    let config = cue_cli::config::Config::load()?;
+    if let Some(extension) = config.extensions.commands.get(name) {
+        return exec_extension_command(&extension.command, args);
+    }
+
+    if config.extensions.path_lookup
+        && let Some(command) = cue_cli::path_lookup::find_executable_on_path(&format!("cue-{name}"))
+    {
+        return exec_program(command.as_os_str(), args);
+    }
+
+    bail!("unknown cue subcommand `{name}`; supported: tui")
+}
+
+#[cfg(not(feature = "tui"))]
+fn run_extension(name: &str, _args: &[OsString]) -> anyhow::Result<()> {
+    bail!("unknown cue subcommand `{name}`; supported: tui")
+}
+
+#[cfg(feature = "tui")]
+fn exec_extension_command(command: &str, args: &[OsString]) -> anyhow::Result<()> {
+    let program = command.trim();
+    if program.is_empty() {
+        bail!("extension command is empty");
+    }
+    exec_program(OsStr::new(program), args)
+}
+
+#[cfg(feature = "tui")]
+fn exec_program(program: &OsStr, args: &[OsString]) -> anyhow::Result<()> {
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run extension `{}`", program.to_string_lossy()))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 fn print_help() {
     let tui_help = if cfg!(feature = "tui") {
         "  tui        Start the terminal UI (default)"
@@ -67,7 +118,7 @@ fn print_help() {
     };
 
     println!(
-        "cue {}\n\nUsage: cue [tui]\n       cue --version\n\nCommands:\n{tui_help}\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
+        "cue {}\n\nUsage: cue [tui]\n       cue <extension> [args...]\n       cue --version\n\nCommands:\n{tui_help}\n  <extension> Run a configured external command, or cue-<extension> when enabled\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -119,9 +170,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_command_rejects_unknown_subcommand() {
-        let error = parse_command([OsString::from("cue"), OsString::from("bogus")])
-            .expect_err("unknown command should fail");
-        assert!(format!("{error:#}").contains("unknown cue subcommand `bogus`"));
+    fn parse_command_treats_unknown_subcommand_as_extension() {
+        assert_eq!(
+            parse_command([
+                OsString::from("cue"),
+                OsString::from("foo"),
+                OsString::from("--bar"),
+            ])
+            .expect("parse command"),
+            CueCommand::Extension {
+                name: "foo".into(),
+                args: vec![OsString::from("--bar")],
+            }
+        );
     }
 }

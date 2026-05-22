@@ -182,7 +182,7 @@ CREATE TABLE jobs_history (
     exit_code    INTEGER
 );
 
--- Config overrides (mode param defaults from config.toml, cached)
+-- Config overrides (mode param defaults from server.toml, cached)
 CREATE TABLE config_cache (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -207,7 +207,9 @@ $XDG_STATE_HOME/cue-shell/    # default: ~/.local/state/cue-shell/
   cued.log                     # daemon log (tracing-appender, rotated)
 
 $XDG_CONFIG_HOME/cue-shell/   # default: ~/.config/cue-shell/
-  config.toml                  # user configuration
+  client.toml                  # client transport/profile and CLI extensions
+  server.toml                  # daemon runtime configuration
+  config.toml                  # legacy combined configuration fallback
 ```
 
 macOS fallback: `$XDG_*` vars respected if set, otherwise:
@@ -285,7 +287,7 @@ When TUI/CLI tries to connect and finds no socket:
 ## 9. Observability
 
 - **tracing** crate with `tracing-subscriber` (fmt layer + file appender)
-- Log levels via `RUST_LOG` env var or `config.toml`
+- Log levels via `RUST_LOG`
 - Default: `cued=info,cue_core=info`
 - Debug mode: `cued=debug,cue_core=debug` (verbose Actor message tracing)
 - Log rotation: `tracing-appender` daily rotation, keep last 7 files
@@ -297,5 +299,5 @@ Design space for future extensions (not v1):
 - **WASM plugins** (like Zellij) — sandboxed, safe, cross-platform
 - Extensions get their own Actor with a constrained message interface
 - Resource limits via WASM fuel metering
-- Extension manifest in config.toml
+- CLI extension registry in `client.toml`
 - This is why we chose multi-threaded tokio — extensions may be CPU-intensive

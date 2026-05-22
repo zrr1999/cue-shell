@@ -103,6 +103,37 @@ impl Pipeline {
     }
 }
 
+/// Return true when a command is likely to need immediate foreground/TTY use.
+pub fn command_prefers_foreground(command_line: &[String]) -> bool {
+    let Some(command_word) = command_line.first() else {
+        return false;
+    };
+    let command = std::path::Path::new(command_word)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command_word.as_str());
+    let args: Vec<&str> = command_line.iter().skip(1).map(String::as_str).collect();
+
+    match command {
+        "vim" | "nvim" | "vi" | "nano" | "less" | "more" | "man" | "top" | "htop" | "watch"
+        | "fzf" | "tig" | "lazygit" | "tmux" | "zellij" => true,
+        "bash" | "zsh" | "sh" | "fish" => {
+            args.is_empty()
+                || args.contains(&"-i")
+                || args.contains(&"--interactive")
+                || args.contains(&"-l")
+        }
+        "python" | "python3" | "node" | "ipython" | "bpython" | "irb" => {
+            args.is_empty()
+                || args
+                    .first()
+                    .is_some_and(|arg| matches!(*arg, "-i" | "--interactive"))
+        }
+        "ssh" | "psql" | "mysql" | "sqlite3" => true,
+        _ => false,
+    }
+}
+
 impl JobPlan {
     pub fn simple(command: Vec<String>) -> Self {
         Self::Pipeline(Pipeline::simple(command))
@@ -174,5 +205,30 @@ mod tests {
             }),
         };
         assert_eq!(chain.leaf_count(), 3);
+    }
+
+    #[test]
+    fn foreground_command_detection() {
+        assert!(command_prefers_foreground(&[
+            "vim".into(),
+            "src/main.rs".into()
+        ]));
+        assert!(command_prefers_foreground(&[
+            "/usr/bin/ssh".into(),
+            "host".into()
+        ]));
+        assert!(command_prefers_foreground(&["python".into()]));
+        assert!(command_prefers_foreground(&[
+            "bash".into(),
+            "--interactive".into(),
+        ]));
+        assert!(!command_prefers_foreground(&[
+            "cargo".into(),
+            "test".into(),
+        ]));
+        assert!(!command_prefers_foreground(&[
+            "python".into(),
+            "script.py".into(),
+        ]));
     }
 }
