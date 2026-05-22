@@ -1,11 +1,11 @@
 use anyhow::bail;
 use std::ffi::OsString;
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "extensions")]
 use anyhow::Context;
-#[cfg(feature = "tui")]
+#[cfg(feature = "extensions")]
 use std::ffi::OsStr;
-#[cfg(feature = "tui")]
+#[cfg(feature = "extensions")]
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +71,7 @@ fn run_tui() -> anyhow::Result<()> {
     bail!("`cue tui` is unavailable because cue-cli was built without the `tui` feature")
 }
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "extensions")]
 fn run_extension(name: &str, args: &[OsString]) -> anyhow::Result<()> {
     let config = cue_cli::config::Config::load()?;
     if let Some(extension) = config.extensions.commands.get(name) {
@@ -84,15 +84,21 @@ fn run_extension(name: &str, args: &[OsString]) -> anyhow::Result<()> {
         return exec_program(command.as_os_str(), args);
     }
 
-    bail!("unknown cue subcommand `{name}`; supported: tui")
+    bail!(
+        "unknown cue subcommand `{name}`; supported: {}",
+        supported_subcommands()
+    )
 }
 
-#[cfg(not(feature = "tui"))]
+#[cfg(not(feature = "extensions"))]
 fn run_extension(name: &str, _args: &[OsString]) -> anyhow::Result<()> {
-    bail!("unknown cue subcommand `{name}`; supported: tui")
+    bail!(
+        "unknown cue subcommand `{name}`; supported: {} (external extensions unavailable in this build)",
+        supported_subcommands()
+    )
 }
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "extensions")]
 fn exec_extension_command(command: &str, args: &[OsString]) -> anyhow::Result<()> {
     let program = command.trim();
     if program.is_empty() {
@@ -101,7 +107,7 @@ fn exec_extension_command(command: &str, args: &[OsString]) -> anyhow::Result<()
     exec_program(OsStr::new(program), args)
 }
 
-#[cfg(feature = "tui")]
+#[cfg(feature = "extensions")]
 fn exec_program(program: &OsStr, args: &[OsString]) -> anyhow::Result<()> {
     let status = Command::new(program)
         .args(args)
@@ -111,16 +117,38 @@ fn exec_program(program: &OsStr, args: &[OsString]) -> anyhow::Result<()> {
 }
 
 fn print_help() {
+    println!("{}", help_text());
+}
+
+fn help_text() -> String {
     let tui_help = if cfg!(feature = "tui") {
         "  tui        Start the terminal UI (default)"
     } else {
         "  tui        Unavailable in this build (enable the `tui` feature)"
     };
+    let extension_usage = if cfg!(feature = "extensions") {
+        "\n       cue <extension> [args...]"
+    } else {
+        ""
+    };
+    let extension_help = if cfg!(feature = "extensions") {
+        "\n  <extension> Run a configured external command, or cue-<extension> when enabled"
+    } else {
+        ""
+    };
 
-    println!(
-        "cue {}\n\nUsage: cue [tui]\n       cue <extension> [args...]\n       cue --version\n\nCommands:\n{tui_help}\n  <extension> Run a configured external command, or cue-<extension> when enabled\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
-        env!("CARGO_PKG_VERSION")
-    );
+    format!(
+        "cue {}\n\nUsage: cue [tui]{extension_usage}\n       cue --version\n\nCommands:\n{tui_help}{extension_help}\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn supported_subcommands() -> &'static str {
+    if cfg!(feature = "tui") {
+        "tui, help, version"
+    } else {
+        "help, version"
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +211,20 @@ mod tests {
                 args: vec![OsString::from("--bar")],
             }
         );
+    }
+
+    #[test]
+    fn help_text_matches_enabled_features() {
+        let text = help_text();
+        if cfg!(feature = "extensions") {
+            assert!(text.contains("cue <extension> [args...]"));
+        } else {
+            assert!(!text.contains("cue <extension> [args...]"));
+        }
+        if cfg!(feature = "tui") {
+            assert!(text.contains("Start the terminal UI"));
+        } else {
+            assert!(text.contains("Unavailable in this build"));
+        }
     }
 }

@@ -1,6 +1,6 @@
-#[cfg(feature = "tui")]
+#[cfg(any(feature = "extensions", feature = "tui"))]
 pub mod config;
-#[cfg(feature = "tui")]
+#[cfg(any(feature = "extensions", feature = "tui"))]
 pub mod path_lookup;
 #[cfg(feature = "tui")]
 mod tui;

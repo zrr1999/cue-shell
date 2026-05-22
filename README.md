@@ -43,7 +43,7 @@ crates/
 ├── cue-client/ — Client connection stack shared by frontends
 ├── cue-daemon/ — Background daemon implementation library used by the `cued` CLI
 ├── cue-tui/    — Optional TUI extension mounted as the `cue tui` subcommand
-├── cue-cli/    — CLI entry crate; builds `cue` and `cued` via `tui`/`daemon`
+├── cue-cli/    — CLI entry crate; builds `cue` and `cued` via `extensions`/`tui`/`daemon`
 ```
 
 ## Installation
@@ -147,7 +147,8 @@ over SSH, so the client speaks the same IPC through `cued gateway --stdio`.
 Remote daemon startup still stays explicit: `cue` will **not** run
 `start_command` for you.
 
-`cue` can also dispatch external CLI extensions from `client.toml`:
+`cue` can also dispatch external CLI extensions from `client.toml`. This is
+enabled by the default `cue-cli` `extensions` Cargo feature:
 
 ```toml
 [extensions.commands.foo]
