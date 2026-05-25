@@ -14,7 +14,7 @@ pub enum ParamValue {
 
 /// Mode parameters extracted from `:cmd(k=v, ...)` syntax.
 ///
-/// Per-invocation overrides merged with config.toml defaults by the Resolver.
+/// Per-invocation overrides merged with server.toml defaults by the Resolver.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModeParams {
     pub params: BTreeMap<String, ParamValue>,
@@ -75,6 +75,25 @@ impl ModeParams {
         match self.get("wrapper") {
             Some(ParamValue::Bool(b)) => Some(*b),
             _ => None,
+        }
+    }
+
+    /// Whether `:run` may apply scope-transform leaves (`cd`, `env set`) to
+    /// the chain scope. Defaults to false when unspecified.
+    pub fn scope(&self) -> Option<bool> {
+        match self.get("scope") {
+            Some(ParamValue::Bool(b)) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Whether to allocate a PTY for the spawned command.
+    /// Defaults to `true` (PTY). Set `pty=false` for non-interactive
+    /// commands that should run with plain pipes.
+    pub fn pty_enabled(&self) -> bool {
+        match self.get("pty") {
+            Some(ParamValue::Bool(b)) => *b,
+            _ => true, // default: PTY on
         }
     }
 }

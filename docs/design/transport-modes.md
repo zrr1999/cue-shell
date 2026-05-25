@@ -157,7 +157,7 @@ Client                         cued (HTTP gateway)
 
 ```rust
 // Server side — add to cued alongside gateway.rs
-// crates/cued/src/actor/gateway_ws.rs
+// crates/cue-daemon/src/actor/gateway_ws.rs
 
 use axum::{Router, extract::ws::{WebSocket, WebSocketUpgrade}, routing::get};
 use tokio::io::duplex;
@@ -233,7 +233,7 @@ url = "ws://192.168.1.10:8765/ws"   # or wss:// for TLS
 Daemon side (`cued` config):
 
 ```toml
-# ~/.config/cue-shell/daemon.toml
+# ~/.config/cue-shell/server.toml
 
 [http_gateway]
 enabled = true
@@ -601,7 +601,7 @@ transport to point at the intermediate `cued`. No new client config needed.
 **Daemon-side** — `cued` in relay mode:
 
 ```toml
-# ~/.config/cue-shell/daemon.toml  (on the relay node)
+# ~/.config/cue-shell/server.toml  (on the relay node)
 
 [relay]
 enabled = true
@@ -623,7 +623,7 @@ cued relay --upstream ssh://prod-server
 
 ### 3.5 Implementation Steps
 
-1. **Add `cued relay` subcommand** in `cued/src/main.rs` (analogous to
+1. **Add `cued relay` subcommand** in `crates/cue-cli/src/bin/cued.rs` (analogous to
    `cued gateway --stdio`):
    - Accept a Unix socket connection
    - Connect to upstream (Unix or SSH using the SSH connector from Mode 2)
@@ -668,9 +668,9 @@ pub async fn run_relay(stdin: impl AsyncRead, stdout: impl AsyncWrite, upstream:
 | HTTP/WS   | `Authorization: Bearer <token>` on WS upgrade  | Token in daemon config; TLS strongly advised |
 | Chain     | Auth at each hop                               | SSH on the relay-to-upstream leg           |
 
-For HTTP, the token should be a random 256-bit hex string stored in
-`~/.config/cue-shell/daemon.toml` with `chmod 600`. Clients read it from the
-same profile config file.
+For HTTP, the token should be a random 256-bit hex string. The daemon stores
+accepted token material in `~/.config/cue-shell/server.toml` with `chmod 600`;
+clients reference the matching token from their `client.toml` transport profile.
 
 ### TLS
 

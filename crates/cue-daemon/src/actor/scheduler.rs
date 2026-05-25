@@ -12,20 +12,21 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use cue_core::command_spec::{COMMAND_SPECS, CommandCategory, CommandSpec, command_spec};
 use cue_core::cron::{
     CronPreset, CronSchedule, CronStatus, DayFilter, Weekday, parse_day_filter, parse_time_of_day,
 };
 use cue_core::ipc::{
-    ChainInfo, ChainJobInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload,
-    ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptSubmitError, error_code,
+    ChainInfo, ChainJobInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, PageInfo,
+    ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptSubmitError, StreamText, error_code,
 };
 use cue_core::job::{CancelReason, JobStatus};
 use cue_core::mode::Mode;
-use cue_core::pipeline::{ChainNode, ParallelOp, SerialOp};
+use cue_core::pipeline::{ChainNode, ParallelOp, SerialOp, command_prefers_foreground};
 use cue_core::scope::EnvSnapshot;
 use cue_core::{ChainId, CronId, JobId, ScopeHash, ScriptId};
 
-use crate::config::Config;
+use crate::config::{BlockDecision, Config};
 use crate::parser::parse::Parser as CueParser;
 use crate::parser::resolver::{ResolvedCommand, Resolver};
 use crate::parser::token::Token;
@@ -78,16 +79,20 @@ struct ChainState {
     pipeline_text: String,
     /// Explicit working directory override for all jobs in this chain.
     cwd_override: Option<std::path::PathBuf>,
+    /// Whether scope-transform leaves may derive a new scope for later leaves.
+    scope_enabled: bool,
     /// Whether the wrapper binary is enabled for this chain's jobs.
     wrapper_enabled: bool,
+    /// Whether to allocate a PTY for spawned leaf commands.
+    pty_enabled: bool,
 }
 
 /// Flattened representation of a chain leaf for easy lookup.
 struct FlatLeaf {
     /// Index in the DFS-order leaf list.
     index: usize,
-    /// Full pipeline (may be multi-segment with pipe operators).
-    pipeline: cue_core::pipeline::Pipeline,
+    /// Full job plan.
+    plan: cue_core::pipeline::JobPlan,
     /// Human-readable pipeline text.
     pipeline_text: String,
 }
@@ -95,11 +100,7 @@ struct FlatLeaf {
 impl FlatLeaf {
     /// First segment's command words (for scope-transform detection and open hint).
     fn command(&self) -> &[String] {
-        self.pipeline
-            .segments
-            .first()
-            .map(|s| s.command.as_slice())
-            .unwrap_or(&[])
+        self.plan.first_command()
     }
 }
 
@@ -132,6 +133,10 @@ struct CronEntry {
     next_trigger: Instant,
     /// Explicit working directory override for jobs spawned by this cron.
     cwd_override: Option<std::path::PathBuf>,
+    /// Whether scope-transform leaves may derive a new scope for later leaves.
+    scope_enabled: bool,
+    /// Whether the wrapper binary is enabled for jobs spawned by this cron.
+    wrapper_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -283,7 +288,7 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
                         SchedulerMsg::Shutdown => {
                             debug!("scheduler: shutting down");
 
-                            // FIX 4: Cancel all active chain jobs before shutting down.
+                            // Cancel all active chain jobs before shutting down.
                             let chain_ids: Vec<ChainId> =
                                 state.chains.keys().copied().collect();
                             for chain_id in chain_ids {
@@ -463,6 +468,8 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
                 status,
                 scope_hash: cron.scope_hash,
                 cwd_override: cron.cwd_override.clone(),
+                scope_enabled: cron.scope_enabled,
+                wrapper_enabled: cron.wrapper_enabled,
                 age_secs: cron.age_secs,
             };
             if let Err(e) =
@@ -492,6 +499,8 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
                 status,
                 next_trigger,
                 cwd_override: cron.cwd_override,
+                scope_enabled: cron.scope_enabled,
+                wrapper_enabled: cron.wrapper_enabled,
             },
         );
     }
@@ -598,6 +607,8 @@ fn persist_cron_entry(db: &storage::SharedConnection, entry: &CronEntry) {
             status: entry.status,
             scope_hash: Some(entry.scope_hash),
             cwd_override: entry.cwd_override.clone(),
+            scope_enabled: entry.scope_enabled,
+            wrapper_enabled: entry.wrapper_enabled,
             age_secs: 0,
         },
     );
@@ -671,12 +682,12 @@ fn flatten_leaves(node: &ChainNode) -> Vec<FlatLeaf> {
 
 fn flatten_leaves_inner(node: &ChainNode, out: &mut Vec<FlatLeaf>) {
     match node {
-        ChainNode::Leaf(pipeline) => {
+        ChainNode::Leaf(plan) => {
             let idx = out.len();
-            let pipeline_text = pipeline_to_text(pipeline);
+            let pipeline_text = job_plan_to_text(plan);
             out.push(FlatLeaf {
                 index: idx,
-                pipeline: pipeline.clone(),
+                plan: plan.clone(),
                 pipeline_text,
             });
         }
@@ -705,10 +716,22 @@ fn pipeline_to_text(pipeline: &cue_core::pipeline::Pipeline) -> String {
         .join(" ")
 }
 
+fn job_plan_to_text(plan: &cue_core::pipeline::JobPlan) -> String {
+    match plan {
+        cue_core::pipeline::JobPlan::Pipeline(pipeline) => pipeline_to_text(pipeline),
+        cue_core::pipeline::JobPlan::And { left, right } => {
+            format!("{} && {}", job_plan_to_text(left), job_plan_to_text(right))
+        }
+        cue_core::pipeline::JobPlan::Or { left, right } => {
+            format!("{} || {}", job_plan_to_text(left), job_plan_to_text(right))
+        }
+    }
+}
+
 /// Convert a full `ChainNode` to text.
 fn chain_to_text(node: &ChainNode) -> String {
     match node {
-        ChainNode::Leaf(p) => pipeline_to_text(p),
+        ChainNode::Leaf(plan) => job_plan_to_text(plan),
         ChainNode::Serial { left, op, right } => {
             let op_str = match op {
                 SerialOp::Then => "->",
@@ -718,8 +741,8 @@ fn chain_to_text(node: &ChainNode) -> String {
         }
         ChainNode::Parallel { left, op, right } => {
             let op_str = match op {
-                ParallelOp::All => "||",
-                ParallelOp::Race => "||?",
+                ParallelOp::All => "|||",
+                ParallelOp::Race => "|?|",
             };
             format!("{} {op_str} {}", chain_to_text(left), chain_to_text(right))
         }
@@ -830,7 +853,7 @@ fn advance_inner(
                 advance_inner(right, right_offset, finished_idx, statuses, ready, cancel);
             }
 
-            // FIX 3: For Race, check entire branch success (subtree terminal + all ok),
+            // For Race, check entire branch success (subtree terminal + all ok),
             // not individual leaf success.
             if *op == ParallelOp::Race {
                 let right_count = leaf_count(right);
@@ -1450,9 +1473,29 @@ fn scope_transform_from_pipeline(
     Ok(found)
 }
 
+fn scope_transform_from_job_plan(
+    plan: &cue_core::pipeline::JobPlan,
+) -> Result<Option<ScopeTransform>, String> {
+    match plan {
+        cue_core::pipeline::JobPlan::Pipeline(pipeline) => scope_transform_from_pipeline(pipeline),
+        cue_core::pipeline::JobPlan::And { left, right }
+        | cue_core::pipeline::JobPlan::Or { left, right } => {
+            let left_transform = scope_transform_from_job_plan(left)?;
+            let right_transform = scope_transform_from_job_plan(right)?;
+            if left_transform.is_some() || right_transform.is_some() {
+                return Err(
+                    "scope-transform steps are not supported inside job-local &&/|| expressions yet"
+                        .into(),
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
 fn subtree_contains_scope_transform(node: &ChainNode) -> Result<bool, String> {
     match node {
-        ChainNode::Leaf(pipeline) => Ok(scope_transform_from_pipeline(pipeline)?.is_some()),
+        ChainNode::Leaf(plan) => Ok(scope_transform_from_job_plan(plan)?.is_some()),
         ChainNode::Serial { left, right, .. } | ChainNode::Parallel { left, right, .. } => {
             Ok(subtree_contains_scope_transform(left)? || subtree_contains_scope_transform(right)?)
         }
@@ -1461,8 +1504,8 @@ fn subtree_contains_scope_transform(node: &ChainNode) -> Result<bool, String> {
 
 fn validate_scope_transform_support(node: &ChainNode) -> Result<(), String> {
     match node {
-        ChainNode::Leaf(pipeline) => {
-            let _ = scope_transform_from_pipeline(pipeline)?;
+        ChainNode::Leaf(plan) => {
+            let _ = scope_transform_from_job_plan(plan)?;
             Ok(())
         }
         ChainNode::Serial { left, right, .. } => {
@@ -1589,43 +1632,15 @@ async fn apply_scope_transform(
     derive_scope(sys, start_scope, delta).await
 }
 
-fn classify_job_open_hint(pipeline: &cue_core::pipeline::Pipeline) -> JobOpenHint {
-    if pipeline.segments.len() != 1 {
-        return JobOpenHint::Stream;
-    }
-    let command_line = &pipeline.segments[0].command;
-    let Some(command_word) = command_line.first() else {
-        return JobOpenHint::Stream;
-    };
-    let command = std::path::Path::new(command_word)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(command_word.as_str());
-    let args: Vec<&str> = command_line.iter().skip(1).map(String::as_str).collect();
-
-    let prefers_fg = match command {
-        "vim" | "nvim" | "vi" | "nano" | "less" | "more" | "man" | "top" | "htop" | "watch"
-        | "fzf" | "tig" | "lazygit" | "tmux" | "zellij" => true,
-        "bash" | "zsh" | "sh" | "fish" => {
-            args.is_empty()
-                || args.contains(&"-i")
-                || args.contains(&"--interactive")
-                || args.contains(&"-l")
+fn classify_job_plan_open_hint(plan: &cue_core::pipeline::JobPlan) -> JobOpenHint {
+    match plan {
+        cue_core::pipeline::JobPlan::Pipeline(pipeline)
+            if pipeline.segments.len() == 1
+                && command_prefers_foreground(&pipeline.segments[0].command) =>
+        {
+            JobOpenHint::Fg
         }
-        "python" | "python3" | "node" | "ipython" | "bpython" | "irb" => {
-            args.is_empty()
-                || args
-                    .first()
-                    .is_some_and(|arg| matches!(*arg, "-i" | "--interactive"))
-        }
-        "ssh" | "psql" | "mysql" | "sqlite3" => true,
-        _ => false,
-    };
-
-    if prefers_fg {
-        JobOpenHint::Fg
-    } else {
-        JobOpenHint::Stream
+        _ => JobOpenHint::Stream,
     }
 }
 
@@ -1818,23 +1833,27 @@ async fn fire_due_crons(
         let schedule = entry.schedule.clone();
         let is_oneshot = schedule.is_oneshot();
         let cwd_override = entry.cwd_override.clone();
+        let scope_enabled = entry.scope_enabled;
+        let wrapper_enabled = entry.wrapper_enabled;
 
         info!(%cron_id, "scheduler: cron triggered");
 
         // Spawn the chain just like `:run`.
-        let wrapper_enabled = state.wrapper_enabled(&sys.config);
         let response = spawn_chain(
             chain,
             scope_hash,
             0,
             0,
             cwd_override,
+            scope_enabled,
             wrapper_enabled,
+            true,
             0,
             None,
             state,
             db,
             sys,
+            Vec::new(),
         )
         .await;
         let first_job_id = match &response {
@@ -1874,16 +1893,22 @@ async fn fire_due_crons(
 // ── Spawn chain / single job ────────────────────────────────────────────────
 
 /// Check whether any pipeline in the chain contains blocked command patterns.
-fn check_chain_blocked(chain: &ChainNode, config: &Config) -> Option<String> {
+/// Warn-only rules are returned as advisory messages and do not prevent execution.
+fn check_chain_guardrails(chain: &ChainNode, config: &Config) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
     let leaves = flatten_leaves(chain);
     for leaf in &leaves {
-        for segment in &leaf.pipeline.segments {
-            if let Some(reason) = config.block.check(&segment.command) {
-                return Some(reason);
+        for pipeline in leaf.plan.pipelines() {
+            for segment in &pipeline.segments {
+                match config.block.check(&segment.command) {
+                    Some(BlockDecision::Block(reason)) => return Err(reason),
+                    Some(BlockDecision::Warn(hint)) => warnings.push(hint),
+                    None => {}
+                }
             }
         }
     }
-    None
+    Ok(warnings)
 }
 
 /// Spawn a chain (or a single job) from a `ChainNode`, returning the response payload.
@@ -1894,14 +1919,17 @@ async fn spawn_chain(
     _client_id: u64,
     _request_id: u32,
     cwd_override: Option<std::path::PathBuf>,
+    scope_enabled: bool,
     wrapper_enabled: bool,
+    pty_enabled: bool,
     retry_max: u32,
     retry_delay: Option<std::time::Duration>,
     state: &mut SchedulerState,
     db: &Arc<Mutex<Connection>>,
     sys: &ActorSystem,
+    warnings: Vec<String>,
 ) -> ResponsePayload {
-    if let Err(message) = validate_scope_transform_support(&chain) {
+    if scope_enabled && let Err(message) = validate_scope_transform_support(&chain) {
         return ResponsePayload::err(error_code::INVALID_SYNTAX, message);
     }
 
@@ -1910,7 +1938,7 @@ async fn spawn_chain(
     if leaves.len() == 1 {
         let leaf = &leaves[0];
         let jid = state.alloc_job();
-        let open_hint = classify_job_open_hint(&leaf.pipeline);
+        let open_hint = classify_job_plan_open_hint(&leaf.plan);
 
         state.jobs.insert(
             jid,
@@ -1930,7 +1958,10 @@ async fn spawn_chain(
 
         publish_job_created(sys, state, jid, &leaf.pipeline_text, scope_hash, open_hint).await;
 
-        match scope_transform_from_command(leaf.command()) {
+        match scope_enabled
+            .then(|| scope_transform_from_command(leaf.command()))
+            .transpose()
+        {
             Ok(Some(_)) => {
                 info!(%jid, pipeline = %leaf.pipeline_text, "scheduler: applying single scope-transform job");
                 match apply_scope_transform(sys, scope_hash, leaf.command()).await {
@@ -1973,10 +2004,11 @@ async fn spawn_chain(
                     .process_mgr
                     .send(ProcessMgrMsg::SpawnJob {
                         job_id: jid,
-                        pipeline: leaf.pipeline.clone(),
+                        plan: leaf.plan.clone(),
                         scope_hash,
                         cwd_override: cwd_override.clone(),
                         wrapper_enabled,
+                        pty_enabled,
                     })
                     .await;
             }
@@ -2005,6 +2037,7 @@ async fn spawn_chain(
             chain_id: None,
             chain_index: None,
             chain_total: None,
+            warnings,
         });
     }
 
@@ -2027,7 +2060,9 @@ async fn spawn_chain(
         scope_hash,
         pipeline_text: chain_text,
         cwd_override: cwd_override.clone(),
+        scope_enabled,
         wrapper_enabled,
+        pty_enabled,
     };
     state.chains.insert(chain_id, chain_state);
 
@@ -2051,6 +2086,7 @@ async fn spawn_chain(
         chain_id: chain_id.to_string(),
         job_ids: spawned_job_ids.iter().map(|j| j.to_string()).collect(),
         chain: build_chain_info(state, chain_id).expect("chain info after creation"),
+        warnings,
     })
 }
 
@@ -2118,11 +2154,16 @@ async fn process_chain_advance(
 ) -> Vec<JobId> {
     cancel_chain_leaves(chain_id, to_cancel, state, db, sys).await;
 
-    let (leaves, wrapper_enabled) = {
+    let (leaves, wrapper_enabled, scope_enabled, pty_enabled) = {
         let Some(chain) = state.chains.get(&chain_id) else {
             return Vec::new();
         };
-        (flatten_leaves(&chain.node), chain.wrapper_enabled)
+        (
+            flatten_leaves(&chain.node),
+            chain.wrapper_enabled,
+            chain.scope_enabled,
+            chain.pty_enabled,
+        )
     };
 
     let mut queue: VecDeque<(usize, ScopeHash)> = newly_ready.into();
@@ -2130,7 +2171,7 @@ async fn process_chain_advance(
 
     while let Some((idx, start_scope)) = queue.pop_front() {
         let jid = state.alloc_job();
-        let open_hint = classify_job_open_hint(&leaves[idx].pipeline);
+        let open_hint = classify_job_plan_open_hint(&leaves[idx].plan);
         if captured.len() < capture_first {
             captured.push(jid);
         }
@@ -2170,7 +2211,10 @@ async fn process_chain_advance(
         )
         .await;
 
-        match scope_transform_from_command(leaves[idx].command()) {
+        match scope_enabled
+            .then(|| scope_transform_from_command(leaves[idx].command()))
+            .transpose()
+        {
             Ok(Some(_)) => {
                 match apply_scope_transform(sys, start_scope, leaves[idx].command()).await {
                     Ok(end_scope) => {
@@ -2219,10 +2263,11 @@ async fn process_chain_advance(
                     .process_mgr
                     .send(ProcessMgrMsg::SpawnJob {
                         job_id: jid,
-                        pipeline: leaves[idx].pipeline.clone(),
+                        plan: leaves[idx].plan.clone(),
                         scope_hash: start_scope,
                         cwd_override: cwd_override.clone(),
                         wrapper_enabled,
+                        pty_enabled,
                     })
                     .await;
             }
@@ -2370,12 +2415,16 @@ async fn handle_command(
                 Ok(h) => h,
                 Err(resp) => return resp,
             };
-            // Check block rules before executing.
-            if let Some(reason) = check_chain_blocked(&chain, config) {
-                return ResponsePayload::err(error_code::BLOCKED, reason);
-            }
+            let warnings = match check_chain_guardrails(&chain, config) {
+                Ok(warnings) => warnings,
+                Err(reason) => return ResponsePayload::err(error_code::BLOCKED, reason),
+            };
             let cwd_override = params.cwd();
-            let wrapper_enabled = state.wrapper_enabled(config);
+            let scope_enabled = params.scope().unwrap_or(false);
+            let wrapper_enabled = params
+                .wrapper_enabled()
+                .unwrap_or_else(|| state.wrapper_enabled(config));
+            let pty_enabled = params.pty_enabled();
             let retry_max = params.retry().unwrap_or(0);
             let retry_delay = params.retry_delay();
             spawn_chain(
@@ -2384,12 +2433,15 @@ async fn handle_command(
                 0,
                 0,
                 cwd_override,
+                scope_enabled,
                 wrapper_enabled,
+                pty_enabled,
                 retry_max,
                 retry_delay,
                 state,
                 db,
                 sys,
+                warnings,
             )
             .await
         }
@@ -2423,6 +2475,10 @@ async fn handle_command(
                 status: CronStatus::Scheduled,
                 next_trigger,
                 cwd_override: params.cwd(),
+                scope_enabled: params.scope().unwrap_or(false),
+                wrapper_enabled: params
+                    .wrapper_enabled()
+                    .unwrap_or_else(|| state.wrapper_enabled(config)),
             };
             persist_cron_entry(db, &entry);
             state.crons.insert(cron_id, entry);
@@ -2537,6 +2593,77 @@ async fn handle_command(
             }
         }
 
+        ResolvedCommand::KillJob { id } => {
+            let Some(jid) = parse_job_id(&id) else {
+                return ResponsePayload::err(
+                    error_code::NOT_SUPPORTED,
+                    "KillJob only supports job IDs (J<n>)",
+                );
+            };
+            let status = state.jobs.get(&jid).map(|entry| entry.status.clone());
+            match status {
+                Some(JobStatus::Running) => {
+                    let _ = sys
+                        .process_mgr
+                        .send(ProcessMgrMsg::KillJob { job_id: jid })
+                        .await;
+                    info!(%jid, "scheduler: job killed");
+                    if let Some((chain_id, ready_queue, to_cancel)) = set_job_terminal_state(
+                        jid,
+                        TerminalStateUpdate {
+                            status: JobStatus::Killed,
+                            exit_code: -1,
+                            end_scope: None,
+                            advance_chain: true,
+                        },
+                        state,
+                        db,
+                        sys,
+                    )
+                    .await
+                    {
+                        let cwd_override = state
+                            .chains
+                            .get(&chain_id)
+                            .and_then(|c| c.cwd_override.clone());
+                        process_chain_advance(
+                            chain_id,
+                            ready_queue,
+                            &to_cancel,
+                            0,
+                            cwd_override,
+                            state,
+                            db,
+                            sys,
+                        )
+                        .await;
+                    }
+                    ResponsePayload::ack()
+                }
+                Some(_) => ResponsePayload::err(
+                    error_code::INVALID_STATE,
+                    format!("job {jid} is not running"),
+                ),
+                None => ResponsePayload::err(error_code::NOT_FOUND, format!("job {id} not found")),
+            }
+        }
+
+        ResolvedCommand::RemoveCron { id } => {
+            let Some(cid) = parse_cron_id(&id) else {
+                return ResponsePayload::err(
+                    error_code::NOT_SUPPORTED,
+                    "RemoveCron only supports cron IDs (C<n>)",
+                );
+            };
+            if state.crons.remove(&cid).is_some() {
+                remove_cron_from_db(db, cid);
+                info!(%cid, "scheduler: cron removed");
+                ResponsePayload::ack()
+            } else {
+                ResponsePayload::err(error_code::NOT_FOUND, format!("cron {id} not found"))
+            }
+        }
+
         ResolvedCommand::Cancel { id } => {
             if let Some(jid) = parse_job_id(&id) {
                 let status = state.jobs.get(&jid).map(|entry| entry.status.clone());
@@ -2644,27 +2771,30 @@ async fn handle_command(
         }
 
         ResolvedCommand::Jobs => {
-            let mut list: Vec<JobInfo> = state.jobs.values().map(job_info_from_entry).collect();
-            list.sort_by_key(|job| parse_job_id(&job.id).map(|id| id.0).unwrap_or(u32::MAX));
+            let list = sorted_job_list(state);
             ResponsePayload::Ok(OkPayload::JobList(list))
         }
 
+        ResolvedCommand::ListJobs { limit } => {
+            let list = sorted_job_list(state);
+            let (jobs, page) = page_items(list, limit);
+            ResponsePayload::Ok(OkPayload::JobListPage { jobs, page })
+        }
+
         ResolvedCommand::Crons => {
-            let mut list: Vec<CronInfo> = state
-                .crons
-                .values()
-                .map(|c| CronInfo {
-                    id: c.cron_id.to_string(),
-                    schedule: c.schedule_text.clone(),
-                    command: chain_to_text(&c.chain),
-                    status: c.status,
-                })
-                .collect();
-            list.sort_by_key(|cron| parse_cron_id(&cron.id).map(|id| id.0).unwrap_or(u32::MAX));
+            let list = sorted_cron_list(state);
             ResponsePayload::Ok(OkPayload::CronList(list))
         }
 
+        ResolvedCommand::ListCrons { limit } => {
+            let list = sorted_cron_list(state);
+            let (crons, page) = page_items(list, limit);
+            ResponsePayload::Ok(OkPayload::CronListPage { crons, page })
+        }
+
         ResolvedCommand::Scopes => handle_list_scopes(sys).await,
+
+        ResolvedCommand::ListScopes { limit } => handle_list_scopes_page(sys, limit).await,
 
         ResolvedCommand::Env { subcommand } => {
             let snapshot = match get_head_snapshot(sys).await {
@@ -2721,6 +2851,16 @@ async fn handle_command(
             }
         }
 
+        ResolvedCommand::ShowEnv { tail_bytes } => {
+            let snapshot = match get_head_snapshot(sys).await {
+                Ok(snapshot) => snapshot,
+                Err(response) => return response,
+            };
+            let text = format_snapshot_env(&snapshot);
+            let (text, truncated) = limit_text(text, None, tail_bytes);
+            ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
+        }
+
         ResolvedCommand::Help { topic } => {
             let text = render_help_text(topic.as_deref());
             ResponsePayload::Ok(OkPayload::EvalText { text })
@@ -2763,7 +2903,7 @@ async fn handle_command(
                     } else {
                         "config"
                     };
-                    let mut lines = vec![
+                    let lines = [
                         format!(
                             "wrapper status: {}",
                             if effective { "enabled" } else { "disabled" }
@@ -2774,20 +2914,14 @@ async fn handle_command(
                         ),
                         format!("  source: {source}"),
                         format!(
-                            "  interactive bypass: {}",
-                            if config.wrapper.denylist.interactive {
-                                "enabled"
+                            "  allowlist: {}",
+                            if config.wrapper.allowlist.commands.is_empty() {
+                                "(empty; wraps nothing)".into()
                             } else {
-                                "disabled"
+                                config.wrapper.allowlist.commands.join(", ")
                             }
                         ),
                     ];
-                    if !config.wrapper.denylist.commands.is_empty() {
-                        lines.push(format!(
-                            "  denylist: {}",
-                            config.wrapper.denylist.commands.join(", ")
-                        ));
-                    }
                     ResponsePayload::Ok(OkPayload::EvalText {
                         text: lines.join("\n"),
                     })
@@ -2871,6 +3005,20 @@ async fn handle_command(
             read_job_stderr(sys, job_id, &id, crate::ring_buffer::DEFAULT_CAPACITY).await
         }
 
+        ResolvedCommand::JobOutput {
+            id,
+            stdout_bytes,
+            stderr_bytes,
+        } => {
+            let Some(job_id) = parse_job_id(&id) else {
+                return ResponsePayload::err(
+                    error_code::NOT_FOUND,
+                    format!("invalid job id: {id}"),
+                );
+            };
+            read_job_output_pair(sys, job_id, &id, stdout_bytes, stderr_bytes).await
+        }
+
         ResolvedCommand::Send { id, data } => {
             if let Some(job_id) = parse_job_id(&id) {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2946,12 +3094,15 @@ async fn handle_command(
                 0,
                 0,
                 None,
+                false,
                 wrapper_enabled,
+                true,
                 0,
                 None,
                 state,
                 db,
                 sys,
+                Vec::new(),
             )
             .await
         }
@@ -2964,6 +3115,16 @@ async fn handle_command(
         ResolvedCommand::Log { id } => {
             let text = format_log_text(state, id.as_deref());
             ResponsePayload::Ok(OkPayload::EvalText { text })
+        }
+
+        ResolvedCommand::ShowLog {
+            id,
+            limit,
+            tail_bytes,
+        } => {
+            let text = format_log_text(state, id.as_deref());
+            let (text, truncated) = limit_text(text, limit, tail_bytes);
+            ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
         }
 
         ResolvedCommand::Scope { subcommand } => {
@@ -2987,6 +3148,12 @@ async fn handle_command(
                 ),
             }
         }
+
+        ResolvedCommand::ShowConfig { tail_bytes } => {
+            let text = format_config_text(config);
+            let (text, truncated) = limit_text(text, None, tail_bytes);
+            ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
+        }
     }
 }
 
@@ -3008,6 +3175,7 @@ fn script_item_result_from_ok(payload: &OkPayload) -> ScriptItemResult {
             chain_id,
             job_ids,
             chain,
+            ..
         } => ScriptItemResult::Chain {
             chain_id: chain_id.clone(),
             job_ids: job_ids.clone(),
@@ -3248,9 +3416,9 @@ fn render_help_text(topic: Option<&str>) -> String {
         .map(|topic| topic.to_ascii_lowercase())
         .as_deref()
     {
-        None => general_help_text().into(),
-        Some(topic) if is_job_help_topic(topic) => job_help_text().into(),
-        Some(topic) if is_cron_help_topic(topic) => cron_help_text().into(),
+        None => general_help_text(),
+        Some(topic) if is_job_help_topic(topic) => job_help_text(),
+        Some(topic) if is_cron_help_topic(topic) => cron_help_text(),
         Some(topic) => format!(
             "Unknown help topic `{topic}`.\n\nAvailable help topics: job, cron.\nUse bare `?` to show detailed help for the current mode."
         ),
@@ -3258,85 +3426,132 @@ fn render_help_text(topic: Option<&str>) -> String {
 }
 
 fn is_job_help_topic(topic: &str) -> bool {
-    matches!(
-        topic,
-        "job"
-            | "jobs"
-            | "run"
-            | "out"
-            | "tail"
-            | "err"
-            | "fg"
-            | "wait"
-            | "retry"
-            | "scope"
-            | "scopes"
-            | "env"
-            | "cd"
-            | "log"
-    )
+    topic == "job"
+        || command_spec(topic).is_some_and(|spec| {
+            matches!(
+                spec.category,
+                CommandCategory::Job | CommandCategory::Scope | CommandCategory::System
+            )
+        })
 }
 
 fn is_cron_help_topic(topic: &str) -> bool {
-    matches!(topic, "cron" | "crons" | "pause" | "resume")
+    topic == "cron"
+        || command_spec(topic).is_some_and(|spec| spec.category == CommandCategory::Cron)
 }
 
-fn general_help_text() -> &'static str {
-    concat!(
-        "cue-shell help\n",
-        "\n",
-        "Modes:\n",
-        "- JOB: run shell commands and inspect output / scopes.\n",
-        "- CRON: define scheduled commands.\n",
-        "\n",
-        "Quick tips:\n",
-        "- Enter bare `?` to show detailed help for the current mode.\n",
-        "- Use `:help job` or `:help cron` for mode-specific help.\n",
-        "- Builtins start with `:` and are executed by `cued`.\n",
-        "- Modes only change how bare input is interpreted.\n"
+fn general_help_text() -> String {
+    format!(
+        concat!(
+            "cue-shell help\n",
+            "\n",
+            "Modes:\n",
+            "- JOB: run shell commands and inspect output / scopes.\n",
+            "- CRON: define scheduled commands.\n",
+            "\n",
+            "Quick tips:\n",
+            "- Enter bare `?` to show detailed help for the current mode.\n",
+            "- Use `:help job` or `:help cron` for mode-specific help.\n",
+            "- Builtins start with `:` and are executed by `cued`.\n",
+            "- Modes only change how bare input is interpreted.\n",
+            "\n",
+            "Builtins:\n",
+            "{}"
+        ),
+        format_command_list(COMMAND_SPECS)
     )
 }
 
-fn job_help_text() -> &'static str {
-    concat!(
-        "JOB mode\n",
-        "\n",
-        "Bare input runs a job using the current scope.\n",
-        "Examples:\n",
-        "- `cargo test`\n",
-        "- `git status -> cargo test`\n",
-        "- `cargo test || cargo clippy`\n",
-        "\n",
-        "Useful builtins:\n",
-        "- `:out J<n>` snapshot stdout\n",
-        "- `:tail J<n> [bytes]` follow live stdout\n",
-        "- `:err J<n>` inspect stderr / error output\n",
-        "- `:fg J<n>` attach an interactive job in the foreground\n",
-        "- `:wait J<n>` block until the job finishes\n",
-        "- `:retry J<n>` rerun from the original start scope\n",
-        "- `:env`, `:env set ...`, `:cd ...` inspect or update the persisted HEAD scope\n"
+fn job_help_text() -> String {
+    format!(
+        concat!(
+            "JOB mode\n",
+            "\n",
+            "Bare input runs a job using the current scope.\n",
+            "Examples:\n",
+            "- `cargo test`\n",
+            "- `git status -> cargo test`\n",
+            "- `cargo test ||| cargo clippy`\n",
+            "\n",
+            "Useful builtins:\n",
+            "{}"
+        ),
+        format_command_list_by_category(&[
+            CommandCategory::Job,
+            CommandCategory::Scope,
+            CommandCategory::System,
+        ])
     )
 }
 
-fn cron_help_text() -> &'static str {
-    concat!(
-        "CRON mode\n",
-        "\n",
-        "Bare input defines a schedule plus command body.\n",
-        "Examples:\n",
-        "- `every 5m cargo test`\n",
-        "- `in 30s echo hello`\n",
-        "- `at 09:00 on weekdays cargo check`\n",
-        "- `on weekends at 10am backup.sh`\n",
-        "- `cron */5 * * * * do curl api/health`\n",
-        "\n",
-        "Useful builtins:\n",
-        "- `:cron <schedule> <command>` add a cron explicitly\n",
-        "- `:crons` list configured cron entries\n",
-        "- `:pause C<n>` temporarily disable a cron\n",
-        "- `:resume C<n>` re-enable a paused cron\n",
-        "- `:kill C<n>` remove a cron entry\n"
+fn cron_help_text() -> String {
+    format!(
+        concat!(
+            "CRON mode\n",
+            "\n",
+            "Bare input defines a schedule plus command body.\n",
+            "Examples:\n",
+            "- `every 5m cargo test`\n",
+            "- `in 30s echo hello`\n",
+            "- `at 09:00 on weekdays cargo check`\n",
+            "- `on weekends at 10am backup.sh`\n",
+            "- `cron */5 * * * * do curl api/health`\n",
+            "\n",
+            "Useful builtins:\n",
+            "{}"
+        ),
+        format_command_list_by_category(&[CommandCategory::Cron])
     )
+}
+
+fn format_command_list_by_category(categories: &[CommandCategory]) -> String {
+    let specs: Vec<&CommandSpec> = COMMAND_SPECS
+        .iter()
+        .filter(|spec| categories.contains(&spec.category))
+        .collect();
+    format_command_list(specs)
+}
+
+fn format_command_list<'a>(specs: impl IntoIterator<Item = &'a CommandSpec>) -> String {
+    specs
+        .into_iter()
+        .map(|spec| format!("- `{}` — {}", spec.usage, spec.detail))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn sorted_job_list(state: &SchedulerState) -> Vec<JobInfo> {
+    let mut list: Vec<JobInfo> = state.jobs.values().map(job_info_from_entry).collect();
+    list.sort_by_key(|job| parse_job_id(&job.id).map(|id| id.0).unwrap_or(u32::MAX));
+    list
+}
+
+fn sorted_cron_list(state: &SchedulerState) -> Vec<CronInfo> {
+    let mut list: Vec<CronInfo> = state
+        .crons
+        .values()
+        .map(|cron| CronInfo {
+            id: cron.cron_id.to_string(),
+            schedule: cron.schedule_text.clone(),
+            command: chain_to_text(&cron.chain),
+            status: cron.status,
+        })
+        .collect();
+    list.sort_by_key(|cron| parse_cron_id(&cron.id).map(|id| id.0).unwrap_or(u32::MAX));
+    list
+}
+
+fn page_items<T>(items: Vec<T>, limit: Option<usize>) -> (Vec<T>, PageInfo) {
+    let total = items.len();
+    let shown = limit.map_or(total, |limit| total.min(limit));
+    let truncated = shown < total;
+    let page = PageInfo {
+        total,
+        shown,
+        limit,
+        truncated,
+    };
+    (items.into_iter().take(shown).collect(), page)
 }
 
 /// Send `ListScopes` to the scope store and return a `ScopeList` response.
@@ -3362,6 +3577,63 @@ async fn handle_list_scopes(sys: &ActorSystem) -> ResponsePayload {
         }
         Err(_) => ResponsePayload::err(error_code::INTERNAL, "scope_store reply dropped"),
     }
+}
+
+async fn handle_list_scopes_page(sys: &ActorSystem, limit: Option<usize>) -> ResponsePayload {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if sys
+        .scope_store
+        .send(ScopeStoreMsg::ListScopes { reply: tx })
+        .await
+        .is_err()
+    {
+        return ResponsePayload::err(error_code::INTERNAL, "scope_store unreachable");
+    }
+    match rx.await {
+        Ok((head, mut scopes)) => {
+            let head_str = head.to_string();
+            scopes.sort_by(|a, b| {
+                let a_head = a.hash == head_str;
+                let b_head = b.hash == head_str;
+                b_head.cmp(&a_head).then(a.hash.cmp(&b.hash))
+            });
+            let (scopes, page) = page_items(scopes, limit);
+            ResponsePayload::Ok(OkPayload::ScopeListPage { scopes, page })
+        }
+        Err(_) => ResponsePayload::err(error_code::INTERNAL, "scope_store reply dropped"),
+    }
+}
+
+fn limit_text(
+    text: String,
+    line_limit: Option<usize>,
+    tail_bytes: Option<usize>,
+) -> (String, bool) {
+    let (text, byte_truncated) = if let Some(max) = tail_bytes {
+        tail_utf8(&text, max)
+    } else {
+        (text, false)
+    };
+    let Some(limit) = line_limit else {
+        return (text, byte_truncated);
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= limit {
+        return (text, byte_truncated);
+    }
+    let start = lines.len().saturating_sub(limit);
+    (lines[start..].join("\n"), true)
+}
+
+fn tail_utf8(text: &str, max_bytes: usize) -> (String, bool) {
+    if max_bytes == 0 || text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    (text[start..].to_string(), true)
 }
 
 /// Build a human-readable log of jobs and crons.
@@ -3459,13 +3731,12 @@ async fn read_job_output(
     }
 
     match rx.await {
-        Ok(Some(data)) => {
-            let truncated = data.len() >= tail_bytes;
-            let text = String::from_utf8_lossy(&data).into_owned();
+        Ok(Some(snapshot)) => {
+            let text = String::from_utf8_lossy(&snapshot.data).into_owned();
             ResponsePayload::Ok(OkPayload::Output {
                 id,
                 data: text,
-                truncated,
+                truncated: snapshot.truncated,
             })
         }
         Ok(None) => read_output_from_log(job_id, &id, tail_bytes).await,
@@ -3510,6 +3781,38 @@ async fn read_output_from_log(
     }
 }
 
+async fn read_job_output_pair(
+    sys: &ActorSystem,
+    job_id: JobId,
+    display_id: &str,
+    stdout_bytes: Option<usize>,
+    stderr_bytes: Option<usize>,
+) -> ResponsePayload {
+    let stdout_limit = stdout_bytes.unwrap_or(crate::ring_buffer::DEFAULT_CAPACITY);
+    let stderr_limit = stderr_bytes.unwrap_or(crate::ring_buffer::DEFAULT_CAPACITY);
+    let stdout = match read_job_output(sys, job_id, display_id, stdout_limit).await {
+        ResponsePayload::Ok(OkPayload::Output {
+            data, truncated, ..
+        }) => StreamText { data, truncated },
+        error => return error,
+    };
+    let stderr = match read_job_stderr(sys, job_id, display_id, stderr_limit).await {
+        ResponsePayload::Ok(OkPayload::Output {
+            data, truncated, ..
+        }) => StreamText { data, truncated },
+        error => return error,
+    };
+    let stderr_pty_merged = stderr
+        .data
+        .starts_with("[PTY: stdout and stderr are merged]");
+    ResponsePayload::Ok(OkPayload::JobOutput {
+        id: display_id.to_string(),
+        stdout,
+        stderr,
+        stderr_pty_merged,
+    })
+}
+
 /// Return stderr for a job — real pipe-mode bytes, or merged PTY output with a notice.
 async fn read_job_stderr(
     sys: &ActorSystem,
@@ -3536,8 +3839,8 @@ async fn read_job_stderr(
         Ok(Some(StderrSnapshot {
             pty_merged: false,
             data,
+            truncated,
         })) => {
-            let truncated = data.len() >= tail_bytes;
             let text = String::from_utf8_lossy(&data).into_owned();
             ResponsePayload::Ok(OkPayload::Output {
                 id,
@@ -3628,19 +3931,19 @@ async fn read_stderr_from_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cue_core::pipeline::{PipeSegment, Pipeline};
+    use cue_core::pipeline::{JobPlan, PipeSegment, Pipeline};
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
     /// Helper: build a simple leaf from a command string.
     fn leaf(cmd: &str) -> ChainNode {
-        ChainNode::Leaf(Pipeline {
+        ChainNode::Leaf(JobPlan::Pipeline(Pipeline {
             segments: vec![PipeSegment {
                 command: cmd.split_whitespace().map(String::from).collect(),
                 pipe_to_next: None,
             }],
-        })
+        }))
     }
 
     type TestActorSystem = (
@@ -3701,7 +4004,69 @@ mod tests {
                             }),
                         }));
                     }
+                    ScopeStoreMsg::Derive { base, delta, reply } => {
+                        let snapshot = cue_core::scope::EnvSnapshot {
+                            env: std::collections::BTreeMap::new(),
+                            cwd: std::env::current_dir().expect("current dir"),
+                        };
+                        let child = cue_core::scope::Scope::fork(base, &snapshot, delta);
+                        let _ = reply.send(Ok(child.hash));
+                    }
+                    ScopeStoreMsg::ListScopes { reply } => {
+                        let cwd = std::env::current_dir()
+                            .expect("current dir")
+                            .display()
+                            .to_string();
+                        let _ = reply.send((
+                            ScopeHash([0u8; 32]),
+                            vec![
+                                cue_core::ipc::ScopeInfo {
+                                    hash: ScopeHash([0u8; 32]).to_string(),
+                                    parent: None,
+                                    cwd: cwd.clone(),
+                                    env_count: 0,
+                                },
+                                cue_core::ipc::ScopeInfo {
+                                    hash: ScopeHash([1u8; 32]).to_string(),
+                                    parent: None,
+                                    cwd,
+                                    env_count: 0,
+                                },
+                            ],
+                        ));
+                    }
                     ScopeStoreMsg::Shutdown => break,
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    fn spawn_fake_process_mgr(mut rx: mpsc::Receiver<ProcessMgrMsg>) {
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    ProcessMgrMsg::GetOutput {
+                        tail_bytes, reply, ..
+                    } => {
+                        let data = b"stdout-data";
+                        let shown = data.len().min(tail_bytes);
+                        let _ = reply.send(Some(crate::actor::OutputSnapshot {
+                            data: data[data.len() - shown..].to_vec(),
+                            truncated: shown < data.len(),
+                        }));
+                    }
+                    ProcessMgrMsg::GetStderr {
+                        tail_bytes, reply, ..
+                    } => {
+                        let data = b"stderr-data";
+                        let shown = data.len().min(tail_bytes);
+                        let _ = reply.send(Some(StderrSnapshot {
+                            pty_merged: false,
+                            data: data[data.len() - shown..].to_vec(),
+                            truncated: shown < data.len(),
+                        }));
+                    }
                     _ => {}
                 }
             }
@@ -3766,11 +4131,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
 
@@ -3810,11 +4178,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -3852,11 +4223,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -3890,11 +4264,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -3928,15 +4305,194 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
         assert_eq!(spawned.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn single_scope_transform_defaults_to_regular_job() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut state = SchedulerState::new();
+        let resp = spawn_chain(
+            leaf("cd ."),
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            false,
+            false,
+            true,
+            0,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+            Vec::new(),
+        )
+        .await;
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::JobCreated { .. })
+        ));
+
+        let spawned = drain_spawn_jobs(&mut pm_rx).await;
+        assert_eq!(spawned.len(), 1);
+        let entry = state.jobs.get(&spawned[0]).expect("job entry");
+        assert_eq!(entry.status, JobStatus::Running);
+        assert_eq!(entry.end_scope, None);
+    }
+
+    #[tokio::test]
+    async fn single_scope_transform_requires_scope_param() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut state = SchedulerState::new();
+        let resp = spawn_chain(
+            leaf("cd ."),
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            true,
+            false,
+            true,
+            0,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+            Vec::new(),
+        )
+        .await;
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::JobCreated { .. })
+        ));
+
+        let spawned = drain_spawn_jobs(&mut pm_rx).await;
+        assert!(spawned.is_empty());
+        let entry = state.jobs.get(&JobId(1)).expect("job entry");
+        assert_eq!(entry.status, JobStatus::Done);
+        assert!(entry.end_scope.is_some());
+    }
+
+    #[tokio::test]
+    async fn warned_run_commands_still_execute() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut config = Config::default();
+        config
+            .block
+            .warn_commands
+            .insert("cd".into(), "review before changing directory".into());
+        let mut state = SchedulerState::new();
+        let chain = ChainNode::Serial {
+            left: Box::new(leaf("cd /tmp")),
+            op: SerialOp::Then,
+            right: Box::new(leaf("pwd")),
+        };
+
+        let resp = handle_command(
+            ResolvedCommand::Run {
+                chain,
+                params: cue_core::command::ModeParams::new(),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+
+        match resp {
+            ResponsePayload::Ok(OkPayload::ChainCreated { warnings, .. }) => {
+                assert_eq!(warnings, vec!["review before changing directory"]);
+            }
+            other => panic!("expected warned chain to execute, got {other:?}"),
+        }
+        let spawned = drain_spawn_jobs(&mut pm_rx).await;
+        assert_eq!(spawned.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_wrapper_param_overrides_session_and_config() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut config = Config::default();
+        config.wrapper.enabled = false;
+        let mut state = SchedulerState::new();
+        state.wrapper_enabled = Some(false);
+        let mut params = cue_core::command::ModeParams::new();
+        params.insert("wrapper", cue_core::command::ParamValue::Bool(true));
+
+        let resp = handle_command(
+            ResolvedCommand::Run {
+                chain: leaf("echo hi"),
+                params,
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::JobCreated { .. })
+        ));
+
+        let msg = pm_rx.try_recv().expect("spawn job");
+        match msg {
+            ProcessMgrMsg::SpawnJob {
+                wrapper_enabled, ..
+            } => assert!(wrapper_enabled),
+            _ => panic!("expected SpawnJob"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_wrapper_param_is_stored_on_entry() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut config = Config::default();
+        config.wrapper.enabled = false;
+        let mut state = SchedulerState::new();
+        let mut params = cue_core::command::ModeParams::new();
+        params.insert("wrapper", cue_core::command::ParamValue::Bool(true));
+        let cmd = ResolvedCommand::Cron {
+            schedule: CronSchedule::Interval(std::time::Duration::from_secs(300)),
+            chain: leaf("backup.sh"),
+            params,
+        };
+        let resp = handle_command(cmd, 0, &mut state, &conn, &config, &sys).await;
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::CronAdded { .. })
+        ));
+        assert!(state.crons[&CronId(1)].wrapper_enabled);
     }
 
     #[tokio::test]
@@ -4030,11 +4586,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         assert!(matches!(
@@ -4068,6 +4627,173 @@ mod tests {
         } else {
             panic!("expected JobList");
         }
+    }
+
+    #[tokio::test]
+    async fn typed_list_jobs_returns_page_metadata() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        for command in ["echo one", "echo two"] {
+            let _ = spawn_chain(
+                leaf(command),
+                ScopeHash([0; 32]),
+                1,
+                1,
+                None,
+                false,
+                false,
+                true,
+                0,
+                None,
+                &mut state,
+                &conn,
+                &sys,
+                Vec::new(),
+            )
+            .await;
+        }
+        let _ = drain_spawn_jobs(&mut pm_rx).await;
+
+        let resp = handle_command(
+            ResolvedCommand::ListJobs { limit: Some(1) },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        match resp {
+            ResponsePayload::Ok(OkPayload::JobListPage { jobs, page }) => {
+                assert_eq!(jobs.len(), 1);
+                assert_eq!(page.total, 2);
+                assert_eq!(page.shown, 1);
+                assert_eq!(page.limit, Some(1));
+                assert!(page.truncated);
+            }
+            other => panic!("expected paged job list, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_list_scopes_returns_page_metadata() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let resp = handle_list_scopes_page(&sys, Some(1)).await;
+        match resp {
+            ResponsePayload::Ok(OkPayload::ScopeListPage { scopes, page }) => {
+                assert_eq!(scopes.len(), 1);
+                assert_eq!(page.total, 2);
+                assert_eq!(page.shown, 1);
+                assert_eq!(page.limit, Some(1));
+                assert!(page.truncated);
+            }
+            other => panic!("expected paged scope list, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_cron_remove_is_separate_from_job_kill() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let cmd = ResolvedCommand::Cron {
+            schedule: CronSchedule::Interval(std::time::Duration::from_secs(300)),
+            chain: leaf("backup.sh"),
+            params: cue_core::command::ModeParams::new(),
+        };
+        let _ = handle_command(cmd, 0, &mut state, &conn, &config, &sys).await;
+        let list_resp = handle_command(
+            ResolvedCommand::ListCrons { limit: Some(1) },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        match list_resp {
+            ResponsePayload::Ok(OkPayload::CronListPage { crons, page }) => {
+                assert_eq!(crons.len(), 1);
+                assert_eq!(page.total, 1);
+                assert!(!page.truncated);
+            }
+            other => panic!("expected paged cron list, got {other:?}"),
+        }
+
+        let wrong_kind = handle_command(
+            ResolvedCommand::KillJob { id: "C1".into() },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(
+            matches!(wrong_kind, ResponsePayload::Err { code, .. } if code == error_code::NOT_SUPPORTED)
+        );
+        assert_eq!(state.crons.len(), 1);
+
+        let removed = handle_command(
+            ResolvedCommand::RemoveCron { id: "C1".into() },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(removed, ResponsePayload::Ok(OkPayload::Ack {})));
+        assert!(state.crons.is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_job_output_uses_independent_stdout_stderr_limits() {
+        let (sys, _gw_rx, _sched_rx, pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+        spawn_fake_process_mgr(pm_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let resp = handle_command(
+            ResolvedCommand::JobOutput {
+                id: "J1".into(),
+                stdout_bytes: Some(4),
+                stderr_bytes: Some(6),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        match resp {
+            ResponsePayload::Ok(OkPayload::JobOutput { stdout, stderr, .. }) => {
+                assert_eq!(stdout.data, "data");
+                assert!(stdout.truncated);
+                assert_eq!(stderr.data, "r-data");
+                assert!(stderr.truncated);
+            }
+            other => panic!("expected job output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_text_limit_applies_tail_then_line_limit() {
+        let (text, truncated) = limit_text("a\nb\nc\nd".to_string(), Some(2), Some(5));
+        assert_eq!(text, "c\nd");
+        assert!(truncated);
     }
 
     #[test]
@@ -4112,6 +4838,8 @@ mod tests {
                 status: CronStatus::Scheduled,
                 scope_hash: Some(ScopeHash([5; 32])),
                 cwd_override: Some(std::path::PathBuf::from("/tmp/cue-cron-cwd")),
+                scope_enabled: true,
+                wrapper_enabled: true,
                 age_secs: 0,
             },
         )
@@ -4130,6 +4858,8 @@ mod tests {
             state.crons[&CronId(4)].cwd_override.as_deref(),
             Some(std::path::Path::new("/tmp/cue-cron-cwd"))
         );
+        assert!(state.crons[&CronId(4)].scope_enabled);
+        assert!(state.crons[&CronId(4)].wrapper_enabled);
     }
 
     #[test]
@@ -4145,6 +4875,8 @@ mod tests {
                 status: CronStatus::Scheduled,
                 scope_hash: Some(ScopeHash([8; 32])),
                 cwd_override: None,
+                scope_enabled: false,
+                wrapper_enabled: false,
                 age_secs: 0,
             },
         )
@@ -4185,11 +4917,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         // Single leaf → JobCreated, not ChainCreated.
@@ -4223,11 +4958,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let chain = match resp {
@@ -4258,11 +4996,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let job_id = match resp {
@@ -4312,11 +5053,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let job_id = match resp {
@@ -4456,9 +5200,9 @@ mod tests {
         assert_eq!(ready, vec![0, 1]); // Both ready.
     }
 
-    // ── FIX 1 test: Race + Serial — cancelled leaf must not be re-spawned ──
+    // ── Race + Serial: cancelled leaf must not be re-spawned ──
 
-    /// `(a -> b) ||? c` — when `c` succeeds, Race should cancel both `a`/`b`.
+    /// `(a -> b) |?| c` — when `c` succeeds, Race should cancel both `a`/`b`.
     /// When `a` also succeeds, `b` should NOT be spawned because it was cancelled.
     #[tokio::test]
     async fn race_serial_cancelled_leaf_not_respawned() {
@@ -4467,7 +5211,7 @@ mod tests {
 
         let conn = test_db();
         let mut state = SchedulerState::new();
-        // (a -> b) ||? c
+        // (a -> b) |?| c
         // Leaves: 0=a, 1=b, 2=c
         let chain = ChainNode::Parallel {
             left: Box::new(ChainNode::Serial {
@@ -4486,11 +5230,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -4523,9 +5270,9 @@ mod tests {
         assert!(state.chains.is_empty(), "chain should be cleaned up");
     }
 
-    // ── FIX 3 test: Race waits for entire branch, not single leaf ──
+    // ── Race waits for entire branch, not single leaf ──
 
-    /// `(compile -> test) ||? lint`
+    /// `(compile -> test) |?| lint`
     /// When `compile` succeeds but `test` hasn't run yet, Race should NOT fire.
     #[tokio::test]
     async fn race_does_not_fire_on_partial_branch_success() {
@@ -4534,7 +5281,7 @@ mod tests {
 
         let conn = test_db();
         let mut state = SchedulerState::new();
-        // (compile -> test) ||? lint
+        // (compile -> test) |?| lint
         // Leaves: 0=compile, 1=test, 2=lint
         let chain = ChainNode::Parallel {
             left: Box::new(ChainNode::Serial {
@@ -4553,11 +5300,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -4580,7 +5330,7 @@ mod tests {
         );
     }
 
-    // ── FIX 2 test: :cancel updates chain leaf_status and advances chain ──
+    // ── :cancel updates chain leaf_status and advances chain ──
 
     #[tokio::test]
     async fn cancel_chain_leaf_updates_leaf_status() {
@@ -4604,11 +5354,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -4640,7 +5393,7 @@ mod tests {
         );
     }
 
-    // ── FIX 2 test: :kill does not get overwritten by later JobFinished ──
+    // ── :kill does not get overwritten by later JobFinished ──
 
     #[tokio::test]
     async fn kill_status_not_overwritten_by_job_finished() {
@@ -4659,11 +5412,14 @@ mod tests {
             1,
             None,
             false,
+            false,
+            true,
             0,
             None,
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;

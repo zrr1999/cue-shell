@@ -15,6 +15,7 @@ use crossterm::event::{
 };
 
 use cue_core::Mode;
+use cue_core::command_spec::command_names;
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
     CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload, ResponsePayload,
@@ -113,6 +114,7 @@ struct JobRow {
     start_scope: Option<String>,
     end_scope: Option<String>,
     open_hint: JobOpenHint,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -993,8 +995,7 @@ impl AppState {
             return;
         };
 
-        // For running jobs, route to the live view based on open_hint instead
-        // of showing a static preview.
+        // For running jobs: always foreground-attach.
         if let Some(job_id) = self
             .job_cards
             .iter()
@@ -1003,12 +1004,20 @@ impl AppState {
             && let Some(job) = self.jobs.iter().find(|j| j.id == job_id)
             && matches!(job.status, JobStatus::Running)
         {
-            let command = if matches!(job.open_hint, JobOpenHint::Fg) {
-                format!(":fg {}", job.id)
-            } else {
-                format!(":tail {}", job.id)
-            };
-            self.update(AppMsg::Submit(command));
+            self.update(AppMsg::Submit(format!(":fg {}", job.id)));
+            return;
+        }
+
+        // For finished jobs: open stdout.
+        if let Some(job_id) = self
+            .job_cards
+            .iter()
+            .find(|&(_, &card_idx)| card_idx == index)
+            .map(|(id, _)| id.clone())
+            && let Some(job) = self.jobs.iter().find(|j| j.id == job_id)
+            && job.status.is_terminal()
+        {
+            self.update(AppMsg::Submit(format!(":tail {}", job.id)));
             return;
         }
 
@@ -1410,9 +1419,8 @@ impl AppState {
             return;
         }
 
-        if let FgSessionKind::Job { card_index, parser } = session.kind
-            && let Some(card_index) = card_index
-        {
+        let FgSessionKind::Job { card_index, parser } = session.kind;
+        if let Some(card_index) = card_index {
             let status = if reason == "done" || reason == "detached" {
                 CardStatus::Success
             } else {
@@ -1485,6 +1493,7 @@ impl AppState {
         status: JobStatus,
         start_scope: Option<String>,
         open_hint: JobOpenHint,
+        warnings: Vec<String>,
     ) {
         if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
             if !label.is_empty() {
@@ -1495,6 +1504,9 @@ impl AppState {
                 job.start_scope = start_scope;
             }
             job.open_hint = open_hint;
+            if !warnings.is_empty() {
+                job.warnings = warnings;
+            }
             return;
         }
 
@@ -1505,6 +1517,7 @@ impl AppState {
             start_scope,
             end_scope: None,
             open_hint,
+            warnings,
         });
     }
 
@@ -1527,6 +1540,7 @@ impl AppState {
                 start_scope: None,
                 end_scope,
                 open_hint: JobOpenHint::Stream,
+                warnings: Vec::new(),
             });
             self.refresh_cron_trigger_card(id);
         }
@@ -1559,6 +1573,7 @@ impl AppState {
                 &job.status,
                 job.start_scope.as_deref(),
                 job.end_scope.as_deref(),
+                &job.warnings,
             ),
         );
         self.main_view
@@ -1591,6 +1606,7 @@ impl AppState {
                 start_scope: job.start_scope,
                 end_scope: job.end_scope,
                 open_hint: job.open_hint,
+                warnings: Vec::new(),
             })
             .collect();
     }
@@ -1702,14 +1718,10 @@ impl AppState {
                 let Some(job) = self.jobs.get(idx) else {
                     return;
                 };
-                let command = if matches!(job.status, JobStatus::Running)
-                    && matches!(job.open_hint, JobOpenHint::Fg)
-                {
+                let command = if matches!(job.status, JobStatus::Running) {
                     format!(":fg {}", job.id)
-                } else if matches!(job.status, JobStatus::Running) {
-                    format!(":tail {}", job.id)
                 } else {
-                    format!(":out {}", job.id)
+                    format!(":tail {}", job.id)
                 };
                 self.update(AppMsg::Submit(command));
             }
@@ -2018,6 +2030,7 @@ impl AppState {
                                             JobStatus::Running,
                                             start_scope.clone(),
                                             *open_hint,
+                                            Vec::new(),
                                         );
                                         sidebar_dirty = true;
                                     }
@@ -2032,6 +2045,7 @@ impl AppState {
                                                     job.status.clone(),
                                                     job.start_scope.clone(),
                                                     *open_hint,
+                                                    Vec::new(),
                                                 );
                                                 sidebar_dirty = true;
                                             }
@@ -2070,6 +2084,7 @@ impl AppState {
                             job_id,
                             start_scope,
                             open_hint,
+                            warnings,
                             ..
                         } => {
                             let label = pending
@@ -2082,6 +2097,7 @@ impl AppState {
                                 JobStatus::Running,
                                 start_scope,
                                 open_hint,
+                                warnings.clone(),
                             );
                             self.sync_sidebar_items();
                             if let Some(pending) = pending.as_ref()
@@ -2105,13 +2121,18 @@ impl AppState {
                             chain_id,
                             job_ids,
                             chain,
+                            warnings,
                         } => {
                             if let Some(pending) = pending.as_ref()
                                 && !pending.silent
                             {
+                                let body = decorate_submission_output(
+                                    &warnings,
+                                    format!("{}: {}", chain_id, job_ids.join(", ")),
+                                );
                                 let card_index = self.show_submission_result(
                                     pending,
-                                    format!("{}: {}", chain_id, job_ids.join(", ")),
+                                    body,
                                     CardStatus::Success,
                                     Some(chain_id.clone()),
                                 );
@@ -2303,6 +2324,7 @@ impl AppState {
                         JobStatus::Running,
                         start_scope,
                         open_hint,
+                        Vec::new(),
                     );
                     // Annotate the chain card with a step label when a new chain job starts.
                     if let (Some(cid), Some(idx), Some(total)) =
@@ -2848,7 +2870,7 @@ fn decorate_submission_output(warnings: &[String], body: String) -> String {
 }
 
 fn operator_spacing_warnings(input: &str) -> Vec<String> {
-    const OPERATORS: [&str; 7] = ["|&>", "|!>", "||?", "->", "~>", "||", "|>"];
+    const OPERATORS: [&str; 4] = ["|||", "|?|", "->", "~>"];
 
     let mut warnings = Vec::new();
     let mut pos = 0;
@@ -3087,6 +3109,7 @@ fn format_cron_trigger_record(
                 &job.status,
                 job.start_scope.as_deref(),
                 job.end_scope.as_deref(),
+                &job.warnings,
             ));
         }
         None => {
@@ -3220,11 +3243,15 @@ fn format_job_record(
     status: &JobStatus,
     start_scope: Option<&str>,
     end_scope: Option<&str>,
+    warnings: &[String],
 ) -> String {
-    let mut lines = vec![
-        job_id.to_string(),
-        format!("status: {}", format_job_status(status)),
-    ];
+    let mut lines = Vec::new();
+    lines.extend(warnings.iter().cloned());
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(job_id.to_string());
+    lines.push(format!("status: {}", format_job_status(status)));
     if let Some(start_scope) = start_scope {
         lines.push(format!("start scope: {start_scope}"));
     }
@@ -3261,14 +3288,9 @@ fn card_status_for_job(status: &JobStatus) -> CardStatus {
 }
 
 fn builtin_command_candidates(word: &str) -> Vec<String> {
-    const COMMANDS: &[&str] = &[
-        "run", "cron", "kill", "retry", "out", "err", "fg", "wait", "send", "cancel", "pause",
-        "resume", "log", "jobs", "crons", "scopes", "env", "cd", "scope", "help", "config",
-        "clear", "quit", "exit", "restart",
-    ];
     let prefix = word.strip_prefix(':').unwrap_or(word);
-    COMMANDS
-        .iter()
+    command_names()
+        .chain(["restart"])
         .filter(|command| command.starts_with(prefix))
         .map(|command| format!(":{command}"))
         .collect()
@@ -3357,7 +3379,7 @@ fn shell_segment_completion_candidates(line_prefix: &str, word: &str) -> Vec<Str
 }
 
 fn is_chain_operator(token: &str) -> bool {
-    matches!(token, "->" | "~>" | "||" | "||?" | "|>" | "|&>" | "|!>")
+    matches!(token, "->" | "~>" | "|||" | "|?|")
 }
 
 fn command_completion_candidates(prefix: &str) -> Vec<String> {
@@ -3603,6 +3625,7 @@ mod tests {
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                warnings: Vec::new(),
             }),
         });
 
@@ -3631,6 +3654,7 @@ mod tests {
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                warnings: Vec::new(),
             }),
         });
 
@@ -3661,6 +3685,7 @@ mod tests {
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                warnings: Vec::new(),
             }),
         });
         state.update(AppMsg::ServerEvent(EventPayload::OutputChunk {
@@ -3674,7 +3699,7 @@ mod tests {
     }
 
     #[test]
-    fn running_stream_job_sidebar_open_prefers_tail() {
+    fn running_stream_job_sidebar_open_prefers_fg() {
         let mut state = AppState::new();
         state.jobs.push(JobRow {
             id: "J1".into(),
@@ -3682,7 +3707,27 @@ mod tests {
             status: JobStatus::Running,
             start_scope: None,
             end_scope: None,
+            open_hint: JobOpenHint::Fg,
+            warnings: Vec::new(),
+        });
+
+        state.activate_sidebar_row(0);
+
+        let card = state.main_view.cards.last().unwrap();
+        assert_eq!(card.input, ":fg J1");
+    }
+
+    #[test]
+    fn finished_job_sidebar_open_uses_tail() {
+        let mut state = AppState::new();
+        state.jobs.push(JobRow {
+            id: "J1".into(),
+            label: "cargo build".into(),
+            status: JobStatus::Done,
+            start_scope: None,
+            end_scope: None,
             open_hint: JobOpenHint::Stream,
+            warnings: Vec::new(),
         });
 
         state.activate_sidebar_row(0);
@@ -3701,6 +3746,7 @@ mod tests {
             start_scope: None,
             end_scope: None,
             open_hint: JobOpenHint::Fg,
+            warnings: Vec::new(),
         });
 
         state.activate_sidebar_row(0);
@@ -3875,6 +3921,7 @@ mod tests {
                 start_scope: None,
                 end_scope: None,
                 open_hint: JobOpenHint::Stream,
+                warnings: Vec::new(),
             },
             JobRow {
                 id: "J2".into(),
@@ -3883,6 +3930,7 @@ mod tests {
                 start_scope: None,
                 end_scope: None,
                 open_hint: JobOpenHint::Stream,
+                warnings: Vec::new(),
             },
         ];
 
@@ -4828,6 +4876,7 @@ destination = "devbox"
                     total_jobs: 1,
                     jobs: vec![],
                 },
+                warnings: Vec::new(),
             }),
         });
 
@@ -4904,6 +4953,7 @@ destination = "devbox"
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                warnings: Vec::new(),
             }),
         });
 
@@ -4936,6 +4986,7 @@ destination = "devbox"
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                warnings: Vec::new(),
             }),
         });
 

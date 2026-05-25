@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::dirs;
@@ -15,6 +15,8 @@ pub struct Config {
     pub block: BlockConfig,
     #[serde(default)]
     pub aliases: AliasConfig,
+    #[serde(default)]
+    pub bash_compat: BashCompatConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
     #[serde(default)]
@@ -110,42 +112,89 @@ fn token_spans(input: &str) -> Vec<(usize, usize)> {
 /// ```toml
 /// [block.commands]
 /// git = ["--no-verify", "--force"]
+///
+/// [block.warn_commands]
+/// rm = "Careful: this removes files"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockConfig {
     /// Map from command name → list of forbidden argument substrings.
     #[serde(default)]
     pub commands: BTreeMap<String, Vec<String>>,
+    /// Map from command name → advisory warning hint.
+    #[serde(default)]
+    pub warn_commands: BTreeMap<String, String>,
 }
 
 impl Default for BlockConfig {
     fn default() -> Self {
         let mut commands = BTreeMap::new();
         commands.insert("git".into(), vec!["--no-verify".into()]);
-        Self { commands }
+        let warn_commands = BTreeMap::new();
+        Self {
+            commands,
+            warn_commands,
+        }
     }
 }
 
 impl BlockConfig {
     /// Check whether `command_line` is blocked.  Returns `None` if allowed,
-    /// or `Some(reason)` if the command matches a blocked pattern.
-    pub fn check(&self, command_line: &[String]) -> Option<String> {
+    /// `Some(BlockDecision::Block(reason))` if blocked,
+    /// `Some(BlockDecision::Warn(hint))` if the command should warn before running.
+    pub fn check(&self, command_line: &[String]) -> Option<BlockDecision> {
         let cmd_name = command_line.first()?;
         let base = std::path::Path::new(cmd_name)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(cmd_name);
+
+        // Check warn-commands first (whole-command match).
+        if let Some(hint) = self.warn_commands.get(base) {
+            return Some(BlockDecision::Warn(hint.clone()));
+        }
+
+        // Check blocked arguments.
         let forbidden = self.commands.get(base)?;
         for arg in &command_line[1..] {
             for pattern in forbidden {
                 if arg == pattern || arg.starts_with(&format!("{pattern}=")) {
-                    return Some(format!(
+                    return Some(BlockDecision::Block(format!(
                         "blocked: `{cmd_name} {pattern}` is forbidden by server config\n  (see [block.commands] in server.toml)"
-                    ));
+                    )));
                 }
             }
         }
         None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum BlockDecision {
+    Block(String),
+    Warn(String),
+}
+
+/// Deprecated bash compatibility transform configuration.
+///
+/// `&&` and `||` are now first-class job-local operators, so this option is
+/// kept only for config compatibility and intentionally performs no rewrite.
+///
+/// ```toml
+/// [bash_compat]
+/// enabled = true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BashCompatConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl BashCompatConfig {
+    /// Apply bash compatibility transformations to the input string.
+    pub fn apply(&self, input: &str) -> String {
+        let _ = self.enabled;
+        input.to_string()
     }
 }
 
@@ -203,8 +252,27 @@ impl Config {
     }
 
     fn parse(text: &str, path: &Path) -> Result<Self> {
+        reject_legacy_wrapper_denylist(text, path)?;
         toml::from_str(text).with_context(|| format!("parse config {}", path.display()))
     }
+}
+
+fn reject_legacy_wrapper_denylist(text: &str, path: &Path) -> Result<()> {
+    let value: toml::Value =
+        toml::from_str(text).with_context(|| format!("parse config {}", path.display()))?;
+    let has_legacy_denylist = value
+        .get("wrapper")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|wrapper| wrapper.contains_key("denylist"));
+
+    if has_legacy_denylist {
+        bail!(
+            "legacy [wrapper.denylist] in {} is no longer supported; wrapper targeting is now allowlist-only. Replace it with [wrapper.allowlist] commands = [...]. Automatic migration is unsafe because the old denylist wrapped every non-denied command.",
+            path.display()
+        );
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -231,10 +299,9 @@ fn default_weft_socket_path() -> PathBuf {
 
 /// Wrapper configuration for binary-prefix injection.
 ///
-/// When enabled, single-segment command spawns are prefixed with `binary`.
-/// The wrapper is **idempotent**: if the program already matches `binary`,
-/// or is in the denylist, or the spawn is a foreground attach, it is
-/// skipped.
+/// When enabled, command spawns are prefixed with `binary` only when the
+/// command basename is explicitly present in `allowlist.commands`. The wrapper
+/// is **idempotent**: if the program already matches `binary`, it is skipped.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WrapperConfig {
     #[serde(default)]
@@ -242,7 +309,7 @@ pub struct WrapperConfig {
     #[serde(default = "default_wrapper_binary")]
     pub binary: String,
     #[serde(default)]
-    pub denylist: WrapperDenylist,
+    pub allowlist: WrapperAllowlist,
 }
 
 impl Default for WrapperConfig {
@@ -250,7 +317,7 @@ impl Default for WrapperConfig {
         Self {
             enabled: false,
             binary: default_wrapper_binary(),
-            denylist: WrapperDenylist::default(),
+            allowlist: WrapperAllowlist::default(),
         }
     }
 }
@@ -264,7 +331,7 @@ impl WrapperConfig {
         override_enabled: Option<bool>,
     ) -> bool {
         let enabled = override_enabled.unwrap_or(self.enabled);
-        if !enabled {
+        if !enabled || is_foreground {
             return false;
         }
         let base = std::path::Path::new(program)
@@ -274,10 +341,7 @@ impl WrapperConfig {
         if base == self.binary_base() {
             return false;
         }
-        if is_foreground && self.denylist.interactive {
-            return false;
-        }
-        !self.denylist.matches(program)
+        self.allowlist.matches(program)
     }
 
     fn binary_base(&self) -> &str {
@@ -288,24 +352,13 @@ impl WrapperConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct WrapperDenylist {
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WrapperAllowlist {
     #[serde(default)]
     pub commands: Vec<String>,
-    #[serde(default = "default_true")]
-    pub interactive: bool,
 }
 
-impl Default for WrapperDenylist {
-    fn default() -> Self {
-        Self {
-            commands: Vec::new(),
-            interactive: true,
-        }
-    }
-}
-
-impl WrapperDenylist {
+impl WrapperAllowlist {
     pub fn matches(&self, program: &str) -> bool {
         let base = std::path::Path::new(program)
             .file_name()
@@ -317,10 +370,6 @@ impl WrapperDenylist {
 
 fn default_wrapper_binary() -> String {
     String::new()
-}
-
-fn default_true() -> bool {
-    true
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -499,6 +548,21 @@ socket_path = "/var/run/weft.sock"
         assert_eq!(config.weft.socket_path, PathBuf::from("/var/run/weft.sock"));
     }
 
+    #[test]
+    fn bash_compat_no_longer_rewrites_job_logical_operators() {
+        let compat = BashCompatConfig { enabled: true };
+        assert_eq!(compat.apply("a && b || c"), "a && b || c");
+    }
+
+    #[test]
+    fn bash_compat_preserves_utf8_input() {
+        let compat = BashCompatConfig { enabled: true };
+        assert_eq!(
+            compat.apply("echo café/路径 && pwd"),
+            "echo café/路径 && pwd"
+        );
+    }
+
     // ── WrapperConfig ──
 
     #[test]
@@ -509,13 +573,27 @@ socket_path = "/var/run/weft.sock"
     }
 
     #[test]
-    fn wrapper_enabled_wraps_command() {
+    fn wrapper_enabled_requires_allowlist_match() {
+        let cfg = WrapperConfig {
+            enabled: true,
+            binary: "rtk".into(),
+            allowlist: WrapperAllowlist {
+                commands: vec!["git".into()],
+            },
+        };
+        assert!(cfg.should_wrap("git", false, None));
+        assert!(cfg.should_wrap("/usr/bin/git", false, None));
+        assert!(!cfg.should_wrap("cargo", false, None));
+    }
+
+    #[test]
+    fn wrapper_empty_allowlist_wraps_nothing() {
         let cfg = WrapperConfig {
             enabled: true,
             binary: "rtk".into(),
             ..Default::default()
         };
-        assert!(cfg.should_wrap("git", false, None));
+        assert!(!cfg.should_wrap("git", false, None));
     }
 
     #[test]
@@ -523,31 +601,21 @@ socket_path = "/var/run/weft.sock"
         let cfg = WrapperConfig {
             enabled: true,
             binary: "rtk".into(),
-            ..Default::default()
+            allowlist: WrapperAllowlist {
+                commands: vec!["rtk".into()],
+            },
         };
         assert!(!cfg.should_wrap("rtk", false, None));
     }
 
     #[test]
-    fn wrapper_denylist_commands() {
+    fn wrapper_skips_foreground_commands() {
         let cfg = WrapperConfig {
             enabled: true,
             binary: "rtk".into(),
-            denylist: WrapperDenylist {
-                commands: vec!["vim".into()],
-                interactive: true,
+            allowlist: WrapperAllowlist {
+                commands: vec!["git".into()],
             },
-        };
-        assert!(!cfg.should_wrap("vim", false, None));
-        assert!(cfg.should_wrap("git", false, None));
-    }
-
-    #[test]
-    fn wrapper_denylist_interactive() {
-        let cfg = WrapperConfig {
-            enabled: true,
-            binary: "rtk".into(),
-            ..Default::default()
         };
         assert!(!cfg.should_wrap("git", true, None));
         assert!(cfg.should_wrap("git", false, None));
@@ -563,9 +631,8 @@ socket_path = "/var/run/weft.sock"
 enabled = true
 binary = "rtk"
 
-[wrapper.denylist]
-commands = ["vim", "ssh"]
-interactive = false
+[wrapper.allowlist]
+commands = ["git", "cargo"]
 "#,
             )),
             None,
@@ -573,8 +640,30 @@ interactive = false
         .expect("load config");
         assert!(config.wrapper.enabled);
         assert_eq!(config.wrapper.binary, "rtk");
-        assert_eq!(config.wrapper.denylist.commands, vec!["vim", "ssh"]);
-        assert!(!config.wrapper.denylist.interactive);
+        assert_eq!(config.wrapper.allowlist.commands, vec!["git", "cargo"]);
+    }
+
+    #[test]
+    fn legacy_wrapper_denylist_reports_migration_error() {
+        let error = Config::load_from_sources(
+            Some((
+                Path::new("server.toml"),
+                r#"
+[wrapper]
+enabled = true
+binary = "rtk"
+
+[wrapper.denylist]
+commands = ["vim", "ssh"]
+"#,
+            )),
+            None,
+        )
+        .expect_err("legacy denylist should fail fast");
+
+        let message = error.to_string();
+        assert!(message.contains("legacy [wrapper.denylist]"));
+        assert!(message.contains("[wrapper.allowlist]"));
     }
 
     #[test]
@@ -603,6 +692,7 @@ pip = "uv pip"
                 .is_some()
         );
         assert!(config.block.check(&["git".into(), "push".into()]).is_none());
+        assert!(config.block.check(&["cd".into(), "/tmp".into()]).is_none());
     }
 
     #[test]

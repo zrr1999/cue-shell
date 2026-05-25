@@ -18,7 +18,7 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 - **Foreground PTY attach**: `:fg J<n>` proxies a real terminal session with input, paste, and resize support
 - **Display tabs with clean semantics**: `:out J<n>` snapshots stdout, `:tail J<n>` follows live stdout, `:err J<n>` opens stderr
 - **Scope persistence**: Environment snapshots with delta storage and lifecycle management
-- **Chain syntax**: `->` serial · `~>` ignore-failure · `||` parallel · `||?` any-success
+- **Chain syntax**: `->` serial · `~>` ignore-failure · `|||` parallel · `|?|` any-success; `&&` / `||` stay inside one job
 - **Daemon durability**: persisted HEAD scope, job history, cron definitions, auto-reconnect TUI
 
 ## Architecture
@@ -40,9 +40,17 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 ```
 crates/
 ├── cue-core/   — Core types and logic: Job, Scope, Chain, Cron
-├── cued/       — Background daemon: Unix socket server, job orchestration
-├── cue-tui/    — TUI frontend: mode switching, command input, job display
-└── cue-cli/    — CLI entry point: command parsing, mode dispatch
+├── cue-client/ — Client connection stack shared by frontends
+├── cue-daemon/ — Background daemon implementation library used by the `cued` CLI
+├── cue-tui/    — Optional TUI extension mounted as the `cue tui` subcommand
+├── cue-cli/    — CLI entry crate; builds `cue` and `cued` via `extensions`/`tui`/`daemon`
+```
+
+## Installation
+
+```bash
+# Install both `cue` and `cued` from PyPI
+uv tool install cue-shell
 ```
 
 ## Development
@@ -60,7 +68,7 @@ cued -f
 cargo run -p cue-cli -- tui
 
 # Restart the daemon directly
-cargo run -p cued -- restart
+cargo run -p cue-cli --bin cued -- restart
 
 # Restart from inside the TUI
 :restart
@@ -105,7 +113,7 @@ mapping:
 
 ```text
 cat _typos.toml |> rg files
-|| cat Cargo.toml |> rg author
+||| cat Cargo.toml |> rg author
 ```
 
 - the submission gets a script id such as `R12`
@@ -114,7 +122,7 @@ cat _typos.toml |> rg files
 - canonical output still belongs to jobs (`:out J<n>`, `:tail J<n>`, `:err J<n>`)
 - the TUI shows one script card summarizing the `R -> C -> J` mapping
 
-### Client transport config
+### Client transport and extension config
 
 `cue` defaults to a local Unix socket profile, so local users do not need any
 config for the current flow. To make the split explicit:
@@ -139,15 +147,54 @@ over SSH, so the client speaks the same IPC through `cued gateway --stdio`.
 Remote daemon startup still stays explicit: `cue` will **not** run
 `start_command` for you.
 
-### Server retention config
+`cue` can also dispatch external CLI extensions from `client.toml`. This is
+enabled by the default `cue-cli` `extensions` Cargo feature:
 
-`server.toml` can now cap persisted job/script history:
+```toml
+[extensions.commands.foo]
+command = "cue-foo"
+description = "Foo extension"
+```
+
+`command` is the executable path/name; extension arguments come from the `cue foo ...`
+invocation. Then `cue foo arg` runs `cue-foo arg`. Built-in subcommands such as
+`tui`, `help`, and `version` take precedence. Optional PATH lookup for unknown
+`cue-<name>` binaries can be enabled explicitly:
+
+```toml
+[extensions]
+path_lookup = true
+```
+
+### Server runtime config
+
+`server.toml` can cap persisted job/script history:
 
 ```toml
 [retention]
 max_job_history = 200
 max_script_runs = 100
 ```
+
+It can also enable a runtime wrapper such as `rtk`. Wrapping is allowlist-only:
+commands not listed under `[wrapper.allowlist]` are never wrapped, and an empty
+allowlist wraps nothing.
+Legacy `[wrapper.denylist]` config is rejected with a migration error because
+the old "wrap everything except..." behavior cannot be safely converted.
+
+```toml
+[wrapper]
+enabled = true
+binary = "rtk"
+
+[wrapper.allowlist]
+commands = ["cargo", "git", "pnpm", "node"]
+```
+
+`:wrap on/off/status` overrides only the session-level enablement. Per-command
+mode params such as `:run(wrapper=false) cargo test` and cron params such as
+`:cron(wrapper=true) every 5m cargo test` override enablement for that
+invocation, but still must match the allowlist.
 
 Typical remote flow:
 
@@ -170,7 +217,7 @@ with a message that includes the profile's explicit `start_command`.
 | Cargo workspace | ✅ Scaffolded |
 | CI/CD | ✅ Configured |
 | cue-core | ✅ Core types / IPC / parser in place |
-| cued daemon | 🚧 Functional prototype |
+| cue-daemon | 🚧 Functional prototype |
 | cue-tui | 🚧 Functional prototype |
 | cue-cli | 🚧 Functional prototype |
 

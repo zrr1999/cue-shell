@@ -11,12 +11,14 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use cue_core::command_spec::{MODE_PARAM_SPECS, command_names, command_spec};
 use cue_core::ipc::{
-    EventPayload, MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload, ResponsePayload,
-    encode_message, error_code,
+    CompletionItem, CompletionKind, EventPayload, HighlightKind, HighlightSpan, MAX_MESSAGE_SIZE,
+    Message, OkPayload, RequestPayload, ResponsePayload, encode_message, error_code,
 };
 
-use crate::parser::{Parser, Resolver};
+use crate::parser::token::Token;
+use crate::parser::{Parser, Resolver, Tokenizer};
 
 use super::{ActorSystem, CLIENT_EVENT_CAP, EventBusMsg, GatewayMsg, SchedulerMsg};
 
@@ -284,6 +286,7 @@ async fn route_request(
 ) -> Result<()> {
     match payload {
         RequestPayload::Eval { input, mode } => {
+            let input = sys.config.bash_compat.apply(&input);
             let input = sys.config.aliases.apply(&input);
             // Parse → resolve → send to scheduler.
             match Parser::parse(&input) {
@@ -306,7 +309,7 @@ async fn route_request(
                                 request_id,
                                 payload: ResponsePayload::err(
                                     error_code::INVALID_SYNTAX,
-                                    e.to_string(),
+                                    syntax_error_message(&input, &e.to_string()),
                                 ),
                             })
                             .await
@@ -320,13 +323,128 @@ async fn route_request(
                             request_id,
                             payload: ResponsePayload::err(
                                 error_code::INVALID_SYNTAX,
-                                e.to_string(),
+                                syntax_error_message(&input, &e.to_string()),
                             ),
                         })
                         .await
                         .context("send error response")?;
                 }
             }
+        }
+
+        RequestPayload::ListJobs { limit } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ListJobs { limit },
+                })
+                .await
+                .context("send list jobs to scheduler")?;
+        }
+
+        RequestPayload::ListCrons { limit } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ListCrons { limit },
+                })
+                .await
+                .context("send list crons to scheduler")?;
+        }
+
+        RequestPayload::ListScopes { limit } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ListScopes { limit },
+                })
+                .await
+                .context("send list scopes to scheduler")?;
+        }
+
+        RequestPayload::ShowLog {
+            id,
+            limit,
+            tail_bytes,
+        } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ShowLog {
+                        id,
+                        limit,
+                        tail_bytes,
+                    },
+                })
+                .await
+                .context("send show log to scheduler")?;
+        }
+
+        RequestPayload::JobOutput {
+            id,
+            stdout_bytes,
+            stderr_bytes,
+        } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::JobOutput {
+                        id,
+                        stdout_bytes,
+                        stderr_bytes,
+                    },
+                })
+                .await
+                .context("send job output to scheduler")?;
+        }
+
+        RequestPayload::KillJob { id } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::KillJob { id },
+                })
+                .await
+                .context("send kill job to scheduler")?;
+        }
+
+        RequestPayload::RemoveCron { id } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::RemoveCron { id },
+                })
+                .await
+                .context("send remove cron to scheduler")?;
+        }
+
+        RequestPayload::ShowEnv { tail_bytes } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ShowEnv { tail_bytes },
+                })
+                .await
+                .context("send show env to scheduler")?;
+        }
+
+        RequestPayload::ShowConfig { tail_bytes } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ShowConfig { tail_bytes },
+                })
+                .await
+                .context("send show config to scheduler")?;
         }
 
         RequestPayload::Subscribe { channels } => {
@@ -443,6 +561,34 @@ async fn route_request(
                 .await?;
         }
 
+        RequestPayload::Complete {
+            input,
+            cursor,
+            mode: _,
+        } => {
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload: ResponsePayload::Ok(OkPayload::CompletionList {
+                        items: complete_input(&input, cursor),
+                    }),
+                })
+                .await?;
+        }
+
+        RequestPayload::Highlight { input } => {
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload: ResponsePayload::Ok(OkPayload::HighlightResult {
+                        spans: highlight_input(&input),
+                    }),
+                })
+                .await?;
+        }
+
         RequestPayload::Ping {} => {
             sys.gateway
                 .send(GatewayMsg::SendResponse {
@@ -467,23 +613,147 @@ async fn route_request(
                 libc::kill(std::process::id() as i32, libc::SIGTERM);
             }
         }
-
-        // Stubs for unimplemented request types.
-        _ => {
-            sys.gateway
-                .send(GatewayMsg::SendResponse {
-                    client_id,
-                    request_id,
-                    payload: ResponsePayload::err(
-                        error_code::NOT_SUPPORTED,
-                        "request type not yet implemented",
-                    ),
-                })
-                .await?;
-        }
     }
 
     Ok(())
+}
+
+fn syntax_error_message(input: &str, base: &str) -> String {
+    let hints = bash_syntax_hints(input);
+    if hints.is_empty() {
+        base.to_string()
+    } else {
+        format!(
+            "{base}\n\nPossible bash syntax issue:\n- {}",
+            hints.join("\n- ")
+        )
+    }
+}
+
+fn bash_syntax_hints(input: &str) -> Vec<&'static str> {
+    let mut hints = Vec::new();
+    if input.contains(';') {
+        hints.push("cue-shell does not use ';' command separators; use a script submission or cue-shell chain operators such as '->' or '~>'");
+    }
+    if input.contains("$(") || input.contains('`') {
+        hints.push(
+            "command substitution is shell syntax; use an explicit helper command/script instead",
+        );
+    }
+    if input.contains("2>") || input.contains("1>") || input.contains(" >") || input.contains("<") {
+        hints.push("redirection is shell syntax; use cue-shell pipes '|>'/'|&>' or write/read files explicitly");
+    }
+    if input.contains(" | ")
+        && !input.contains("|>")
+        && !input.contains("|&>")
+        && !input.contains("|!>")
+    {
+        hints.push("bare '|' is shell syntax; use cue-shell '|>' for stdout pipes or '|&>' for stdout+stderr pipes");
+    }
+    hints
+}
+
+fn complete_input(input: &str, cursor: usize) -> Vec<CompletionItem> {
+    let prefix = input
+        .get(..cursor.min(input.len()))
+        .unwrap_or(input)
+        .trim_start();
+
+    if let Some(param_prefix) = mode_param_key_prefix(prefix) {
+        return MODE_PARAM_SPECS
+            .iter()
+            .filter(|param| param.name.starts_with(param_prefix))
+            .map(|param| CompletionItem {
+                label: param.name.into(),
+                insert_text: format!("{}={}", param.name, param.value_hint),
+                kind: CompletionKind::Param,
+                detail: Some(param.detail.into()),
+            })
+            .collect();
+    }
+
+    if let Some(command_prefix) = prefix.strip_prefix(':') {
+        let word = command_prefix
+            .rsplit_once(char::is_whitespace)
+            .map(|(_, word)| word)
+            .unwrap_or(command_prefix);
+        return command_names()
+            .filter_map(command_spec)
+            .filter(|spec| spec.name.starts_with(word))
+            .map(|spec| CompletionItem {
+                label: format!(":{}", spec.name),
+                insert_text: format!(":{}", spec.name),
+                kind: CompletionKind::Command,
+                detail: Some(spec.detail.into()),
+            })
+            .collect();
+    }
+
+    Vec::new()
+}
+
+fn mode_param_key_prefix(prefix: &str) -> Option<&str> {
+    let open = prefix.rfind('(')?;
+    let command = prefix[..open].strip_prefix(':')?;
+    let command = command.split_whitespace().next().unwrap_or(command);
+    if !command_spec(command)?.accepts_mode_params {
+        return None;
+    }
+    let params = &prefix[open + 1..];
+    if params.contains(')') {
+        return None;
+    }
+    let current = params
+        .rsplit_once([',', ' ', '\t'])
+        .map(|(_, current)| current)
+        .unwrap_or(params);
+    if current.contains('=') {
+        return None;
+    }
+    Some(current)
+}
+
+fn highlight_input(input: &str) -> Vec<HighlightSpan> {
+    match Tokenizer::tokenize(input) {
+        Ok(tokens) => tokens
+            .into_iter()
+            .filter_map(|spanned| {
+                let kind = match spanned.token {
+                    Token::Command(_) => HighlightKind::CommandName,
+                    Token::ModeParenOpen
+                    | Token::ModeParenClose
+                    | Token::ParamKey(_)
+                    | Token::ParamEq
+                    | Token::ParamValue(_)
+                    | Token::Comma => HighlightKind::ModeParam,
+                    Token::SerialThen
+                    | Token::SerialAlways
+                    | Token::ParallelAll
+                    | Token::ParallelRace
+                    | Token::JobAnd
+                    | Token::JobOr
+                    | Token::PipeStdout
+                    | Token::PipeAll
+                    | Token::PipeStderr => HighlightKind::Operator,
+                    Token::IdRef(_, _) => HighlightKind::IdRef,
+                    Token::Word(_) => HighlightKind::Word,
+                    Token::Colon => HighlightKind::CommandPrefix,
+                    Token::GroupOpen | Token::GroupClose => HighlightKind::Word,
+                    Token::Whitespace(_) | Token::Newline | Token::Eof => return None,
+                };
+                Some(HighlightSpan {
+                    start: spanned.span.start,
+                    end: spanned.span.end,
+                    kind,
+                })
+            })
+            .collect(),
+        Err(error) => vec![HighlightSpan {
+            start: error.pos,
+            end: error.pos.saturating_add(1).min(input.len()),
+            kind: HighlightKind::Error,
+        }],
+    }
 }
 
 #[cfg(test)]
@@ -530,5 +800,41 @@ mod tests {
                 payload: ResponsePayload::Ok(OkPayload::Pong {}),
             }
         ));
+    }
+
+    #[test]
+    fn completion_uses_shared_command_specs() {
+        let items = complete_input(":ta", 3);
+        assert!(items.iter().any(|item| item.label == ":tail"));
+    }
+
+    #[test]
+    fn completion_uses_shared_mode_param_specs() {
+        let items = complete_input(":run(re", 7);
+        assert!(items.iter().any(|item| item.label == "retry"));
+        assert!(items.iter().any(|item| item.label == "retry_delay"));
+    }
+
+    #[test]
+    fn syntax_error_message_adds_bash_hints() {
+        let message = syntax_error_message("echo hi | wc -c > out.txt", "parse failed");
+        assert!(message.contains("Possible bash syntax issue"));
+        assert!(message.contains("bare '|' is shell syntax"));
+        assert!(message.contains("redirection is shell syntax"));
+    }
+
+    #[test]
+    fn highlight_tokenizes_command_and_operator_spans() {
+        let spans = highlight_input(":run cargo test -> :jobs");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.kind == HighlightKind::CommandName)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.kind == HighlightKind::Operator)
+        );
     }
 }

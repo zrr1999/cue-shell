@@ -74,17 +74,19 @@ pub enum SchedulerMsg {
 
 /// Messages handled by the ProcessManager actor.
 pub enum ProcessMgrMsg {
-    /// Spawn a child process (or pipeline) for the given job.
+    /// Spawn a child process, pipeline, or job-local expression for the given job.
     SpawnJob {
         job_id: cue_core::JobId,
-        /// Full pipeline.  Single-segment → spawn one process via PTY.
-        /// Multi-segment → spawn natively with OS pipes between children.
-        pipeline: cue_core::pipeline::Pipeline,
+        /// Full job plan. A simple single-segment pipeline can use PTY; compound
+        /// plans run as one JobId with stream output.
+        plan: cue_core::pipeline::JobPlan,
         scope_hash: ScopeHash,
         /// Override the scope's cwd for this specific invocation.
         cwd_override: Option<std::path::PathBuf>,
         /// Whether the wrapper binary should be prepended to each segment.
         wrapper_enabled: bool,
+        /// Whether to allocate a PTY. `false` uses pipes (stdout/stderr).
+        pty_enabled: bool,
     },
     /// Kill a running job.
     KillJob { job_id: cue_core::JobId },
@@ -92,7 +94,7 @@ pub enum ProcessMgrMsg {
     GetOutput {
         job_id: cue_core::JobId,
         tail_bytes: usize,
-        reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+        reply: tokio::sync::oneshot::Sender<Option<OutputSnapshot>>,
     },
     /// Read the stderr tail of a running job.
     /// Returns `None` when the job is not in the live map (completed or unknown).
@@ -132,12 +134,22 @@ pub enum ProcessMgrMsg {
     Shutdown,
 }
 
+/// Snapshot of a job output stream, as returned by `ProcessMgrMsg::GetOutput`.
+pub struct OutputSnapshot {
+    /// Captured bytes (tail of the ring buffer, or empty).
+    pub data: Vec<u8>,
+    /// True when older bytes were omitted by ring-buffer overflow or tail limit.
+    pub truncated: bool,
+}
+
 /// Snapshot of a job's stderr, as returned by `ProcessMgrMsg::GetStderr`.
 pub struct StderrSnapshot {
     /// True when the job used a PTY (stdout and stderr are merged).
     pub pty_merged: bool,
     /// Captured bytes (tail of the ring buffer, or empty).
     pub data: Vec<u8>,
+    /// True when older bytes were omitted by ring-buffer overflow or tail limit.
+    pub truncated: bool,
 }
 
 /// Messages handled by the ScopeStore actor.

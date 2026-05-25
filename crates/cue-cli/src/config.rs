@@ -12,6 +12,8 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub transport: TransportConfig,
+    #[serde(default)]
+    pub extensions: ExtensionsConfig,
 }
 
 impl Config {
@@ -177,6 +179,21 @@ pub struct SshProfile {
     pub start_command: String,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ExtensionsConfig {
+    #[serde(default)]
+    pub path_lookup: bool,
+    #[serde(default)]
+    pub commands: BTreeMap<String, ExtensionCommand>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ExtensionCommand {
+    pub command: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedTransport {
     Unix {
@@ -301,6 +318,34 @@ destination = "devbox"
                 gateway_command: "cued gateway --stdio".into(),
                 start_command: "cued start".into(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_external_extensions() {
+        let config = Config::load_from_sources(
+            Some((
+                Path::new("client.toml"),
+                r#"
+[extensions]
+path_lookup = true
+
+[extensions.commands.foo]
+command = "cue-foo"
+description = "Foo extension"
+"#,
+            )),
+            None,
+        )
+        .expect("load config");
+
+        assert!(config.extensions.path_lookup);
+        assert_eq!(
+            config.extensions.commands.get("foo"),
+            Some(&ExtensionCommand {
+                command: "cue-foo".into(),
+                description: Some("Foo extension".into()),
+            })
         );
     }
 

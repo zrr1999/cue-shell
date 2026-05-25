@@ -48,7 +48,7 @@ enum Message {
 {"type": "response", "id": 1, "payload": {"Ok": {"ChainCreated": {"chain_id": "CH1", "job_ids": ["J1"], "chain": {"id": "CH1", "pipeline": "cargo test -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo test", "status": "Running", "job_id": "J1", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": null, "start_scope": null, "end_scope": null, "open_hint": null}]}}}}}
 
 // Response (error)
-{"type": "response", "id": 1, "payload": {"Err": {"code": "INVALID_SYNTAX", "message": "unexpected token '||?' at position 15"}}}
+{"type": "response", "id": 1, "payload": {"Err": {"code": "INVALID_SYNTAX", "message": "cue chain operator `|?|` must be surrounded by whitespace"}}}
 
 // Response (success — Eval resolved to a multiline script submission)
 {"type": "response", "id": 4, "payload": {"Ok": {"ScriptCreated": {"script_id": "R7", "items": [{"index": 0, "source": "cargo test", "result": {"kind": "job", "job_id": "J9", "start_scope": "S@32b17bec", "open_hint": "Stream"}}, {"index": 1, "source": "cargo fmt -> cargo clippy", "result": {"kind": "chain", "chain_id": "CH5", "job_ids": ["J10", "J11"], "chain": {"id": "CH5", "pipeline": "cargo fmt -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo fmt", "status": "Running", "job_id": "J10", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": "J11", "start_scope": null, "end_scope": null, "open_hint": null}]}}}], "submit_error": null}}}}
@@ -130,6 +130,19 @@ enum RequestPayload {
     Complete { input: String, cursor: usize, mode: Mode },
     Highlight { input: String },
 
+    // Typed query/control APIs for non-interactive clients. These mirror common
+    // Eval commands but support server-side limits, pagination metadata, and
+    // typed job/cron control without overloading IDs.
+    ListJobs { limit: Option<usize> },
+    ListCrons { limit: Option<usize> },
+    ListScopes { limit: Option<usize> },
+    ShowLog { id: Option<String>, limit: Option<usize>, tail_bytes: Option<usize> },
+    JobOutput { id: String, stdout_bytes: Option<usize>, stderr_bytes: Option<usize> },
+    KillJob { id: String },
+    RemoveCron { id: String },
+    ShowEnv { tail_bytes: Option<usize> },
+    ShowConfig { tail_bytes: Option<usize> },
+
     // System
     Ping {},
     Shutdown {},
@@ -165,19 +178,37 @@ enum OkPayload {
 
     JobInfo(JobInfo),
     JobList(Vec<JobInfo>),
+    JobListPage { jobs: Vec<JobInfo>, page: PageInfo },
     CronList(Vec<CronInfo>),   // includes persisted cron status/history for reconnect snapshots
+    CronListPage { crons: Vec<CronInfo>, page: PageInfo },
     ScopeInfo(ScopeInfo),
+    ScopeList(Vec<ScopeInfo>),
+    ScopeListPage { scopes: Vec<ScopeInfo>, page: PageInfo },
     Output { id: String, data: String, truncated: bool },
+    JobOutput { id: String, stdout: StreamText, stderr: StreamText, stderr_pty_merged: bool },
 
     // Eval can return any of the above depending on the parsed command.
     // Additionally, some commands produce text output:
     EvalText { text: String },  // for :help, :env list, etc.
+    TextOutput { text: String, truncated: bool },
     // Editor services
     CompletionList { items: Vec<CompletionItem> },
     HighlightResult { spans: Vec<HighlightSpan> },
 
     FgAttached { id: String },  // J<n> = live PTY attach
     Pong {},
+}
+
+struct PageInfo {
+    total: usize,
+    shown: usize,
+    limit: Option<usize>,
+    truncated: bool,
+}
+
+struct StreamText {
+    data: String,
+    truncated: bool,
 }
 
 // Completion item (for Complete request)

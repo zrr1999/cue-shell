@@ -190,7 +190,7 @@ async fn connect_bridge(
     let socket = UnixStream::connect(socket)
         .await
         .expect("connect bridge socket");
-    let relay = tokio::spawn(cued::gateway_stdio::relay(
+    let relay = tokio::spawn(cue_daemon::gateway_stdio::relay(
         relay_input,
         relay_output,
         socket,
@@ -203,6 +203,19 @@ fn write_executable_script(path: &Path, body: &str) {
     let mut permissions = fs::metadata(path).expect("stat test script").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).expect("chmod test script");
+}
+
+fn write_server_config(env: &TestEnv, text: &str) {
+    let config_dir = env.root.join("config/cue-shell");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::write(config_dir.join("server.toml"), text).expect("write server.toml");
+}
+
+fn job_id_from_created(resp: ResponsePayload) -> String {
+    match resp {
+        ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+        other => panic!("expected JobCreated, got {other:?}"),
+    }
 }
 
 /// Write a length-prefixed JSON message to the stream.
@@ -246,6 +259,28 @@ where
             && rid == id
         {
             return payload;
+        }
+    }
+}
+
+/// Send a request and return the matching response plus any messages observed before it.
+async fn roundtrip_with_messages<S>(
+    stream: &mut S,
+    id: u32,
+    payload: RequestPayload,
+) -> (ResponsePayload, Vec<Message>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send(stream, &request(id, payload)).await;
+    let mut observed = Vec::new();
+    loop {
+        let msg = recv(stream).await;
+        match msg {
+            Message::Response {
+                id: rid, payload, ..
+            } if rid == id => return (payload, observed),
+            other => observed.push(other),
         }
     }
 }
@@ -869,6 +904,171 @@ async fn test_chain_execution() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_job_logical_operators_stay_single_job() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("job-logical");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: "false && printf no || printf yes".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let job_id = match resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected single JobCreated, got {other:?}"),
+        };
+
+        let status = wait_for_job_terminal(&mut stream, 2, &job_id).await;
+        assert_eq!(status, JobStatus::Done);
+
+        let out_resp = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match out_resp {
+            ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+                assert_eq!(data.trim(), "yes");
+                assert!(!data.contains("no"));
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_chain_parallel_operator_uses_triple_pipe() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("triple-pipe");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: "printf a ||| printf b".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match resp {
+            ResponsePayload::Ok(OkPayload::ChainCreated { job_ids, .. }) => {
+                assert_eq!(job_ids.len(), 2);
+            }
+            other => panic!("expected ChainCreated for |||, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_job_local_cd_does_not_update_global_scope_by_default() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("job-local-cd");
+        let job_cwd = env.root.join("job-cwd");
+        std::fs::create_dir_all(&job_cwd).expect("create job cwd");
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: format!("cd {} && pwd", job_cwd.display()),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let job_id = match resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected JobCreated, got {other:?}"),
+        };
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &job_id).await,
+            JobStatus::Done
+        );
+
+        let out_resp = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match out_resp {
+            ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+                let actual = std::fs::canonicalize(data.trim()).expect("canonicalize job pwd");
+                let expected = std::fs::canonicalize(&job_cwd).expect("canonicalize expected cwd");
+                assert_eq!(actual, expected);
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+
+        let pwd_resp = roundtrip(
+            &mut stream,
+            4,
+            RequestPayload::Eval {
+                input: "pwd".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let pwd_job = match pwd_resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected JobCreated, got {other:?}"),
+        };
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 5, &pwd_job).await,
+            JobStatus::Done
+        );
+
+        let pwd_out = roundtrip(
+            &mut stream,
+            6,
+            RequestPayload::Eval {
+                input: format!(":out {pwd_job}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match pwd_out {
+            ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+                let actual = std::fs::canonicalize(data.trim()).expect("canonicalize global pwd");
+                let expected = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                    .expect("canonicalize initial cwd");
+                assert_eq!(actual, expected);
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_job_kill() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("kill");
@@ -1014,21 +1214,33 @@ async fn test_fg_attach_input_and_detach() {
             "expected FgOutput containing tty echo, got {msgs:?}"
         );
 
-        let detach_resp = roundtrip(&mut stream, 4, RequestPayload::FgDetach {}).await;
+        let (detach_resp, mut msgs) =
+            roundtrip_with_messages(&mut stream, 4, RequestPayload::FgDetach {}).await;
         assert!(
             matches!(detach_resp, ResponsePayload::Ok(OkPayload::Ack {})),
             "expected Ack for fg detach, got {detach_resp:?}"
         );
 
-        let msgs = collect_until(&mut stream, Duration::from_secs(5), |msg| {
+        if !msgs.iter().any(|msg| {
             matches!(
                 msg,
                 Message::Event {
                     payload: EventPayload::FgExited { id, reason },
                 } if id == &job_id && reason == "detached"
             )
-        })
-        .await;
+        }) {
+            msgs.extend(
+                collect_until(&mut stream, Duration::from_secs(5), |msg| {
+                    matches!(
+                        msg,
+                        Message::Event {
+                            payload: EventPayload::FgExited { id, reason },
+                        } if id == &job_id && reason == "detached"
+                    )
+                })
+                .await,
+            );
+        }
         assert!(
             msgs.iter().any(|msg| matches!(
                 msg,
@@ -1780,6 +1992,166 @@ async fn test_native_stderr_only_pipeline_keeps_stdout_outside_pipe() {
             }
             other => panic!("expected stderr Output, got {other:?}"),
         }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wrapper_allowlist_wraps_single_pipeline_and_logical_jobs() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("wrapper-allowlist");
+        let wrapper_log = env.root.join("wrapper.log");
+        let wrapper = env.root.join("rtk-test");
+        write_executable_script(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\nexec \"$@\"\n",
+                wrapper_log.display()
+            ),
+        );
+        write_server_config(
+            &env,
+            &format!(
+                r#"
+[wrapper]
+enabled = true
+binary = "{}"
+
+[wrapper.allowlist]
+commands = ["printf", "sed", "true"]
+"#,
+                wrapper.display()
+            ),
+        );
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let single = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":run(pty=false) printf single".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let single_job = job_id_from_created(single);
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &single_job).await,
+            JobStatus::Done
+        );
+
+        let pipeline = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: ":run(pty=false) printf pipe |> sed s/pipe/wrapped/".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let pipeline_job = job_id_from_created(pipeline);
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 4, &pipeline_job).await,
+            JobStatus::Done
+        );
+
+        let logical = roundtrip(
+            &mut stream,
+            5,
+            RequestPayload::Eval {
+                input: ":run(pty=false) true && printf logical".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let logical_job = job_id_from_created(logical);
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 6, &logical_job).await,
+            JobStatus::Done
+        );
+
+        let log = fs::read_to_string(&wrapper_log).expect("read wrapper log");
+        assert!(
+            log.contains("printf\n"),
+            "expected printf wrap, got {log:?}"
+        );
+        assert!(log.contains("sed\n"), "expected sed wrap, got {log:?}");
+        assert!(log.contains("true\n"), "expected true wrap, got {log:?}");
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wrapper_non_allowlisted_and_param_disabled_do_not_wrap() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("wrapper-skip");
+        let wrapper_log = env.root.join("wrapper.log");
+        let wrapper = env.root.join("rtk-test");
+        write_executable_script(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\nexec \"$@\"\n",
+                wrapper_log.display()
+            ),
+        );
+        write_server_config(
+            &env,
+            &format!(
+                r#"
+[wrapper]
+enabled = true
+binary = "{}"
+
+[wrapper.allowlist]
+commands = ["printf"]
+"#,
+                wrapper.display()
+            ),
+        );
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let non_allowlisted = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":run(pty=false) echo plain".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let non_allowlisted_job = job_id_from_created(non_allowlisted);
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &non_allowlisted_job).await,
+            JobStatus::Done
+        );
+
+        let disabled = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: ":run(pty=false, wrapper=false) printf disabled".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let disabled_job = job_id_from_created(disabled);
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 4, &disabled_job).await,
+            JobStatus::Done
+        );
+
+        let log = fs::read_to_string(&wrapper_log).unwrap_or_default();
+        assert!(log.is_empty(), "wrapper should not have run, got {log:?}");
 
         shutdown_daemon(&mut stream, &mut child).await;
     })

@@ -4,7 +4,7 @@
 //! stdout/stderr into a [`RingBuffer`], writes a persistent log file, and
 //! publishes output chunks + state-change events.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::Stdio;
@@ -18,11 +18,12 @@ use tracing::{debug, error, info, warn};
 use cue_core::JobId;
 use cue_core::ipc::{EventPayload, Stream as OutputStream};
 use cue_core::job::JobStatus;
+use cue_core::pipeline::{JobPlan, command_prefers_foreground};
 use cue_core::scope::EnvSnapshot;
 
 use super::{
-    ActorSystem, EventBusMsg, GatewayMsg, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg,
-    StderrSnapshot,
+    ActorSystem, EventBusMsg, GatewayMsg, OutputSnapshot, ProcessMgrMsg, SchedulerMsg,
+    ScopeStoreMsg, StderrSnapshot,
 };
 use crate::ring_buffer::RingBuffer;
 use crate::runtime_env::effective_snapshot;
@@ -37,7 +38,7 @@ struct ProcessEntry {
     _reader_handle: tokio::task::JoinHandle<()>,
     /// Send on this channel to request a kill.
     kill_tx: mpsc::Sender<()>,
-    /// Shared ring buffer holding the latest output bytes (FIX 7).
+    /// Shared ring buffer holding the latest output bytes for live-tail queries.
     ring_buffer: Arc<Mutex<RingBuffer>>,
     /// Separate stderr ring buffer.  `None` in PTY mode (streams are merged).
     stderr_ring: Option<Arc<Mutex<RingBuffer>>>,
@@ -81,6 +82,11 @@ enum PipelineReaderMsg {
     Closed,
 }
 
+enum JobLocalBuiltin {
+    Cd { path: String },
+    EnvSet { assignments: Vec<String> },
+}
+
 /// Spawn the ProcessManager actor task.
 pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
     tokio::spawn(async move {
@@ -88,7 +94,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
         let mut children: HashMap<u32, ProcessEntry> = HashMap::new();
 
-        // FIX 2: internal channel for reader tasks to request cleanup.
+        // Internal channel for reader tasks to request cleanup.
         let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<JobId>(super::ACTOR_CHANNEL_CAP);
 
         loop {
@@ -98,12 +104,13 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     match msg {
                 ProcessMgrMsg::SpawnJob {
                     job_id,
-                    pipeline,
+                    plan,
                     scope_hash,
                     cwd_override,
                     wrapper_enabled,
+                    pty_enabled,
                 } => {
-                    info!(%job_id, segments = pipeline.segments.len(), %scope_hash, "process_mgr: spawn");
+                    info!(%job_id, plan = %job_plan_to_text(&plan), %scope_hash, "process_mgr: spawn");
 
                     // 1. Query ScopeStore for the environment snapshot.
                     let snapshot = {
@@ -118,7 +125,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             .is_err()
                         {
                             error!(%job_id, "process_mgr: scope_store channel closed");
-                            // FIX 1: fail the job instead of continuing with daemon env.
+                            // Fail the job instead of continuing with the daemon environment.
                             emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
                             let _ = sys.scheduler.send(SchedulerMsg::JobFinished { job_id, exit_code: -1 }).await;
                             continue;
@@ -126,14 +133,14 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         match rx.await {
                             Ok(Some(scope)) => scope.snapshot,
                             Ok(None) => {
-                                // FIX 1: scope not found — fail the job.
+                                // Scope resolution failed, so the job cannot safely inherit env.
                                 error!(%job_id, %scope_hash, "process_mgr: scope not found");
                                 emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
                                 let _ = sys.scheduler.send(SchedulerMsg::JobFinished { job_id, exit_code: -1 }).await;
                                 continue;
                             }
                             Err(_) => {
-                                // FIX 1: oneshot dropped — fail the job.
+                                // Scope resolution failed, so the job cannot safely inherit env.
                                 error!(%job_id, "process_mgr: scope_store reply dropped");
                                 emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
                                 let _ = sys.scheduler.send(SchedulerMsg::JobFinished { job_id, exit_code: -1 }).await;
@@ -169,28 +176,17 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
                     clear_job_logs(job_id).await;
 
-                    let entry = if pipeline.segments.len() > 1 {
-                        spawn_native_pipeline_job(
-                            job_id,
-                            &pipeline,
-                            effective_snapshot.as_ref(),
-                            cwd_override.as_ref(),
-                            sys.clone(),
-                            cleanup_tx.clone(),
-                        )
-                        .await
-                    } else {
-                        spawn_single_pty_job(
-                            job_id,
-                            &pipeline,
-                            effective_snapshot.as_ref(),
-                            cwd_override.as_ref(),
-                            wrapper_enabled,
-                            sys.clone(),
-                            cleanup_tx.clone(),
-                        )
-                        .await
-                    };
+                    let entry = spawn_job_plan(
+                        job_id,
+                        &plan,
+                        effective_snapshot.as_ref(),
+                        cwd_override.as_ref(),
+                        wrapper_enabled,
+                        pty_enabled,
+                        sys.clone(),
+                        cleanup_tx.clone(),
+                    )
+                    .await;
 
                     match entry {
                         Ok(entry) => {
@@ -225,23 +221,34 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     }
                 }
 
-                // FIX 7: expose ring-buffer contents for live-tail queries.
+                // Expose ring-buffer contents for live-tail queries.
                 ProcessMgrMsg::GetOutput { job_id, tail_bytes, reply } => {
-                    let result = children
-                        .get(&job_id.0)
-                        .map(|entry| entry.ring_buffer.lock().unwrap().tail(tail_bytes));
+                    let result = children.get(&job_id.0).map(|entry| {
+                        let (data, truncated) = entry
+                            .ring_buffer
+                            .lock()
+                            .unwrap()
+                            .tail_with_truncation(tail_bytes);
+                        OutputSnapshot { data, truncated }
+                    });
                     let _ = reply.send(result);
                 }
 
                 ProcessMgrMsg::GetStderr { job_id, tail_bytes, reply } => {
                     let result = children.get(&job_id.0).map(|entry| match &entry.stderr_ring {
-                        Some(ring) => StderrSnapshot {
-                            pty_merged: false,
-                            data: ring.lock().unwrap().tail(tail_bytes),
-                        },
+                        Some(ring) => {
+                            let (data, truncated) =
+                                ring.lock().unwrap().tail_with_truncation(tail_bytes);
+                            StderrSnapshot {
+                                pty_merged: false,
+                                data,
+                                truncated,
+                            }
+                        }
                         None => StderrSnapshot {
                             pty_merged: true,
                             data: Vec::new(),
+                            truncated: false,
                         },
                     });
                     let _ = reply.send(result);
@@ -357,7 +364,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     debug!("process_mgr: shutting down — killing all children");
                     for entry in children.values() {
                         if !entry.status.is_terminal() {
-                            // FIX 4: non-blocking send so shutdown cannot stall.
+                            // Non-blocking send keeps shutdown from stalling on a full channel.
                             let _ = entry.kill_tx.try_send(());
                         }
                     }
@@ -368,7 +375,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     }
                 }
 
-                // FIX 2: reader task finished — remove the stale entry.
+                // Reader task finished; remove the stale entry.
                 Some(job_id) = cleanup_rx.recv() => {
                     debug!(%job_id, "process_mgr: cleaning up finished child");
                     children.remove(&job_id.0);
@@ -461,6 +468,7 @@ async fn write_job_input(input: &JobInput, data: &[u8]) -> std::io::Result<()> {
 
 #[derive(Clone)]
 struct ExpandedSegment {
+    command_line: Vec<String>,
     program: String,
     args: Vec<String>,
     pipe_to_next: Option<cue_core::pipeline::PipeOp>,
@@ -486,9 +494,11 @@ fn expand_pipeline_segments(
             );
             return Err(());
         };
+        let args = command_line.get(1..).unwrap_or(&[]).to_vec();
         expanded.push(ExpandedSegment {
+            command_line,
             program,
-            args: command_line.get(1..).unwrap_or(&[]).to_vec(),
+            args,
             pipe_to_next: segment.pipe_to_next,
         });
     }
@@ -533,6 +543,273 @@ fn log_spawn_failure(
     );
 }
 
+fn pipeline_has_job_local_builtin(pipeline: &cue_core::pipeline::Pipeline) -> bool {
+    pipeline.segments.len() == 1
+        && detect_job_local_builtin(&pipeline.segments[0].command).is_some()
+}
+
+fn detect_job_local_builtin(words: &[String]) -> Option<JobLocalBuiltin> {
+    let command = words.first()?.as_str();
+    match command {
+        "cd" => Some(JobLocalBuiltin::Cd {
+            path: words.get(1).cloned().unwrap_or_else(|| "~".into()),
+        }),
+        "env" if words.get(1).map(String::as_str) == Some("set") => Some(JobLocalBuiltin::EnvSet {
+            assignments: words.get(2..).unwrap_or(&[]).to_vec(),
+        }),
+        _ => None,
+    }
+}
+
+fn job_plan_to_text(plan: &JobPlan) -> String {
+    match plan {
+        JobPlan::Pipeline(pipeline) => pipeline_to_text(pipeline),
+        JobPlan::And { left, right } => {
+            format!("{} && {}", job_plan_to_text(left), job_plan_to_text(right))
+        }
+        JobPlan::Or { left, right } => {
+            format!("{} || {}", job_plan_to_text(left), job_plan_to_text(right))
+        }
+    }
+}
+
+fn pipeline_to_text(pipeline: &cue_core::pipeline::Pipeline) -> String {
+    pipeline
+        .segments
+        .iter()
+        .map(|segment| {
+            let cmd = segment.command.join(" ");
+            match segment.pipe_to_next {
+                Some(cue_core::pipeline::PipeOp::Stdout) => format!("{cmd} |>"),
+                Some(cue_core::pipeline::PipeOp::StdoutStderr) => format!("{cmd} |&>"),
+                Some(cue_core::pipeline::PipeOp::StderrOnly) => format!("{cmd} |!>"),
+                None => cmd,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_job_plan(
+    job_id: JobId,
+    plan: &JobPlan,
+    snapshot: Option<&EnvSnapshot>,
+    cwd_override: Option<&std::path::PathBuf>,
+    wrapper_enabled: bool,
+    pty_enabled: bool,
+    sys: ActorSystem,
+    cleanup_tx: mpsc::Sender<JobId>,
+) -> Result<ProcessEntry, ()> {
+    match plan {
+        JobPlan::Pipeline(pipeline) if pipeline_has_job_local_builtin(pipeline) => {
+            spawn_logical_job(
+                job_id,
+                plan.clone(),
+                snapshot.cloned(),
+                cwd_override.cloned(),
+                wrapper_enabled,
+                sys,
+                cleanup_tx,
+            )
+            .await
+        }
+        JobPlan::Pipeline(pipeline) if pipeline.segments.len() == 1 && pty_enabled => {
+            spawn_single_pty_job(
+                job_id,
+                pipeline,
+                snapshot,
+                cwd_override,
+                wrapper_enabled,
+                sys,
+                cleanup_tx,
+            )
+            .await
+        }
+        // Single-segment without PTY → spawn with pipes.
+        JobPlan::Pipeline(pipeline) if pipeline.segments.len() == 1 => {
+            spawn_single_pipe_job(
+                job_id,
+                pipeline,
+                snapshot,
+                cwd_override,
+                wrapper_enabled,
+                sys,
+                cleanup_tx,
+            )
+            .await
+        }
+        JobPlan::Pipeline(pipeline) => {
+            spawn_native_pipeline_job(
+                job_id,
+                pipeline,
+                snapshot,
+                cwd_override,
+                wrapper_enabled,
+                sys,
+                cleanup_tx,
+            )
+            .await
+        }
+        JobPlan::And { .. } | JobPlan::Or { .. } => {
+            spawn_logical_job(
+                job_id,
+                plan.clone(),
+                snapshot.cloned(),
+                cwd_override.cloned(),
+                wrapper_enabled,
+                sys,
+                cleanup_tx,
+            )
+            .await
+        }
+    }
+}
+
+/// Spawn a single-segment job with pipes (stdout/stderr piped, no PTY).
+/// Used when `pty=false` is specified — the child cannot detect a terminal.
+async fn spawn_single_pipe_job(
+    job_id: JobId,
+    pipeline: &cue_core::pipeline::Pipeline,
+    snapshot: Option<&EnvSnapshot>,
+    cwd_override: Option<&std::path::PathBuf>,
+    wrapper_enabled: bool,
+    sys: ActorSystem,
+    cleanup_tx: mpsc::Sender<JobId>,
+) -> Result<ProcessEntry, ()> {
+    use tokio::io::AsyncReadExt;
+
+    let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
+    let segment = &segments[0];
+    let (program, args) = wrap_segment_if_enabled(&sys, wrapper_enabled, segment);
+
+    let mut cmd = tokio::process::Command::new(&program);
+    if !args.is_empty() {
+        cmd.args(&args);
+    }
+    if let Some(snap) = snapshot {
+        apply_env(&mut cmd, snap);
+    }
+    if let Some(ref cwd) = cwd_override {
+        cmd.current_dir(cwd);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        error!(%job_id, program = %program, err = %e, "process_mgr: pipe spawn failed");
+    })?;
+    let pid = child.id().unwrap_or(0);
+    info!(%job_id, pid, "process_mgr: pipe child spawned");
+
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+
+    let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
+    let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
+    let fg_owner = Arc::new(Mutex::new(None));
+    let sys_clone = sys.clone();
+    let ring_clone = ring_buffer.clone();
+    let stderr_clone = stderr_ring.clone();
+    let fg_clone = fg_owner.clone();
+    let cleanup_tx_clone = cleanup_tx.clone();
+
+    // Read stdout and stderr concurrently, wait for exit.
+    let log_file = open_output_log(job_id).await;
+    let reader_handle = tokio::spawn(async move {
+        let log = Arc::new(Mutex::new(log_file));
+        let log_clone = log.clone();
+        let sys_emit = sys_clone.clone();
+
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = buf[..n].to_vec();
+                        ring_clone.lock().unwrap().push(&chunk);
+                        if let Ok(mut guard) = log_clone.lock()
+                            && let Some(f) = guard.as_mut()
+                        {
+                            use std::io::Write;
+                            let _ = f.write_all(&chunk);
+                        }
+                        emit_output(&sys_emit, job_id, OutputStream::Stdout, &chunk).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let stderr_log = open_stderr_log(job_id).await;
+        let stderr_log = Arc::new(Mutex::new(stderr_log));
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = buf[..n].to_vec();
+                        stderr_clone.lock().unwrap().push(&chunk);
+                        if let Ok(mut guard) = stderr_log.lock()
+                            && let Some(f) = guard.as_mut()
+                        {
+                            use std::io::Write;
+                            let _ = f.write_all(&chunk);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+
+        let status = child.wait().await.ok();
+        let exit_code = status.and_then(|s| s.code()).unwrap_or(-1);
+        info!(%job_id, exit_code, "process_mgr: pipe child exited");
+
+        let _ = sys_clone
+            .event_bus
+            .send(EventBusMsg::Publish {
+                payload: EventPayload::OutputEof {
+                    id: job_id.to_string(),
+                },
+                channel: format!("output:{job_id}"),
+            })
+            .await;
+
+        let new_state = if exit_code == 0 {
+            JobStatus::Done
+        } else {
+            JobStatus::Failed
+        };
+        emit_state_change(&sys_clone, job_id, JobStatus::Running, new_state).await;
+        emit_fg_exit(&sys_clone, &fg_clone, job_id, &format!("exit {exit_code}")).await;
+        let _ = sys_clone
+            .scheduler
+            .send(SchedulerMsg::JobFinished { job_id, exit_code })
+            .await;
+        let _ = cleanup_tx_clone.send(job_id).await;
+    });
+
+    Ok(ProcessEntry {
+        job_id,
+        status: JobStatus::Running,
+        _reader_handle: reader_handle,
+        kill_tx: mpsc::channel::<()>(1).0,
+        ring_buffer,
+        stderr_ring: Some(stderr_ring),
+        input: None,
+        resize: None,
+        fg_owner,
+    })
+}
+
 async fn spawn_single_pty_job(
     job_id: JobId,
     pipeline: &cue_core::pipeline::Pipeline,
@@ -544,7 +821,7 @@ async fn spawn_single_pty_job(
 ) -> Result<ProcessEntry, ()> {
     let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
     let segment = &segments[0];
-    let (program, args) = wrap_single_command_if_enabled(&sys, wrapper_enabled, segment);
+    let (program, args) = wrap_segment_if_enabled(&sys, wrapper_enabled, segment);
 
     let mut cmd = tokio::process::Command::new(&program);
     if !args.is_empty() {
@@ -668,7 +945,7 @@ async fn spawn_single_pty_job(
     })
 }
 
-fn wrap_single_command_if_enabled(
+fn wrap_segment_if_enabled(
     sys: &ActorSystem,
     wrapper_enabled: bool,
     segment: &ExpandedSegment,
@@ -680,7 +957,8 @@ fn wrap_single_command_if_enabled(
     }
 
     let wrapper = &sys.config.wrapper;
-    if wrapper.binary.is_empty() || !wrapper.should_wrap(&program, false, Some(true)) {
+    let is_foreground = command_prefers_foreground(&segment.command_line);
+    if wrapper.binary.is_empty() || !wrapper.should_wrap(&program, is_foreground, Some(true)) {
         return (program, args);
     }
 
@@ -695,6 +973,7 @@ async fn spawn_native_pipeline_job(
     pipeline: &cue_core::pipeline::Pipeline,
     snapshot: Option<&EnvSnapshot>,
     cwd_override: Option<&std::path::PathBuf>,
+    wrapper_enabled: bool,
     sys: ActorSystem,
     cleanup_tx: mpsc::Sender<JobId>,
 ) -> Result<ProcessEntry, ()> {
@@ -704,7 +983,14 @@ async fn spawn_native_pipeline_job(
         input,
         stdout_sources,
         stderr_sources,
-    } = spawn_native_pipeline(job_id, &segments, snapshot, cwd_override)?;
+    } = spawn_native_pipeline(
+        job_id,
+        &segments,
+        snapshot,
+        cwd_override,
+        wrapper_enabled,
+        &sys,
+    )?;
 
     let pids: Vec<u32> = children
         .iter()
@@ -746,11 +1032,57 @@ async fn spawn_native_pipeline_job(
     })
 }
 
+async fn spawn_logical_job(
+    job_id: JobId,
+    plan: JobPlan,
+    snapshot: Option<EnvSnapshot>,
+    cwd_override: Option<std::path::PathBuf>,
+    wrapper_enabled: bool,
+    sys: ActorSystem,
+    cleanup_tx: mpsc::Sender<JobId>,
+) -> Result<ProcessEntry, ()> {
+    let log_file = open_output_log(job_id).await;
+    let stderr_log = open_stderr_log(job_id).await;
+    let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
+    let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
+    let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
+    let fg_owner = Arc::new(Mutex::new(None));
+    let reader_handle = tokio::spawn(logical_job_task(
+        job_id,
+        plan,
+        snapshot,
+        cwd_override,
+        log_file,
+        stderr_log,
+        kill_rx,
+        wrapper_enabled,
+        sys.clone(),
+        ring_buffer.clone(),
+        stderr_ring.clone(),
+        fg_owner.clone(),
+        cleanup_tx.clone(),
+    ));
+
+    Ok(ProcessEntry {
+        job_id,
+        status: JobStatus::Running,
+        _reader_handle: reader_handle,
+        kill_tx,
+        ring_buffer,
+        stderr_ring: Some(stderr_ring),
+        input: None,
+        resize: None,
+        fg_owner,
+    })
+}
+
 fn spawn_native_pipeline(
     job_id: JobId,
     segments: &[ExpandedSegment],
     snapshot: Option<&EnvSnapshot>,
     cwd_override: Option<&std::path::PathBuf>,
+    wrapper_enabled: bool,
+    sys: &ActorSystem,
 ) -> Result<NativePipelineSpawn, ()> {
     let mut children = Vec::with_capacity(segments.len());
     let mut stdout_sources = Vec::new();
@@ -759,9 +1091,10 @@ fn spawn_native_pipeline(
     let mut next_stdin = None;
 
     for (idx, segment) in segments.iter().enumerate() {
-        let mut cmd = tokio::process::Command::new(&segment.program);
-        if !segment.args.is_empty() {
-            cmd.args(&segment.args);
+        let (program, args) = wrap_segment_if_enabled(sys, wrapper_enabled, segment);
+        let mut cmd = tokio::process::Command::new(&program);
+        if !args.is_empty() {
+            cmd.args(&args);
         }
         configure_command(&mut cmd, snapshot, cwd_override);
 
@@ -809,7 +1142,7 @@ fn spawn_native_pipeline(
         }
 
         let mut child = cmd.spawn().map_err(|error| {
-            log_spawn_failure(job_id, &segment.program, &segment.args, snapshot, &error);
+            log_spawn_failure(job_id, &program, &args, snapshot, &error);
         })?;
         if idx == 0 {
             input = child
@@ -852,8 +1185,8 @@ fn create_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
 
 /// Open (or create) the append-only log file for a job's output.
 ///
-/// FIX 5: runs on the blocking thread-pool so the tokio runtime thread is
-/// never stalled by filesystem syscalls.
+/// Runs on the blocking thread pool so filesystem syscalls do not stall the
+/// Tokio runtime thread.
 async fn open_output_log(job_id: JobId) -> Option<std::fs::File> {
     tokio::task::spawn_blocking(move || {
         let dir = crate::dirs::output_dir();
@@ -935,7 +1268,7 @@ async fn reader_task(
     fg_owner: Arc<Mutex<Option<u64>>>,
     cleanup_tx: mpsc::Sender<JobId>,
 ) {
-    // FIX 5: wrap the log file so it can be shared with spawn_blocking.
+    // Wrap the log file so it can be shared with `spawn_blocking`.
     let log_file = Arc::new(Mutex::new(log_file));
     let mut pty_buf = vec![0u8; 8192];
     let mut pty_done = false;
@@ -964,7 +1297,7 @@ async fn reader_task(
                 emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Killed).await;
                 emit_fg_exit(&sys, &fg_owner, job_id, "killed").await;
                 let _ = sys.scheduler.send(SchedulerMsg::JobFinished { job_id, exit_code: -1 }).await;
-                // FIX 2: tell the main loop to remove our entry.
+                // Tell the main loop to remove our entry.
                 let _ = cleanup_tx.send(job_id).await;
                 return;
             }
@@ -996,7 +1329,7 @@ async fn reader_task(
         }
     }
 
-    // FIX 3: wait for exit status while still honouring late kill requests.
+    // Wait for exit status while still honoring late kill requests.
     let (exit_code, was_killed) = tokio::select! {
         status = child.wait() => {
             let code = match status {
@@ -1064,7 +1397,7 @@ async fn reader_task(
             .await;
     }
 
-    // FIX 2: tell the main loop to remove our entry.
+    // Tell the main loop to remove our entry.
     let _ = cleanup_tx.send(job_id).await;
 }
 
@@ -1184,6 +1517,389 @@ async fn pipeline_reader_task(
     }
 
     let _ = cleanup_tx.send(job_id).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn logical_job_task(
+    job_id: JobId,
+    plan: JobPlan,
+    snapshot: Option<EnvSnapshot>,
+    cwd_override: Option<std::path::PathBuf>,
+    log_file: Option<std::fs::File>,
+    stderr_log: Option<std::fs::File>,
+    mut kill_rx: mpsc::Receiver<()>,
+    wrapper_enabled: bool,
+    sys: ActorSystem,
+    ring: Arc<Mutex<RingBuffer>>,
+    stderr_ring: Arc<Mutex<RingBuffer>>,
+    fg_owner: Arc<Mutex<Option<u64>>>,
+    cleanup_tx: mpsc::Sender<JobId>,
+) {
+    let log_file = Arc::new(Mutex::new(log_file));
+    let stderr_log = Arc::new(Mutex::new(stderr_log));
+    let mut was_killed = false;
+    let mut local_snapshot = snapshot.unwrap_or_else(|| EnvSnapshot {
+        env: std::env::vars().collect::<BTreeMap<_, _>>(),
+        cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    });
+    if let Some(cwd) = cwd_override.as_ref() {
+        local_snapshot.cwd = cwd.clone();
+    }
+    let exit_code = run_job_plan_streaming(
+        job_id,
+        &plan,
+        &mut local_snapshot,
+        &mut kill_rx,
+        &mut was_killed,
+        wrapper_enabled,
+        &sys,
+        &ring,
+        &stderr_ring,
+        &log_file,
+        &stderr_log,
+    )
+    .await;
+
+    let _ = sys
+        .event_bus
+        .send(EventBusMsg::Publish {
+            payload: EventPayload::OutputEof {
+                id: job_id.to_string(),
+            },
+            channel: format!("output:{job_id}"),
+        })
+        .await;
+
+    if was_killed {
+        emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Killed).await;
+        emit_fg_exit(&sys, &fg_owner, job_id, "killed").await;
+        let _ = sys
+            .scheduler
+            .send(SchedulerMsg::JobFinished {
+                job_id,
+                exit_code: -1,
+            })
+            .await;
+    } else {
+        let new_state = if exit_code == 0 {
+            JobStatus::Done
+        } else {
+            JobStatus::Failed
+        };
+        emit_state_change(&sys, job_id, JobStatus::Running, new_state).await;
+        let reason = if exit_code == 0 {
+            "done".to_string()
+        } else {
+            format!("exit {exit_code}")
+        };
+        emit_fg_exit(&sys, &fg_owner, job_id, &reason).await;
+        let _ = sys
+            .scheduler
+            .send(SchedulerMsg::JobFinished { job_id, exit_code })
+            .await;
+    }
+
+    let _ = cleanup_tx.send(job_id).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_job_plan_streaming(
+    job_id: JobId,
+    plan: &JobPlan,
+    snapshot: &mut EnvSnapshot,
+    kill_rx: &mut mpsc::Receiver<()>,
+    was_killed: &mut bool,
+    wrapper_enabled: bool,
+    sys: &ActorSystem,
+    ring: &Arc<Mutex<RingBuffer>>,
+    stderr_ring: &Arc<Mutex<RingBuffer>>,
+    log_file: &Arc<Mutex<Option<std::fs::File>>>,
+    stderr_log: &Arc<Mutex<Option<std::fs::File>>>,
+) -> i32 {
+    if *was_killed {
+        return -1;
+    }
+    match plan {
+        JobPlan::Pipeline(pipeline) => {
+            run_pipeline_streaming(
+                job_id,
+                pipeline,
+                snapshot,
+                kill_rx,
+                was_killed,
+                wrapper_enabled,
+                sys,
+                ring,
+                stderr_ring,
+                log_file,
+                stderr_log,
+            )
+            .await
+        }
+        JobPlan::And { left, right } => {
+            let code = Box::pin(run_job_plan_streaming(
+                job_id,
+                left,
+                snapshot,
+                kill_rx,
+                was_killed,
+                wrapper_enabled,
+                sys,
+                ring,
+                stderr_ring,
+                log_file,
+                stderr_log,
+            ))
+            .await;
+            if code == 0 && !*was_killed {
+                Box::pin(run_job_plan_streaming(
+                    job_id,
+                    right,
+                    snapshot,
+                    kill_rx,
+                    was_killed,
+                    wrapper_enabled,
+                    sys,
+                    ring,
+                    stderr_ring,
+                    log_file,
+                    stderr_log,
+                ))
+                .await
+            } else {
+                code
+            }
+        }
+        JobPlan::Or { left, right } => {
+            let code = Box::pin(run_job_plan_streaming(
+                job_id,
+                left,
+                snapshot,
+                kill_rx,
+                was_killed,
+                wrapper_enabled,
+                sys,
+                ring,
+                stderr_ring,
+                log_file,
+                stderr_log,
+            ))
+            .await;
+            if code != 0 && !*was_killed {
+                Box::pin(run_job_plan_streaming(
+                    job_id,
+                    right,
+                    snapshot,
+                    kill_rx,
+                    was_killed,
+                    wrapper_enabled,
+                    sys,
+                    ring,
+                    stderr_ring,
+                    log_file,
+                    stderr_log,
+                ))
+                .await
+            } else {
+                code
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_pipeline_streaming(
+    job_id: JobId,
+    pipeline: &cue_core::pipeline::Pipeline,
+    snapshot: &mut EnvSnapshot,
+    kill_rx: &mut mpsc::Receiver<()>,
+    was_killed: &mut bool,
+    wrapper_enabled: bool,
+    sys: &ActorSystem,
+    ring: &Arc<Mutex<RingBuffer>>,
+    stderr_ring: &Arc<Mutex<RingBuffer>>,
+    log_file: &Arc<Mutex<Option<std::fs::File>>>,
+    stderr_log: &Arc<Mutex<Option<std::fs::File>>>,
+) -> i32 {
+    if let Some(code) =
+        run_job_local_builtin(job_id, pipeline, snapshot, stderr_ring, stderr_log).await
+    {
+        return code;
+    }
+
+    let segments = match expand_pipeline_segments(job_id, pipeline, Some(snapshot)) {
+        Ok(segments) => segments,
+        Err(()) => return -1,
+    };
+    let mut spawn = match spawn_native_pipeline(
+        job_id,
+        &segments,
+        Some(snapshot),
+        None,
+        wrapper_enabled,
+        sys,
+    ) {
+        Ok(spawn) => spawn,
+        Err(()) => return -1,
+    };
+
+    let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+    let mut active_readers = 0usize;
+
+    for stdout in spawn.stdout_sources.drain(..) {
+        active_readers += 1;
+        spawn_pipeline_stream_reader(stdout, PipelineStreamKind::Stdout, chunk_tx.clone());
+    }
+    for stderr in spawn.stderr_sources.drain(..) {
+        active_readers += 1;
+        spawn_pipeline_stream_reader(stderr, PipelineStreamKind::Stderr, chunk_tx.clone());
+    }
+    drop(chunk_tx);
+
+    while active_readers > 0 {
+        tokio::select! {
+            _ = kill_rx.recv(), if !*was_killed => {
+                *was_killed = true;
+                terminate_children(&mut spawn.children).await;
+            }
+            Some(msg) = chunk_rx.recv() => {
+                match msg {
+                    PipelineReaderMsg::Chunk { kind: PipelineStreamKind::Stdout, data } => {
+                        ring.lock().unwrap().push(&data);
+                        write_log(log_file, &data).await;
+                        emit_output(sys, job_id, OutputStream::Stdout, &data).await;
+                    }
+                    PipelineReaderMsg::Chunk { kind: PipelineStreamKind::Stderr, data } => {
+                        stderr_ring.lock().unwrap().push(&data);
+                        write_log(stderr_log, &data).await;
+                        emit_output(sys, job_id, OutputStream::Stderr, &data).await;
+                    }
+                    PipelineReaderMsg::Closed => {
+                        active_readers = active_readers.saturating_sub(1);
+                    }
+                }
+            }
+            else => break,
+        }
+    }
+
+    if *was_killed {
+        wait_for_children(&mut spawn.children).await;
+        -1
+    } else {
+        tokio::select! {
+            _ = kill_rx.recv() => {
+                *was_killed = true;
+                terminate_children(&mut spawn.children).await;
+                wait_for_children(&mut spawn.children).await;
+                -1
+            }
+            code = wait_for_children(&mut spawn.children) => code,
+        }
+    }
+}
+
+async fn run_job_local_builtin(
+    job_id: JobId,
+    pipeline: &cue_core::pipeline::Pipeline,
+    snapshot: &mut EnvSnapshot,
+    stderr_ring: &Arc<Mutex<RingBuffer>>,
+    stderr_log: &Arc<Mutex<Option<std::fs::File>>>,
+) -> Option<i32> {
+    if pipeline.segments.len() != 1 {
+        return None;
+    }
+    let segment = &pipeline.segments[0];
+    if segment.pipe_to_next.is_some() {
+        return None;
+    }
+
+    let expanded = expand_command_line(&segment.command, Some(snapshot));
+    match detect_job_local_builtin(&expanded)? {
+        JobLocalBuiltin::Cd { path } => {
+            if expanded.len() > 2 {
+                write_job_local_stderr(
+                    job_id,
+                    stderr_ring,
+                    stderr_log,
+                    b"cd: too many arguments\n",
+                )
+                .await;
+                return Some(1);
+            }
+            match resolve_job_local_cd_target(snapshot, &path) {
+                Ok(cwd) => {
+                    snapshot.cwd = cwd;
+                    Some(0)
+                }
+                Err(message) => {
+                    let line = format!("{message}\n");
+                    write_job_local_stderr(job_id, stderr_ring, stderr_log, line.as_bytes()).await;
+                    Some(1)
+                }
+            }
+        }
+        JobLocalBuiltin::EnvSet { assignments } => {
+            if assignments.is_empty() {
+                write_job_local_stderr(
+                    job_id,
+                    stderr_ring,
+                    stderr_log,
+                    b"env set: expected KEY=VALUE\n",
+                )
+                .await;
+                return Some(1);
+            }
+            for assignment in assignments {
+                let Some((key, value)) = assignment.split_once('=') else {
+                    let line = format!("env set: expected KEY=VALUE, got `{assignment}`\n");
+                    write_job_local_stderr(job_id, stderr_ring, stderr_log, line.as_bytes()).await;
+                    return Some(1);
+                };
+                if key.is_empty() {
+                    write_job_local_stderr(
+                        job_id,
+                        stderr_ring,
+                        stderr_log,
+                        b"env set: empty variable name\n",
+                    )
+                    .await;
+                    return Some(1);
+                }
+                snapshot.env.insert(key.to_string(), value.to_string());
+            }
+            Some(0)
+        }
+    }
+}
+
+fn resolve_job_local_cd_target(
+    snapshot: &EnvSnapshot,
+    path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let requested = std::path::PathBuf::from(path);
+    let target = if requested.is_absolute() {
+        requested
+    } else {
+        snapshot.cwd.join(requested)
+    };
+    let resolved = std::fs::canonicalize(&target)
+        .map_err(|error| format!("cd: {}: {error}", target.display()))?;
+    if !resolved.is_dir() {
+        return Err(format!("cd: {}: not a directory", resolved.display()));
+    }
+    Ok(resolved)
+}
+
+async fn write_job_local_stderr(
+    job_id: JobId,
+    stderr_ring: &Arc<Mutex<RingBuffer>>,
+    stderr_log: &Arc<Mutex<Option<std::fs::File>>>,
+    data: &[u8],
+) {
+    stderr_ring.lock().unwrap().push(data);
+    write_log(stderr_log, data).await;
+    debug!(%job_id, bytes = data.len(), "process_mgr: job-local builtin stderr");
 }
 
 fn spawn_pipeline_stream_reader<R>(
@@ -1323,8 +2039,8 @@ async fn emit_fg_exit(
 
 /// Write a chunk to the log file (best-effort).
 ///
-/// FIX 5: offloaded to the blocking thread-pool so the async reader task
-/// never stalls the tokio runtime with synchronous I/O.
+/// Offloaded to the blocking thread pool so the async reader task never stalls
+/// the Tokio runtime with synchronous I/O.
 async fn write_log(file: &Arc<Mutex<Option<std::fs::File>>>, data: &[u8]) {
     let file = file.clone();
     let data = data.to_vec();

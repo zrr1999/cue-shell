@@ -43,8 +43,8 @@ enum Token {
     // Operators (chain layer)
     SerialThen,             // ->
     SerialAlways,           // ~>
-    ParallelAll,            // ||
-    ParallelRace,           // ||?
+    ParallelAll,            // |||
+    ParallelRace,           // |?|
 
     // Operators (pipe layer, within a job)
     PipeStdout,             // |>
@@ -127,7 +127,7 @@ enum ChainNode {
 }
 
 enum SerialOp { Then, Always }   // ->  ~>
-enum ParallelOp { All, Race }    // ||  ||?
+enum ParallelOp { All, Race }    // |||  |?|
 
 /// Pipeline = one Job's process chain
 struct Pipeline {
@@ -167,13 +167,14 @@ value       = NUMBER | DURATION | STRING | BOOL
 argument    = chain | id_ref | cron_expr | text | empty
 
 chain       = parallel (serial_op parallel)*
-parallel    = pipeline (parallel_op pipeline)*
+parallel    = job_expr (parallel_op job_expr)*
+job_expr    = pipeline (("&&" | "||") pipeline)*
 pipeline    = atom (pipe_op atom)*
 atom        = "(" chain ")"
             | word+
 
 serial_op   = "->" | "~>"
-parallel_op = "||" | "||?"
+parallel_op = "|||" | "|?|"
 pipe_op     = "|>" | "|&>" | "|!>"
 
 id_ref      = [JCS] DIGITS
@@ -207,7 +208,7 @@ The Resolver transforms `Ast` → `RequestPayload`:
 
 3. **ID resolution**: validates J1/C3/S0 references exist (queries cued state)
 
-4. **Mode params merge**: per-invocation params override config.toml defaults
+4. **Mode params merge**: per-invocation params override server.toml defaults
 
 5. **Scope resolution**: jobs start from HEAD; `cwd` mode params override process cwd without mutating HEAD
 
@@ -248,7 +249,7 @@ enum HighlightKind {
     CommandPrefix,   // :
     CommandName,     // run, kill, ...
     ModeParam,       // retry=3
-    Operator,        // ->, ||, |>, ...
+    Operator,        // ->, |||, &&, |>, ...
     IdRef,           // J1, A2
     Word,            // arguments
     String,          // quoted strings
@@ -289,22 +290,29 @@ Which argument type each command expects:
 
 | Command | Argument | Mode Params |
 |---|---|---|
-| `:run` | Chain | ✓ (cwd, retry, retry_delay) |
-| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd) |
+| `:run` | Chain | ✓ (cwd, retry, retry_delay, timeout, wrapper) |
+| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, retry, retry_delay, timeout, wrapper) |
 | `:kill` | IdRef | ✗ |
 | `:retry` | IdRef | ✗ |
 | `:out` | IdRef | ✗ |
+| `:tail` | IdRef + optional bytes | ✗ |
+| `:err` | IdRef | ✗ |
 | `:fg` | IdRef | ✗ |
+| `:wait` | IdRef | ✗ |
+| `:send` | Text (`J<n> <input>`) | ✗ |
+| `:cancel` | IdRef | ✗ |
 | `:jobs` | Empty | ✗ |
 | `:crons` | Empty | ✗ |
 | `:scopes` | Empty | ✗ |
 | `:env` | Text (subcommand) | ✗ |
 | `:cd` | Text (path) | ✗ |
-| `:scope` | Text (subcommand) | ✓ (new/fork) |
+| `:scope` | Text (subcommand) | ✓ |
 | `:help` | Empty or Text | ✗ |
 | `:pause` | IdRef | ✗ |
 | `:resume` | IdRef | ✗ |
 | `:config` | Text | ✗ |
+| `:wrap` | Text (`on`, `off`, `status`) | ✗ |
 | `:log` | IdRef or Empty | ✗ |
 | `:clear` | Empty | ✗ |
 | `:quit` | Empty | ✗ |
+| `:exit` | Empty | ✗ |
