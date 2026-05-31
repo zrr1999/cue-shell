@@ -1142,6 +1142,137 @@ async fn test_job_kill() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_pipe_mode_job_kill() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("pipe-kill");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        subscribe(&mut stream, 1, vec!["jobs"]).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            2,
+            RequestPayload::Eval {
+                input: ":run(pty=false) sleep 60".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+
+        let job_id = match &resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id.clone(),
+            other => panic!("expected job created, got {other:?}"),
+        };
+
+        let running_events = collect_until(&mut stream, Duration::from_secs(5), |msg| {
+            matches!(
+                msg,
+                Message::Event {
+                    payload: EventPayload::JobStateChanged {
+                        new_state: JobStatus::Running,
+                        ..
+                    },
+                }
+            )
+        })
+        .await;
+        assert!(
+            running_events.iter().any(|msg| matches!(
+                msg,
+                Message::Event {
+                    payload: EventPayload::JobStateChanged {
+                        new_state: JobStatus::Running,
+                        ..
+                    },
+                }
+            )),
+            "job did not reach running state"
+        );
+
+        let kill_resp = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: format!(":kill {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(kill_resp, ResponsePayload::Ok(OkPayload::Ack {})));
+
+        let status = wait_for_job_terminal(&mut stream, 4, &job_id).await;
+        assert_eq!(status, JobStatus::Killed);
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_single_pipe_mode_stdin_is_closed_by_default() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("pipe-stdin-null");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":run(pty=false) cat".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+
+        let job_id = match &resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id.clone(),
+            other => panic!("expected job created, got {other:?}"),
+        };
+
+        let status = wait_for_job_terminal(&mut stream, 2, &job_id).await;
+        assert_eq!(status, JobStatus::Done);
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_pipe_mode_pipeline_stdin_is_closed_by_default() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("pipe-chain-stdin-null");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":run(pty=false) cat |> wc -c".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+
+        let job_id = match &resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id.clone(),
+            other => panic!("expected job created, got {other:?}"),
+        };
+
+        let status = wait_for_job_terminal(&mut stream, 2, &job_id).await;
+        assert_eq!(status, JobStatus::Done);
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_fg_attach_input_and_detach() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("fg");

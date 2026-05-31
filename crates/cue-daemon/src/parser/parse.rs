@@ -18,8 +18,8 @@
 //! ```
 
 use cue_core::command_spec::{
-    CommandArgKind, CommandSpec, ModeParamSpec, ModeParamValueKind, command_spec,
-    command_suggestions, mode_param_spec,
+    CommandArgKind, CommandSpec, MODE_PARAM_SPECS, ModeParamSpec, ModeParamValueKind, command_spec,
+    command_suggestions,
 };
 use cue_core::pipeline::{ParallelOp, PipeOp, SerialOp};
 
@@ -297,7 +297,7 @@ impl<'a> Parser<'a> {
                         }
                     };
                     let key_span = self.tokens[self.pos - 1].span;
-                    let Some(spec) = mode_param_spec(&key) else {
+                    let Some(spec) = MODE_PARAM_SPECS.iter().find(|spec| spec.name == key) else {
                         return Err(ParseError {
                             span: key_span,
                             message: format!("unknown mode parameter `{key}`"),
@@ -818,13 +818,10 @@ fn validate_mode_param_value(
     value: &Value,
     span: Span,
 ) -> Result<(), ParseError> {
-    let valid = match (spec.value_kind, value) {
-        (ModeParamValueKind::String, Value::Str(_)) => true,
-        (ModeParamValueKind::NonNegativeInt, Value::Int(n)) => u32::try_from(*n).is_ok(),
-        (ModeParamValueKind::Duration, Value::Duration(_)) => true,
-        (ModeParamValueKind::Bool, Value::Bool(_)) => true,
-        _ => false,
-    };
+    let valid = matches!(
+        (spec.value_kind, value),
+        (ModeParamValueKind::Str, Value::Str(_)) | (ModeParamValueKind::Bool, Value::Bool(_))
+    );
     if valid {
         return Ok(());
     }
@@ -844,9 +841,7 @@ fn validate_mode_param_value(
 
 fn mode_param_value_kind_name(kind: ModeParamValueKind) -> &'static str {
     match kind {
-        ModeParamValueKind::String => "a string",
-        ModeParamValueKind::NonNegativeInt => "a non-negative integer",
-        ModeParamValueKind::Duration => "a duration",
+        ModeParamValueKind::Str => "a string/path",
         ModeParamValueKind::Bool => "a boolean",
     }
 }
@@ -1014,7 +1009,7 @@ mod tests {
 
     #[test]
     fn parse_mode_params() {
-        let ast = Parser::parse(":run(retry=3) cargo test").unwrap();
+        let ast = Parser::parse(":run(pty=false) cargo test").unwrap();
         match ast {
             Ast::Command {
                 mode_params,
@@ -1022,8 +1017,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(mode_params.len(), 1);
-                assert_eq!(mode_params[0].0, "retry");
-                assert_eq!(mode_params[0].1, Value::Int(3));
+                assert_eq!(mode_params[0].0, "pty");
+                assert_eq!(mode_params[0].1, Value::Bool(false));
                 assert!(matches!(argument, Argument::Chain(_)));
             }
             _ => panic!("expected Command"),
@@ -1046,16 +1041,15 @@ mod tests {
 
     #[test]
     fn mode_params_reject_values_with_wrong_type() {
-        let err =
-            Parser::parse(":run(timeout=soon) cargo test").expect_err("timeout needs duration");
+        let err = Parser::parse(":run(pty=no) cargo test").expect_err("pty needs a boolean");
         assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
-        assert!(err.message.contains("timeout"));
-        assert!(err.message.contains("duration"));
+        assert!(err.message.contains("pty"));
+        assert!(err.message.contains("boolean"));
 
-        let err = Parser::parse(":run(retry=-1) cargo test")
-            .expect_err("retry needs non-negative integer");
+        let err = Parser::parse(":run(cwd=false) cargo test").expect_err("cwd needs a string/path");
         assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
-        assert!(err.message.contains("non-negative integer"));
+        assert!(err.message.contains("cwd"));
+        assert!(err.message.contains("string/path"));
     }
 
     #[test]

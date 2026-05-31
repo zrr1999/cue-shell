@@ -628,15 +628,15 @@ mod tests {
 
     #[test]
     fn command_with_mode_params() {
-        let toks = tokens(":run(retry=3) cargo test");
+        let toks = tokens(":run(pty=false) cargo test");
         assert_eq!(
             toks,
             vec![
                 Token::Command("run".into()),
                 Token::ModeParenOpen,
-                Token::Word("retry".into()),
+                Token::Word("pty".into()),
                 Token::ParamEq,
-                Token::ParamValue(Value::Int(3)),
+                Token::ParamValue(Value::Bool(false)),
                 Token::GroupClose, // Will be ModeParenClose after parser context
                 Token::Word("cargo".into()),
                 Token::Word("test".into()),
@@ -1026,19 +1026,19 @@ mod tests {
     #[test]
     fn comma_in_mode_params_still_separates() {
         // Inside mode params, commas should still separate key=val pairs.
-        let toks = tokens(":run(retry=3,timeout=30s) cargo test");
+        let toks = tokens(":run(pty=false,wrapper=true) cargo test");
         assert_eq!(
             toks,
             vec![
                 Token::Command("run".into()),
                 Token::ModeParenOpen,
-                Token::Word("retry".into()),
+                Token::Word("pty".into()),
                 Token::ParamEq,
-                Token::ParamValue(Value::Int(3)),
+                Token::ParamValue(Value::Bool(false)),
                 Token::Comma,
-                Token::Word("timeout".into()),
+                Token::Word("wrapper".into()),
                 Token::ParamEq,
-                Token::ParamValue(Value::Duration(std::time::Duration::from_secs(30))),
+                Token::ParamValue(Value::Bool(true)),
                 Token::GroupClose,
                 Token::Word("cargo".into()),
                 Token::Word("test".into()),

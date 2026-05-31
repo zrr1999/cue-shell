@@ -15,7 +15,7 @@ pub enum Token {
     ModeParenOpen,
     /// `)` in mode-params context.
     ModeParenClose,
-    /// Parameter key in mode-params, e.g. `cwd`, `retry`.
+    /// Parameter key in mode-params, e.g. `cwd`, `pty`.
     ParamKey(String),
     /// `=` in mode-params.
     ParamEq,

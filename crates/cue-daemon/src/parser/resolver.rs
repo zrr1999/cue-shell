@@ -7,6 +7,7 @@
 //! 4. AST → cue_core types conversion
 
 use cue_core::command::{ModeParams, ParamValue};
+use cue_core::command_spec::{MODE_PARAM_SPECS, ModeParamValueKind, command_spec};
 use cue_core::cron::{CronPreset, CronSchedule, parse_day_filter, parse_time_of_day};
 use cue_core::ipc::ScriptSource;
 use cue_core::mode::Mode;
@@ -192,6 +193,7 @@ impl Resolver {
         argument: Argument,
         span: Span,
     ) -> Result<ResolvedCommand, ParseError> {
+        validate_mode_params(name, &mode_params, span)?;
         let params = convert_mode_params(mode_params);
 
         Ok(match name {
@@ -338,6 +340,74 @@ fn convert_pipeline(p: Pipeline) -> core_pipeline::Pipeline {
                 pipe_to_next: s.pipe_to_next,
             })
             .collect(),
+    }
+}
+
+fn validate_mode_params(
+    command: &str,
+    params: &[(String, Value)],
+    span: Span,
+) -> Result<(), ParseError> {
+    if params.is_empty() {
+        return Ok(());
+    }
+
+    let Some(spec) = command_spec(command) else {
+        return Ok(());
+    };
+    if !spec.accepts_mode_params {
+        return Err(ParseError {
+            span,
+            message: format!(":{command} does not accept mode params"),
+            kind: ParseErrorKind::InvalidModeParam,
+            suggestions: vec![],
+        });
+    }
+
+    let known_params = MODE_PARAM_SPECS
+        .iter()
+        .map(|spec| spec.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    for (key, value) in params {
+        let Some(param_spec) = MODE_PARAM_SPECS.iter().find(|spec| spec.name == key) else {
+            return Err(ParseError {
+                span,
+                message: format!(
+                    "unknown mode param `{key}` for :{command}; supported: {}",
+                    known_params.iter().copied().collect::<Vec<_>>().join(", ")
+                ),
+                kind: ParseErrorKind::InvalidModeParam,
+                suggestions: known_params.iter().map(|name| format!("{name}=")).collect(),
+            });
+        };
+
+        if !mode_param_value_matches(param_spec.value_kind, value) {
+            return Err(ParseError {
+                span,
+                message: format!(
+                    "mode param `{key}` for :{command} expects {}",
+                    mode_param_kind_name(param_spec.value_kind)
+                ),
+                kind: ParseErrorKind::InvalidModeParam,
+                suggestions: vec![format!("{}={}", param_spec.name, param_spec.value_hint)],
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn mode_param_value_matches(kind: ModeParamValueKind, value: &Value) -> bool {
+    matches!(
+        (kind, value),
+        (ModeParamValueKind::Bool, Value::Bool(_)) | (ModeParamValueKind::Str, Value::Str(_))
+    )
+}
+
+fn mode_param_kind_name(kind: ModeParamValueKind) -> &'static str {
+    match kind {
+        ModeParamValueKind::Bool => "a boolean",
+        ModeParamValueKind::Str => "a string/path",
     }
 }
 
@@ -848,7 +918,7 @@ mod tests {
                 params,
             } => {
                 // schedule_text replaced by schedule: CronSchedule; display check removed
-                assert_eq!(params.retry(), None);
+                assert!(params.is_empty());
                 match chain {
                     core_pipeline::ChainNode::Serial { left, right, .. } => {
                         let pipeline = leaf_pipeline(*left);
@@ -969,13 +1039,37 @@ mod tests {
 
     #[test]
     fn resolve_with_params() {
-        let cmd = resolve(":run(retry=3) cargo test", Mode::Job);
+        let cmd = resolve(":run(pty=false,wrapper=true) cargo test", Mode::Job);
         match cmd {
             ResolvedCommand::Run { params, .. } => {
-                assert_eq!(params.retry(), Some(3));
+                assert!(!params.pty_enabled());
+                assert_eq!(params.wrapper_enabled(), Some(true));
             }
             _ => panic!("expected Run"),
         }
+    }
+
+    #[test]
+    fn rejects_mode_params_on_commands_that_do_not_accept_them() {
+        let error = CueParser::parse(":jobs(pty=false)").expect_err("mode params should fail");
+        assert_eq!(error.kind, ParseErrorKind::InvalidModeParam);
+        assert!(error.message.contains("does not accept mode params"));
+    }
+
+    #[test]
+    fn rejects_unknown_mode_params() {
+        let error = CueParser::parse(":run(timeout=30s) cargo test")
+            .expect_err("unknown param should fail");
+        assert_eq!(error.kind, ParseErrorKind::InvalidModeParam);
+        assert!(error.message.contains("unknown mode parameter `timeout`"));
+    }
+
+    #[test]
+    fn rejects_wrong_mode_param_types() {
+        let error =
+            CueParser::parse(":run(pty=no) cargo test").expect_err("wrong type should fail");
+        assert_eq!(error.kind, ParseErrorKind::InvalidModeParam);
+        assert!(error.message.contains("expects a boolean"));
     }
 
     #[test]

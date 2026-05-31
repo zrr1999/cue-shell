@@ -884,9 +884,9 @@ mod tests {
 
     #[test]
     fn completion_uses_shared_mode_param_specs() {
-        let items = complete_input(":run(re", 7);
-        assert!(items.iter().any(|item| item.label == "retry"));
-        assert!(items.iter().any(|item| item.label == "retry_delay"));
+        let items = complete_input(":run(pt", 7);
+        assert!(items.iter().any(|item| item.label == "pty"));
+        assert!(!items.iter().any(|item| item.label == "timeout"));
     }
 
     #[test]

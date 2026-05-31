@@ -42,7 +42,7 @@ enum Message {
 
 ```json
 // Request: Eval (core job command)
-{"type": "request", "id": 1, "payload": {"Eval": {"input": ":run(retry=3) cargo test", "mode": "Job"}}}
+{"type": "request", "id": 1, "payload": {"Eval": {"input": ":run(pty=false) cargo test", "mode": "Job"}}}
 
 // Response (success — Eval resolved to a serial chain)
 {"type": "response", "id": 1, "payload": {"Ok": {"ChainCreated": {"chain_id": "CH1", "job_ids": ["J1"], "chain": {"id": "CH1", "pipeline": "cargo test -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo test", "status": "Running", "job_id": "J1", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": null, "start_scope": null, "end_scope": null, "open_hint": null}]}}}}}
@@ -75,6 +75,7 @@ enum Message {
 **Request-Response + Event Stream**, multiplexed on a single connection.
 
 Flow:
+
 1. Client connects to Unix socket
 2. Client sends `Subscribe` request to register interest channels
 3. cued responds with `Ok`
@@ -91,6 +92,7 @@ struct SubscribeRequest {
 ```
 
 Channel types:
+
 - `"jobs"` — all job state changes (created, state transitions, removed)
 - `"crons"` — all cron state changes
 - `"output:<id>"` — stdout/stderr chunks for a specific job (e.g., `"output:J1"`)
@@ -98,6 +100,7 @@ Channel types:
 - `"system"` — cued status, shutdown notices
 
 Operations:
+
 - `Subscribe { channels }` — add channels (additive, no duplicates)
 - `Unsubscribe { channels }` — remove channels
 
@@ -117,7 +120,7 @@ are protocol-level operations that don't correspond to user-typed commands.
 enum RequestPayload {
     // === User commands (raw string, parsed by cued) ===
     Eval { input: String, mode: Mode },
-    // input: raw user input, e.g. ":run(retry=3) cargo test -> cargo build"
+    // input: raw user input, e.g. ":run(pty=false) cargo test -> cargo build"
     //        or bare input "cargo test" (cued applies mode default)
     // mode: current TUI mode (JOB/CRON) for bare input resolution
 
@@ -387,6 +390,7 @@ Job scope fields are intentionally split:
 ## 9. :fg Full-Duplex Proxy Mode
 
 When client sends `FgAttach { id: "J1" }`:
+
 1. cued responds `FgAttached { id: "J1" }`
 2. Connection enters **fg proxy mode** for this job:
    - Client → cued: `FgInput { data }` messages (raw keystrokes)
@@ -401,16 +405,16 @@ During fg mode, other Request/Response and Event messages continue normally on t
 
 Standard error codes returned in `Err { code, message }`:
 
-| Code | Meaning |
-|---|---|
-| `NOT_FOUND` | Job/Cron/Scope not found |
-| `INVALID_STATE` | Operation not valid in current state (e.g., :fg on Done job) |
-| `INVALID_SCOPE` | Referenced scope hash not found |
-| `INVALID_SYNTAX` | Malformed pipeline/chain/cron expression |
-| `ALREADY_EXISTS` | Duplicate operation (e.g., already fg-attached) |
-| `NOT_SUPPORTED` | Operation not supported |
-| `PERMISSION_DENIED` | Operation rejected by policy |
-| `INTERNAL` | Unexpected cued error |
+| Code                | Meaning                                                      |
+| ------------------- | ------------------------------------------------------------ |
+| `NOT_FOUND`         | Job/Cron/Scope not found                                     |
+| `INVALID_STATE`     | Operation not valid in current state (e.g., :fg on Done job) |
+| `INVALID_SCOPE`     | Referenced scope hash not found                              |
+| `INVALID_SYNTAX`    | Malformed pipeline/chain/cron expression                     |
+| `ALREADY_EXISTS`    | Duplicate operation (e.g., already fg-attached)              |
+| `NOT_SUPPORTED`     | Operation not supported                                      |
+| `PERMISSION_DENIED` | Operation rejected by policy                                 |
+| `INTERNAL`          | Unexpected cued error                                        |
 
 ## 11. Connection Lifecycle
 

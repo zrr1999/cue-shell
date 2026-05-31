@@ -64,14 +64,6 @@ impl LeafStatus {
 /// Tracks a running chain's execution state.
 struct ChainState {
     node: ChainNode,
-    /// Reserved for auto-retry: maximum retry attempts (0 = no retry).
-    #[allow(dead_code)]
-    retry_max: u32,
-    /// Reserved for auto-retry: delay between retry attempts.
-    retry_delay: Option<std::time::Duration>,
-    /// Reserved for auto-retry: attempts made so far.
-    #[allow(dead_code)]
-    retry_attempts: u32,
     /// Maps each leaf index (0-based, left-to-right DFS) to its `JobId`.
     leaf_jobs: HashMap<usize, JobId>,
     /// Maps each leaf index to its current status.
@@ -139,6 +131,8 @@ struct CronEntry {
     scope_enabled: bool,
     /// Whether the wrapper binary is enabled for jobs spawned by this cron.
     wrapper_enabled: bool,
+    /// Whether to allocate a PTY for spawned cron jobs.
+    pty_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -518,6 +512,7 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
                 cwd_override: cron.cwd_override.clone(),
                 scope_enabled: cron.scope_enabled,
                 wrapper_enabled: cron.wrapper_enabled,
+                pty_enabled: cron.pty_enabled,
                 age_secs: cron.age_secs,
             };
             if let Err(e) =
@@ -549,6 +544,7 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
                 cwd_override: cron.cwd_override,
                 scope_enabled: cron.scope_enabled,
                 wrapper_enabled: cron.wrapper_enabled,
+                pty_enabled: cron.pty_enabled,
             },
         );
     }
@@ -655,6 +651,7 @@ fn stored_cron_from_entry(entry: &CronEntry) -> storage::StoredCron {
         cwd_override: entry.cwd_override.clone(),
         scope_enabled: entry.scope_enabled,
         wrapper_enabled: entry.wrapper_enabled,
+        pty_enabled: entry.pty_enabled,
         age_secs: 0,
     }
 }
@@ -1649,10 +1646,14 @@ async fn apply_scope_transform(
     derive_scope(sys, start_scope, delta).await
 }
 
-fn classify_job_plan_open_hint(plan: &cue_core::pipeline::JobPlan) -> JobOpenHint {
+fn classify_job_plan_open_hint(
+    plan: &cue_core::pipeline::JobPlan,
+    pty_enabled: bool,
+) -> JobOpenHint {
     match plan {
         cue_core::pipeline::JobPlan::Pipeline(pipeline)
-            if pipeline.segments.len() == 1
+            if pty_enabled
+                && pipeline.segments.len() == 1
                 && command_prefers_foreground(&pipeline.segments[0].command) =>
         {
             JobOpenHint::Fg
@@ -1861,6 +1862,7 @@ async fn fire_due_crons(
         let cwd_override = entry.cwd_override.clone();
         let scope_enabled = entry.scope_enabled;
         let wrapper_enabled = entry.wrapper_enabled;
+        let pty_enabled = entry.pty_enabled;
 
         info!(%cron_id, "scheduler: cron triggered");
 
@@ -1873,9 +1875,7 @@ async fn fire_due_crons(
             cwd_override,
             scope_enabled,
             wrapper_enabled,
-            true,
-            0,
-            None,
+            pty_enabled,
             state,
             db,
             sys,
@@ -1951,8 +1951,6 @@ async fn spawn_chain(
     scope_enabled: bool,
     wrapper_enabled: bool,
     pty_enabled: bool,
-    retry_max: u32,
-    retry_delay: Option<std::time::Duration>,
     state: &mut SchedulerState,
     db: &Arc<Mutex<Connection>>,
     sys: &ActorSystem,
@@ -1967,7 +1965,7 @@ async fn spawn_chain(
     if leaves.len() == 1 {
         let leaf = &leaves[0];
         let jid = state.alloc_job();
-        let open_hint = classify_job_plan_open_hint(&leaf.plan);
+        let open_hint = classify_job_plan_open_hint(&leaf.plan, pty_enabled);
 
         state.jobs.insert(
             jid,
@@ -2081,9 +2079,6 @@ async fn spawn_chain(
 
     let chain_state = ChainState {
         node: chain,
-        retry_max,
-        retry_delay,
-        retry_attempts: 0,
         leaf_jobs: HashMap::new(),
         leaf_status,
         scope_hash,
@@ -2233,7 +2228,7 @@ async fn process_chain_advance(
 
     while let Some((idx, start_scope)) = queue.pop_front() {
         let jid = state.alloc_job();
-        let open_hint = classify_job_plan_open_hint(&leaves[idx].plan);
+        let open_hint = classify_job_plan_open_hint(&leaves[idx].plan, pty_enabled);
         if captured.len() < capture_first {
             captured.push(jid);
         }
@@ -2865,8 +2860,6 @@ async fn handle_command_with_scope(
                 .wrapper_enabled()
                 .unwrap_or_else(|| state.wrapper_enabled(config));
             let pty_enabled = params.pty_enabled();
-            let retry_max = params.retry().unwrap_or(0);
-            let retry_delay = params.retry_delay();
             spawn_chain(
                 chain,
                 scope_hash,
@@ -2876,8 +2869,6 @@ async fn handle_command_with_scope(
                 scope_enabled,
                 wrapper_enabled,
                 pty_enabled,
-                retry_max,
-                retry_delay,
                 state,
                 db,
                 sys,
@@ -2917,6 +2908,7 @@ async fn handle_command_with_scope(
                 wrapper_enabled: params
                     .wrapper_enabled()
                     .unwrap_or_else(|| state.wrapper_enabled(config)),
+                pty_enabled: params.pty_enabled(),
             };
             if let Err(error) = persist_cron_entry(db, &entry).await {
                 return ResponsePayload::err(error_code::INTERNAL, error.to_string());
@@ -3504,14 +3496,7 @@ async fn handle_command_with_scope(
                     );
                 }
             };
-            // Apply retry backoff: if the job has a chain with retry config, use it;
-            // otherwise apply a short default delay.
-            let delay = state
-                .chains
-                .values()
-                .find(|c| c.leaf_jobs.values().any(|jid| *jid == job_id))
-                .and_then(|c| c.retry_delay)
-                .unwrap_or(std::time::Duration::from_millis(500));
+            let delay = std::time::Duration::from_millis(500);
             info!(%job_id, ?delay, "scheduler: retrying job with delay");
             tokio::time::sleep(delay).await;
             let wrapper_enabled = state.wrapper_enabled(config);
@@ -3524,8 +3509,6 @@ async fn handle_command_with_scope(
                 false,
                 wrapper_enabled,
                 true,
-                0,
-                None,
                 state,
                 db,
                 sys,
@@ -4423,6 +4406,22 @@ mod tests {
         }))
     }
 
+    #[test]
+    fn pty_false_foreground_commands_open_as_stream() {
+        let plan = JobPlan::Pipeline(Pipeline {
+            segments: vec![PipeSegment {
+                command: vec!["vim".into()],
+                pipe_to_next: None,
+            }],
+        });
+
+        assert_eq!(classify_job_plan_open_hint(&plan, true), JobOpenHint::Fg);
+        assert_eq!(
+            classify_job_plan_open_hint(&plan, false),
+            JobOpenHint::Stream
+        );
+    }
+
     type TestActorSystem = (
         ActorSystem,
         mpsc::Receiver<GatewayMsg>,
@@ -4651,8 +4650,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -4698,8 +4695,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -4743,8 +4738,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -4784,8 +4777,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -4825,8 +4816,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -4853,8 +4842,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -4889,8 +4876,6 @@ mod tests {
             true,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -5274,7 +5259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cron_wrapper_param_is_stored_on_entry() {
+    async fn cron_wrapper_and_pty_params_are_stored_on_entry() {
         let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
         spawn_fake_scope_store(ss_rx);
 
@@ -5284,6 +5269,7 @@ mod tests {
         let mut state = SchedulerState::new();
         let mut params = cue_core::command::ModeParams::new();
         params.insert("wrapper", cue_core::command::ParamValue::Bool(true));
+        params.insert("pty", cue_core::command::ParamValue::Bool(false));
         let cmd = ResolvedCommand::Cron {
             schedule: CronSchedule::Interval(std::time::Duration::from_secs(300)),
             chain: leaf("backup.sh"),
@@ -5295,6 +5281,7 @@ mod tests {
             ResponsePayload::Ok(OkPayload::CronAdded { .. })
         ));
         assert!(state.crons[&CronId(1)].wrapper_enabled);
+        assert!(!state.crons[&CronId(1)].pty_enabled);
     }
 
     #[tokio::test]
@@ -5494,8 +5481,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -5553,8 +5538,6 @@ mod tests {
                 false,
                 false,
                 true,
-                0,
-                None,
                 &mut state,
                 &conn,
                 &sys,
@@ -5746,6 +5729,7 @@ mod tests {
                 cwd_override: Some(std::path::PathBuf::from("/tmp/cue-cron-cwd")),
                 scope_enabled: true,
                 wrapper_enabled: true,
+                pty_enabled: false,
                 age_secs: 0,
             },
         )
@@ -5766,6 +5750,7 @@ mod tests {
         );
         assert!(state.crons[&CronId(4)].scope_enabled);
         assert!(state.crons[&CronId(4)].wrapper_enabled);
+        assert!(!state.crons[&CronId(4)].pty_enabled);
     }
 
     #[test]
@@ -5783,6 +5768,7 @@ mod tests {
                 cwd_override: None,
                 scope_enabled: false,
                 wrapper_enabled: false,
+                pty_enabled: true,
                 age_secs: 0,
             },
         )
@@ -5825,8 +5811,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -5866,8 +5850,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -5904,8 +5886,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -5961,8 +5941,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -6138,8 +6116,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -6208,8 +6184,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -6262,8 +6236,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,
@@ -6320,8 +6292,6 @@ mod tests {
             false,
             false,
             true,
-            0,
-            None,
             &mut state,
             &conn,
             &sys,

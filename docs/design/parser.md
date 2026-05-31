@@ -23,6 +23,7 @@ complete. Interactive JOB multiline input is not a script-mode entry point; see
 ## 2. Implementation
 
 **Hand-written recursive descent** — no parser combinator dependencies.
+
 - Full control over error messages, recovery, and completion suggestions
 - Tokenizer is a state machine with context-sensitive `()` handling
 - Parser produces an unresolved AST; Resolver validates IDs, scopes, injects mode defaults
@@ -39,7 +40,7 @@ enum Token {
     // Mode params (context: immediately after Command)
     ModeParenOpen,          // ( — mode params context
     ModeParenClose,         // ) — mode params context
-    ParamKey(String),       // cwd, retry, retry_delay, ...
+    ParamKey(String),       // cwd, pty, scope, wrapper
     ParamEq,               // =
     ParamValue(Value),      // 3, "30s", true, ...
     Comma,                  // ,
@@ -86,6 +87,7 @@ enum Value {
 ### `()` Disambiguation
 
 Tokenizer uses positional context:
+
 - Previous non-whitespace token is `Command(...)` → `ModeParenOpen` / `ModeParenClose`
 - Otherwise → `GroupOpen` / `GroupClose`
 
@@ -208,7 +210,7 @@ The Resolver transforms `Ast` → `RequestPayload`:
    - CRON ⏰ → `:cron`
 
 2. **Argument type validation**: ensures command gets correct argument type
-    - `:run` expects Chain, `:kill` expects IdRef, `:send` expects Text, etc.
+   - `:run` expects Chain, `:kill` expects IdRef, `:send` expects Text, etc.
 
 3. **ID resolution**: validates J1/C3/S0 references exist (queries cued state)
 
@@ -223,7 +225,7 @@ The Resolver transforms `Ast` → `RequestPayload`:
 1. Tokenize up to cursor position
 2. Determine context:
    - After `:` → command name completion (run, kill, jobs, ...)
-   - After `:cmd(` → mode param key completion (cwd, retry, retry_delay, ...)
+   - After `:cmd(` → mode param key completion (cwd, pty, scope, wrapper)
    - After `=` in mode params → value completion (based on param type)
    - After IdRef prefix `J` → active job ID completion
    - After word → filesystem path / command completion
@@ -252,7 +254,7 @@ struct HighlightSpan {
 enum HighlightKind {
     CommandPrefix,   // :
     CommandName,     // run, kill, ...
-    ModeParam,       // retry=3
+    ModeParam,       // pty=false
     Operator,        // ->, |||, &&, |>, ...
     IdRef,           // J1, A2
     Word,            // arguments
@@ -292,31 +294,31 @@ TUI highlights the error span in red and shows the message inline.
 
 Which argument type each command expects:
 
-| Command | Argument | Mode Params |
-|---|---|---|
-| `:run` | Chain | ✓ (cwd, retry, retry_delay, timeout, wrapper, scope, pty) |
-| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, retry, retry_delay, timeout, wrapper, scope, pty) |
-| `:kill` | IdRef | ✗ |
-| `:retry` | IdRef | ✗ |
-| `:out` | IdRef | ✗ |
-| `:tail` | IdRef + optional bytes | ✗ |
-| `:err` | IdRef | ✗ |
-| `:fg` | IdRef | ✗ |
-| `:wait` | IdRef | ✗ |
-| `:send` | Text (`J<n> <input>`) | ✗ |
-| `:cancel` | IdRef | ✗ |
-| `:jobs` | Empty | ✗ |
-| `:crons` | Empty | ✗ |
-| `:scopes` | Empty | ✗ |
-| `:env` | Text (subcommand) | ✗ |
-| `:cd` | Text (path) | ✗ |
-| `:scope` | Text (subcommand) | ✓ |
-| `:help` | Empty or Text | ✗ |
-| `:pause` | IdRef | ✗ |
-| `:resume` | IdRef | ✗ |
-| `:config` | Text | ✗ |
-| `:wrap` | Text (`on`, `off`, `status`) | ✗ |
-| `:log` | IdRef or Empty | ✗ |
-| `:clear` | Empty | ✗ |
-| `:quit` | Empty | ✗ |
-| `:exit` | Empty | ✗ |
+| Command   | Argument                             | Mode Params                  |
+| --------- | ------------------------------------ | ---------------------------- |
+| `:run`    | Chain                                | ✓ (cwd, pty, scope, wrapper) |
+| `:cron`   | Chain（resolver 再拆 schedule/body） | ✓ (cwd, pty, scope, wrapper) |
+| `:kill`   | IdRef                                | ✗                            |
+| `:retry`  | IdRef                                | ✗                            |
+| `:out`    | IdRef                                | ✗                            |
+| `:tail`   | IdRef + optional bytes               | ✗                            |
+| `:err`    | IdRef                                | ✗                            |
+| `:fg`     | IdRef                                | ✗                            |
+| `:wait`   | IdRef                                | ✗                            |
+| `:send`   | Text (`J<n> <input>`)                | ✗                            |
+| `:cancel` | IdRef                                | ✗                            |
+| `:jobs`   | Empty                                | ✗                            |
+| `:crons`  | Empty                                | ✗                            |
+| `:scopes` | Empty                                | ✗                            |
+| `:env`    | Text (subcommand)                    | ✗                            |
+| `:cd`     | Text (path)                          | ✗                            |
+| `:scope`  | Text (subcommand)                    | ✗                            |
+| `:help`   | Empty or Text                        | ✗                            |
+| `:pause`  | IdRef                                | ✗                            |
+| `:resume` | IdRef                                | ✗                            |
+| `:config` | Text                                 | ✗                            |
+| `:wrap`   | Text (`on`, `off`, `status`)         | ✗                            |
+| `:log`    | IdRef or Empty                       | ✗                            |
+| `:clear`  | Empty                                | ✗                            |
+| `:quit`   | Empty                                | ✗                            |
+| `:exit`   | Empty                                | ✗                            |

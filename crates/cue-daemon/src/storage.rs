@@ -37,7 +37,7 @@ where
 // ── Schema migration ──
 
 /// Current schema version (bump when adding migrations).
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 
 const MIGRATION_V1: &str = r"
 CREATE TABLE IF NOT EXISTS scopes (
@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS crons (
     cwd_override TEXT,
     scope_enabled INTEGER NOT NULL DEFAULT 0,
     wrapper_enabled INTEGER NOT NULL DEFAULT 0,
+    pty_enabled INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -127,6 +128,10 @@ ALTER TABLE crons ADD COLUMN scope_enabled INTEGER NOT NULL DEFAULT 0;
 
 const MIGRATION_V12: &str = r"
 ALTER TABLE crons ADD COLUMN wrapper_enabled INTEGER NOT NULL DEFAULT 0;
+";
+
+const MIGRATION_V13: &str = r"
+ALTER TABLE crons ADD COLUMN pty_enabled INTEGER NOT NULL DEFAULT 1;
 ";
 
 /// Open (or create) the database at `path`, apply WAL mode and run migrations.
@@ -227,6 +232,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         if !column_exists(conn, "crons", "wrapper_enabled")? {
             conn.execute_batch(MIGRATION_V12)
                 .context("failed to run schema migration v12")?;
+        }
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    if current < 13 {
+        if !column_exists(conn, "crons", "pty_enabled")? {
+            conn.execute_batch(MIGRATION_V13)
+                .context("failed to run schema migration v13")?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -344,6 +356,7 @@ pub struct StoredCron {
     pub cwd_override: Option<PathBuf>,
     pub scope_enabled: bool,
     pub wrapper_enabled: bool,
+    pub pty_enabled: bool,
     pub age_secs: i64,
 }
 
@@ -480,9 +493,10 @@ pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
         .map(|path| path.to_string_lossy().into_owned());
     let scope_enabled = i64::from(cron.scope_enabled);
     let wrapper_enabled = i64::from(cron.wrapper_enabled);
+    let pty_enabled = i64::from(cron.pty_enabled);
     conn.execute(
-        "INSERT INTO crons (id, schedule, command, enabled, scope_hash, status, cwd_override, scope_enabled, wrapper_enabled)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO crons (id, schedule, command, enabled, scope_hash, status, cwd_override, scope_enabled, wrapper_enabled, pty_enabled)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
               schedule = excluded.schedule,
               command = excluded.command,
@@ -491,7 +505,8 @@ pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
               status = excluded.status,
               cwd_override = excluded.cwd_override,
               scope_enabled = excluded.scope_enabled,
-              wrapper_enabled = excluded.wrapper_enabled",
+              wrapper_enabled = excluded.wrapper_enabled,
+              pty_enabled = excluded.pty_enabled",
         rusqlite::params![
             cron.id,
             cron.schedule,
@@ -502,6 +517,7 @@ pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
             cwd_override,
             scope_enabled,
             wrapper_enabled,
+            pty_enabled,
         ],
     )?;
     Ok(())
@@ -618,6 +634,7 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<StoredCron>> {
                 cwd_override,
                 COALESCE(scope_enabled, 0) AS scope_enabled,
                 COALESCE(wrapper_enabled, 0) AS wrapper_enabled,
+                COALESCE(pty_enabled, 1) AS pty_enabled,
                 CAST((julianday('now') - julianday(created_at)) * 86400 AS INTEGER) AS age_secs
           FROM crons",
     )?;
@@ -631,7 +648,8 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<StoredCron>> {
         let cwd_override: Option<String> = row.get(6)?;
         let scope_enabled: i64 = row.get(7)?;
         let wrapper_enabled: i64 = row.get(8)?;
-        let age_secs: i64 = row.get(9)?;
+        let pty_enabled: i64 = row.get(9)?;
+        let age_secs: i64 = row.get(10)?;
         Ok((
             id,
             schedule,
@@ -642,6 +660,7 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<StoredCron>> {
             cwd_override,
             scope_enabled,
             wrapper_enabled,
+            pty_enabled,
             age_secs,
         ))
     })?;
@@ -658,6 +677,7 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<StoredCron>> {
             cwd_override,
             scope_enabled,
             wrapper_enabled,
+            pty_enabled,
             age_secs,
         ) = row?;
         let status = match parse_cron_status(&status_text) {
@@ -679,6 +699,7 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<StoredCron>> {
             cwd_override: cwd_override.map(PathBuf::from),
             scope_enabled: scope_enabled != 0,
             wrapper_enabled: wrapper_enabled != 0,
+            pty_enabled: pty_enabled != 0,
             age_secs,
         });
     }
@@ -845,6 +866,7 @@ mod tests {
             cwd_override: Some(PathBuf::from("/tmp/cue-cron-cwd")),
             scope_enabled: true,
             wrapper_enabled: true,
+            pty_enabled: false,
             age_secs: 0,
         };
 
@@ -860,6 +882,7 @@ mod tests {
         assert_eq!(loaded[0].cwd_override, cron.cwd_override);
         assert_eq!(loaded[0].scope_enabled, cron.scope_enabled);
         assert_eq!(loaded[0].wrapper_enabled, cron.wrapper_enabled);
+        assert_eq!(loaded[0].pty_enabled, cron.pty_enabled);
     }
 
     #[test]

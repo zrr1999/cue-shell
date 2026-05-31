@@ -31,22 +31,22 @@ the tool surface stays “atomic”, see [conceptual-model.md](conceptual-model.
 
 ### Crate Layout
 
-| Crate | Role |
-|---|---|
-| **cue-core** | Shared types, parser, protocol definitions |
-| **cued** | Background daemon — process substrate, scheduler, process manager, scope store |
-| **cue-tui** | Interactive TUI client (ratatui + crossterm) |
-| **cue-cli** | Headless CLI client for `cue run <file.cue>` and extension dispatch |
+| Crate        | Role                                                                           |
+| ------------ | ------------------------------------------------------------------------------ |
+| **cue-core** | Shared types, parser, protocol definitions                                     |
+| **cued**     | Background daemon — process substrate, scheduler, process manager, scope store |
+| **cue-tui**  | Interactive TUI client (ratatui + crossterm)                                   |
+| **cue-cli**  | Headless CLI client for `cue run <file.cue>` and extension dispatch            |
 
 ## Core Primitives
 
-| Primitive | ID | Description |
-|---|---|---|
-| **Job** | J1, J2, ... | OS child process (or pipeline of processes) |
-| **Cron** | C1, C2, ... | Scheduled/delayed task that spawns Jobs |
-| **Scope** | S0@a3f1 | Immutable environment snapshot (content-addressed, blake3) |
-| **Chain** | — | Job orchestration graph (serial/parallel) |
-| **Pipeline** | — | Process pipe chain within a single Job |
+| Primitive    | ID          | Description                                                |
+| ------------ | ----------- | ---------------------------------------------------------- |
+| **Job**      | J1, J2, ... | OS child process (or pipeline of processes)                |
+| **Cron**     | C1, C2, ... | Scheduled/delayed task that spawns Jobs                    |
+| **Scope**    | S0@a3f1     | Immutable environment snapshot (content-addressed, blake3) |
+| **Chain**    | —           | Job orchestration graph (serial/parallel)                  |
+| **Pipeline** | —           | Process pipe chain within a single Job                     |
 
 ## Operator Model (Two Layers)
 
@@ -62,23 +62,23 @@ Priority: pipe (1) > job logical (2) > chain parallel (3) > chain serial (4).
 
 ## Modes
 
-| Mode | Indicator | Bare input becomes |
-|---|---|---|
-| JOB ⚡ | `[JOB ⚡] > _` | `:run <input>` |
-| CRON ⏰ | `[CRON ⏰] > _` | `:cron <input>` |
+| Mode    | Indicator       | Bare input becomes |
+| ------- | --------------- | ------------------ |
+| JOB ⚡  | `[JOB ⚡] > _`  | `:run <input>`     |
+| CRON ⏰ | `[CRON ⏰] > _` | `:cron <input>`    |
 
 Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless of mode.
 
 ## Mode Params
 
 ```
-:run(cwd=/repo, retry=3, retry_delay=5s) cargo test
-:cron(cwd=/repo) every 5m cargo clippy
+:run(cwd=/repo, pty=false) cargo test
+:cron(cwd=/repo, pty=false) every 5m cargo clippy
 ```
 
 Parenthesized `key=value` pairs immediately after the command name configure
 execution behavior. They override `server.toml` defaults. Only launcher-style
-commands support mode params: `:run`, `:cron`, `:scope new`.
+commands support mode params: `:run` and `:cron` (`cwd`, `pty`, `scope`, `wrapper`).
 
 ## Scope Model
 
@@ -103,43 +103,43 @@ Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default sc
 
 ## Storage (Three Layers)
 
-| Layer | What | Where |
-|---|---|---|
-| In-memory | Ring buffers (per-Job, 1 MiB), active state | cued process |
-| File system | Output logs (`J1.log`) | `$XDG_DATA_HOME/cue-shell/output/` |
-| SQLite | Scopes, Crons, job history, config | `$XDG_DATA_HOME/cue-shell/cued.db` |
+| Layer       | What                                        | Where                              |
+| ----------- | ------------------------------------------- | ---------------------------------- |
+| In-memory   | Ring buffers (per-Job, 1 MiB), active state | cued process                       |
+| File system | Output logs (`J1.log`)                      | `$XDG_DATA_HOME/cue-shell/output/` |
+| SQLite      | Scopes, Crons, job history, config          | `$XDG_DATA_HOME/cue-shell/cued.db` |
 
 ## Design Documents
 
-| Document | Contents |
-|---|---|
-| [conceptual-model.md](conceptual-model.md) | Formal-ish model: jobs, scopes, indexing, composition, tool atoms |
-| [commands-and-modes.md](commands-and-modes.md) | Complete command reference, modes, cron syntax |
-| [cue-script.md](cue-script.md) | `.cue` file-script mode — `cue run`, syntax, scope, exit semantics |
-| [core-types.md](core-types.md) | Rust type definitions — Scope, Job, Cron, Pipeline, Chain |
-| [tui.md](tui.md) | TUI architecture, layout, interaction design |
-| [ipc-protocol.md](ipc-protocol.md) | cued ↔ client protocol specification |
-| [parser.md](parser.md) | Command parser — tokenizer, grammar, completion |
-| [daemon-architecture.md](daemon-architecture.md) | cued internals — actors, storage, startup/shutdown |
+| Document                                         | Contents                                                          |
+| ------------------------------------------------ | ----------------------------------------------------------------- |
+| [conceptual-model.md](conceptual-model.md)       | Formal-ish model: jobs, scopes, indexing, composition, tool atoms |
+| [commands-and-modes.md](commands-and-modes.md)   | Complete command reference, modes, cron syntax                    |
+| [cue-script.md](cue-script.md)                   | `.cue` file-script mode — `cue run`, syntax, scope, exit semantics |
+| [core-types.md](core-types.md)                   | Rust type definitions — Scope, Job, Cron, Pipeline, Chain          |
+| [tui.md](tui.md)                                 | TUI architecture, layout, interaction design                       |
+| [ipc-protocol.md](ipc-protocol.md)               | cued ↔ client protocol specification                               |
+| [parser.md](parser.md)                           | Command parser — tokenizer, grammar, completion                    |
+| [daemon-architecture.md](daemon-architecture.md) | cued internals — actors, storage, startup/shutdown                 |
 
 ## Research Documents
 
-| Document | Contents |
-|---|---|
-| [competitive-landscape.md](../research/competitive-landscape.md) | Competitive analysis of shells, TUIs, process managers |
-| [syntax-decisions.md](../research/syntax-decisions.md) | Prefix syntax selection process and cron grammar design |
+| Document                                                             | Contents                                                |
+| -------------------------------------------------------------------- | ------------------------------------------------------- |
+| [competitive-landscape.md](../research/competitive-landscape.md)     | Competitive analysis of shells, TUIs, process managers  |
+| [syntax-decisions.md](../research/syntax-decisions.md)               | Prefix syntax selection process and cron grammar design |
 | [extensions-and-wrappers.md](../research/extensions-and-wrappers.md) | CLI extension registry and runtime wrapper design notes |
 
 ## Tech Stack
 
-| Dependency | Role |
-|---|---|
-| tokio | Async runtime (multi-threaded) |
-| ratatui + crossterm | TUI rendering |
-| bpaf | CLI argument parsing |
-| rusqlite | SQLite persistence |
-| serde + serde_json | Serialization (IPC protocol) |
-| tracing | Structured logging |
-| thiserror + anyhow | Error handling |
+| Dependency          | Role                           |
+| ------------------- | ------------------------------ |
+| tokio               | Async runtime (multi-threaded) |
+| ratatui + crossterm | TUI rendering                  |
+| bpaf                | CLI argument parsing           |
+| rusqlite            | SQLite persistence             |
+| serde + serde_json  | Serialization (IPC protocol)   |
+| tracing             | Structured logging             |
+| thiserror + anyhow  | Error handling                 |
 
 MSRV: 1.90 · Edition: 2024 · License: MIT
