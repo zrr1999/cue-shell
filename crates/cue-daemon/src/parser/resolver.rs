@@ -814,6 +814,11 @@ mod tests {
         Resolver::resolve(ast, mode).unwrap()
     }
 
+    fn resolve_file_script(input: &str) -> ResolvedCommand {
+        let ast = CueParser::parse_file_script(input).unwrap();
+        Resolver::resolve(ast, Mode::Job).unwrap()
+    }
+
     fn leaf_pipeline(chain: core_pipeline::ChainNode) -> core_pipeline::Pipeline {
         match chain {
             core_pipeline::ChainNode::Leaf(JobPlan::Pipeline(pipeline)) => pipeline,
@@ -831,6 +836,21 @@ mod tests {
     fn resolve_bare_job() {
         let cmd = resolve("cargo test --release", Mode::Job);
         assert!(matches!(cmd, ResolvedCommand::Run { .. }));
+    }
+
+    #[test]
+    fn resolve_file_script_bare_items_as_runs() {
+        let cmd = resolve_file_script("cargo fmt --check\ncargo test -> cargo clippy");
+        match cmd {
+            ResolvedCommand::Script { items, .. } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].source, "cargo fmt --check");
+                assert_eq!(items[1].source, "cargo test -> cargo clippy");
+                assert!(matches!(*items[0].command, ResolvedCommand::Run { .. }));
+                assert!(matches!(*items[1].command, ResolvedCommand::Run { .. }));
+            }
+            _ => panic!("expected Script"),
+        }
     }
 
     #[test]

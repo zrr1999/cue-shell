@@ -39,12 +39,17 @@ Rules:
 A `.cue` script is a list of top-level cue-shell items. Each item is parsed with
 the same command and chain grammar used by JOB-mode input and `:run`.
 
+Bare top-level items default to JOB-mode `:run`, so ordinary command lines do
+not need an explicit `:run` prefix. Keep explicit `:` commands for cue-shell
+builtins and for `:run(...)` when mode parameters are needed.
+
 Example:
 
 ```cue
 # comments are ignored
-:run cargo fmt --check
-:run cargo test -> cargo clippy
+cargo fmt --check
+cargo test -> cargo clippy
+:run(pty=false) cat Cargo.toml |> wc -l
 :cron in 5m cargo test
 ```
 
@@ -61,6 +66,8 @@ v1 file-specific lexical rules:
 - `#` starts a line comment when it appears at the beginning of a line or after
   horizontal whitespace in token-boundary context.
 - `#` inside quoted words is part of the word, not a comment.
+- Bare non-`:` items are resolved as `:run <item>` in JOB mode while preserving
+  the original source text for `R<n>` script metadata.
 - Newline separates top-level items only when the current chain is syntactically
   complete.
 - Newline inside an unfinished chain is formatting whitespace.
@@ -123,7 +130,7 @@ Within the script:
 
 - item 0 starts from the forked scope
 - each later top-level item inherits the previous top-level item's `end_scope`
-- `:run cd ...` and `:run env set ...` affect later items in the same script
+- `cd ...`, `env set ...`, `:run cd ...`, and `:run env set ...` affect later items in the same script
 - the default HEAD is not advanced or mutated by script execution
 
 After the run, the isolated scope lineage may remain in normal scope storage and

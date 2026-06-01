@@ -203,6 +203,8 @@ The Resolver transforms `Ast` → `RequestPayload`:
 1. **Mode injection**: `BareInput` → wraps with default command per current mode
    - JOB ⚡ → `:run`
    - CRON ⏰ → `:cron`
+   - `.cue` file scripts resolve bare top-level items in JOB mode, so `echo hi`
+     in a script is equivalent to `:run echo hi` while preserving source text
 
 2. **Argument type validation**: ensures command gets correct argument type
     - `:run` expects Chain, `:kill` expects IdRef, `:send` expects Text, etc.

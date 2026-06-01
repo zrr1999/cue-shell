@@ -1,2 +1,2 @@
 # Minimal .cue script.
-:run echo hello from cue
+echo hello from cue
