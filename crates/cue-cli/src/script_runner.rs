@@ -2,9 +2,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use cue_client::{CuedClient, ResolvedTransport, connect_ssh_transport};
 use cue_core::Mode;
-use cue_core::ipc::{EventPayload, Message, OkPayload, RequestPayload, ResponsePayload, Stream};
+use cue_core::ipc::{EventPayload, Message, OkPayload, ResponsePayload, Stream};
 
 use crate::config::Config;
 use crate::daemon_lifecycle::{
@@ -61,28 +62,16 @@ async fn connect_for_script() -> Result<CuedClient> {
 }
 
 async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Result<i32> {
-    let subscribe_id = client
-        .send(RequestPayload::Subscribe {
-            channels: vec!["jobs".into()],
-        })
-        .await?;
     let request_id = client.run_script(path, input, Mode::Job).await?;
     let mut script_id: Option<String> = None;
     let mut pending_finished: Vec<(String, i32)> = Vec::new();
 
     loop {
         match client.recv().await? {
-            Message::Response { id, payload } if id == subscribe_id => match payload {
-                ResponsePayload::Ok(OkPayload::Ack {}) => {}
-                ResponsePayload::Err { code, message } => {
-                    bail!("subscribe failed [{code}]: {message}");
-                }
-                other => bail!("unexpected subscribe response: {other:?}"),
-            },
             Message::Response { id, payload } if id == request_id => match payload {
                 ResponsePayload::Ok(OkPayload::ScriptCreated {
                     script_id: created,
-                    items,
+                    items: _,
                     submit_error,
                     ..
                 }) => {
@@ -93,7 +82,6 @@ async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Re
                     {
                         return Ok(*exit_code);
                     }
-                    subscribe_script_item_outputs(client, &items).await?;
                     if let Some(error) = submit_error {
                         bail!(
                             "script {created} submission failed at item {} [{}]: {}",
@@ -102,9 +90,6 @@ async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Re
                             error.message
                         );
                     }
-                }
-                ResponsePayload::Ok(OkPayload::ScriptFinished { exit_code, .. }) => {
-                    return Ok(exit_code);
                 }
                 ResponsePayload::Err { code, message } => {
                     bail!("cue run failed [{code}]: {message}");
@@ -116,14 +101,12 @@ async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Re
                 bail!("unexpected request message from cued");
             }
             Message::Event { payload } => match payload {
-                EventPayload::JobCreated { job_id, .. } => {
-                    subscribe_output(client, &job_id).await?;
-                }
                 EventPayload::OutputChunk { stream, data, .. } => {
                     write_stream(stream, data.as_bytes())?;
                 }
                 EventPayload::OutputChunkBinary { stream, base64, .. } => {
-                    write_stream(stream, base64.as_bytes())?;
+                    let bytes = decode_binary_output_chunk(&base64)?;
+                    write_stream(stream, &bytes)?;
                 }
                 EventPayload::ScriptFinished {
                     script_id: finished,
@@ -141,40 +124,119 @@ async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Re
     }
 }
 
-async fn subscribe_script_item_outputs(
-    client: &mut CuedClient,
-    items: &[cue_core::ipc::ScriptItemInfo],
-) -> Result<()> {
-    for item in items {
-        match &item.result {
-            cue_core::ipc::ScriptItemResult::Job { job_id, .. } => {
-                subscribe_output(client, job_id).await?;
-            }
-            cue_core::ipc::ScriptItemResult::Chain { job_ids, .. } => {
-                for job_id in job_ids {
-                    subscribe_output(client, job_id).await?;
-                }
-            }
-            cue_core::ipc::ScriptItemResult::Cron { .. }
-            | cue_core::ipc::ScriptItemResult::Message { .. } => {}
-        }
-    }
-    Ok(())
-}
-
-async fn subscribe_output(client: &mut CuedClient, job_id: &str) -> Result<()> {
-    let _ = client
-        .send(RequestPayload::Subscribe {
-            channels: vec![format!("output:{job_id}")],
-        })
-        .await?;
-    Ok(())
-}
-
 fn write_stream(stream: Stream, bytes: &[u8]) -> Result<()> {
     match stream {
         Stream::Stdout => std::io::stdout().write_all(bytes)?,
         Stream::Stderr => std::io::stderr().write_all(bytes)?,
     }
     Ok(())
+}
+
+fn decode_binary_output_chunk(base64: &str) -> Result<Vec<u8>> {
+    BASE64_STANDARD
+        .decode(base64.as_bytes())
+        .context("decode binary output chunk")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cue_core::ipc::{
+        MAX_MESSAGE_SIZE, RequestPayload, ScriptRunStatus, ScriptSource, encode_message,
+    };
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    async fn read_test_message<R>(stream: &mut R) -> Message
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .expect("read message length");
+        let len = u32::from_be_bytes(len_buf) as usize;
+        assert!(len <= MAX_MESSAGE_SIZE, "test message too large: {len}");
+        let mut body = vec![0u8; len];
+        stream
+            .read_exact(&mut body)
+            .await
+            .expect("read message body");
+        serde_json::from_slice(&body).expect("decode message")
+    }
+
+    async fn write_test_message<W>(stream: &mut W, message: Message)
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let encoded = encode_message(&message).expect("encode message");
+        stream
+            .write_all(&encoded)
+            .await
+            .expect("write test message");
+    }
+
+    #[test]
+    fn binary_output_chunks_decode_to_original_bytes() {
+        let encoded = BASE64_STANDARD.encode([0, 159, 146, 150, b'\n']);
+
+        let decoded = decode_binary_output_chunk(&encoded).expect("decode binary chunk");
+
+        assert_eq!(decoded, vec![0, 159, 146, 150, b'\n']);
+    }
+
+    #[tokio::test]
+    async fn run_with_client_uses_direct_script_finished_without_jobs_subscription() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let mut client = CuedClient::from_stream(client_stream);
+        let runner =
+            tokio::spawn(async move { run_with_client(&mut client, "fast.cue", ":help\n").await });
+
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                id,
+                payload: RequestPayload::RunScript { path, input, mode },
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(path, "fast.cue");
+                assert_eq!(input, ":help\n");
+                assert_eq!(mode, Mode::Job);
+            }
+            other => panic!("expected first request to be RunScript, got {other:?}"),
+        }
+
+        write_test_message(
+            &mut server_stream,
+            Message::Event {
+                payload: EventPayload::ScriptFinished {
+                    script_id: "R1".into(),
+                    status: ScriptRunStatus::Done,
+                    exit_code: 0,
+                    failed_item_index: None,
+                },
+            },
+        )
+        .await;
+        write_test_message(
+            &mut server_stream,
+            Message::Response {
+                id: 1,
+                payload: ResponsePayload::Ok(OkPayload::ScriptCreated {
+                    script_id: "R1".into(),
+                    source: ScriptSource::File {
+                        path: "fast.cue".into(),
+                    },
+                    items: vec![],
+                    submit_error: None,
+                }),
+            },
+        )
+        .await;
+
+        let exit_code = runner
+            .await
+            .expect("runner task")
+            .expect("run_with_client succeeds");
+        assert_eq!(exit_code, 0);
+    }
 }

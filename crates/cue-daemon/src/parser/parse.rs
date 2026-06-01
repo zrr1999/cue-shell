@@ -18,13 +18,13 @@
 //! ```
 
 use cue_core::command_spec::{
-    CommandArgKind, CommandSpec, MODE_PARAM_SPECS, ModeParamSpec, ModeParamValueKind, command_spec,
-    command_suggestions,
+    CommandArgKind, CommandIdKind, CommandSpec, ModeParamSpec, ModeParamValueKind, command_spec,
+    command_suggestions, mode_param_spec, mode_param_spec_for_command,
 };
 use cue_core::pipeline::{ParallelOp, PipeOp, SerialOp};
 
 use super::ast::{Argument, Ast, ChainNode, JobExpr, PipeSegment, Pipeline, ScriptItemAst};
-use super::token::{Span, Spanned, Token, Value};
+use super::token::{IdKind, Span, Spanned, Token, Value};
 use super::tokenizer::Tokenizer;
 
 /// Parser error.
@@ -234,7 +234,7 @@ impl<'a> Parser<'a> {
 
         // Mode params?
         let mode_params = if matches!(self.peek(), Token::ModeParenOpen) {
-            if !spec.accepts_mode_params {
+            if !spec.accepts_mode_params() {
                 return Err(ParseError {
                     span: self.peek_span(),
                     message: format!("`:{name}` does not accept mode params"),
@@ -243,7 +243,7 @@ impl<'a> Parser<'a> {
                 });
             }
             self.advance(); // consume ModeParenOpen
-            self.parse_mode_params()?
+            self.parse_mode_params(&name)?
         } else {
             vec![]
         };
@@ -260,11 +260,11 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_mode_params(&mut self) -> Result<Vec<(String, Value)>, ParseError> {
+    fn parse_mode_params(&mut self, command: &str) -> Result<Vec<(String, Value)>, ParseError> {
         let mut params = vec![];
         loop {
             match self.peek() {
-                Token::GroupClose => {
+                Token::ModeParenClose => {
                     self.advance(); // consume )
                     break;
                 }
@@ -297,7 +297,7 @@ impl<'a> Parser<'a> {
                         }
                     };
                     let key_span = self.tokens[self.pos - 1].span;
-                    let Some(spec) = MODE_PARAM_SPECS.iter().find(|spec| spec.name == key) else {
+                    let Some(global_spec) = mode_param_spec(&key) else {
                         return Err(ParseError {
                             span: key_span,
                             message: format!("unknown mode parameter `{key}`"),
@@ -305,6 +305,17 @@ impl<'a> Parser<'a> {
                             suggestions: vec![],
                         });
                     };
+                    let Some(spec) = mode_param_spec_for_command(command, &key) else {
+                        return Err(ParseError {
+                            span: key_span,
+                            message: format!(
+                                "mode parameter `{key}` is not supported by `:{command}`"
+                            ),
+                            kind: ParseErrorKind::InvalidModeParam,
+                            suggestions: vec![],
+                        });
+                    };
+                    debug_assert_eq!(spec.name, global_spec.name);
                     self.expect(&Token::ParamEq)?;
                     let value_span = self.peek_span();
                     let value = match self.peek().clone() {
@@ -364,8 +375,9 @@ impl<'a> Parser<'a> {
                 Ok(Argument::Chain(self.parse_chain()?))
             }
 
-            CommandArgKind::Tail => {
+            CommandArgKind::Tail(allowed) => {
                 if let Token::IdRef(kind, n) = self.peek().clone() {
+                    validate_id_kind(name, allowed, kind, self.peek_span())?;
                     self.advance();
                     let bytes = match self.peek().clone() {
                         Token::Word(w) => {
@@ -382,23 +394,27 @@ impl<'a> Parser<'a> {
                 } else {
                     Err(ParseError {
                         span: self.peek_span(),
-                        message: format!(":{name} requires an ID (e.g. J1)"),
+                        message: format!(":{name} requires an ID ({})", allowed.display()),
                         kind: ParseErrorKind::InvalidIdRef,
-                        suggestions: vec![format!(":{name} J1"), format!(":{name} J1 1024")],
+                        suggestions: vec![
+                            format!(":{name} {}", allowed.first_example()),
+                            format!(":{name} {} 1024", allowed.first_example()),
+                        ],
                     })
                 }
             }
 
-            CommandArgKind::Id => {
+            CommandArgKind::Id(allowed) => {
                 if let Token::IdRef(kind, n) = self.peek().clone() {
+                    validate_id_kind(name, allowed, kind, self.peek_span())?;
                     self.advance();
                     Ok(Argument::IdRef(kind, n))
                 } else {
                     Err(ParseError {
                         span: self.peek_span(),
-                        message: format!(":{name} requires an ID (e.g. J1, C1)"),
+                        message: format!(":{name} requires an ID ({})", allowed.display()),
                         kind: ParseErrorKind::InvalidIdRef,
-                        suggestions: vec![format!(":{name} J1")],
+                        suggestions: vec![format!(":{name} {}", allowed.first_example())],
                     })
                 }
             }
@@ -419,8 +435,27 @@ impl<'a> Parser<'a> {
                 Ok(Argument::Text(text))
             }
 
-            CommandArgKind::OptionalId => {
+            CommandArgKind::TargetText(allowed) => {
+                let target = self.peek().clone();
+                validate_text_target(name, allowed, &target, self.peek_span())?;
+                let text = self.consume_remaining_raw_text();
+                if text.is_empty() {
+                    return Err(ParseError {
+                        span: self.peek_span(),
+                        message: format!("`:{name}` requires a target and input"),
+                        kind: ParseErrorKind::MissingArgument,
+                        suggestions: vec![format!(
+                            ":{name} {} your input",
+                            allowed.first_example()
+                        )],
+                    });
+                }
+                Ok(Argument::Text(text))
+            }
+
+            CommandArgKind::OptionalId(allowed) => {
                 if let Token::IdRef(kind, n) = self.peek().clone() {
+                    validate_id_kind(name, allowed, kind, self.peek_span())?;
                     self.advance();
                     Ok(Argument::IdRef(kind, n))
                 } else {
@@ -627,6 +662,51 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn validate_id_kind(
+    command: &str,
+    allowed: CommandIdKind,
+    actual: IdKind,
+    span: Span,
+) -> Result<(), ParseError> {
+    let accepted = match actual {
+        IdKind::Job => allowed.accepts_job(),
+        IdKind::Cron => allowed.accepts_cron(),
+    };
+    if accepted {
+        return Ok(());
+    }
+
+    Err(ParseError {
+        span,
+        message: format!(":{command} expects {} ID, got {actual}", allowed.display()),
+        kind: ParseErrorKind::InvalidIdRef,
+        suggestions: vec![format!(":{command} {}", allowed.first_example())],
+    })
+}
+
+fn validate_text_target(
+    command: &str,
+    allowed: CommandIdKind,
+    target: &Token,
+    span: Span,
+) -> Result<(), ParseError> {
+    match target {
+        Token::IdRef(kind, _) => validate_id_kind(command, allowed, *kind, span),
+        Token::Eof => Err(ParseError {
+            span,
+            message: format!("`:{command}` requires a target and input"),
+            kind: ParseErrorKind::MissingArgument,
+            suggestions: vec![format!(":{command} {} your input", allowed.first_example())],
+        }),
+        _ => Err(ParseError {
+            span,
+            message: format!(":{command} requires a target ID ({})", allowed.display()),
+            kind: ParseErrorKind::InvalidIdRef,
+            suggestions: vec![format!(":{command} {} your input", allowed.first_example())],
+        }),
+    }
+}
+
 fn tokenize_for_parser(input: &str) -> Result<Vec<Spanned>, ParseError> {
     let all_tokens = Tokenizer::tokenize(input).map_err(|e| ParseError {
         span: Span::new(e.pos, e.pos + 1),
@@ -820,7 +900,7 @@ fn validate_mode_param_value(
 ) -> Result<(), ParseError> {
     let valid = matches!(
         (spec.value_kind, value),
-        (ModeParamValueKind::Str, Value::Str(_)) | (ModeParamValueKind::Bool, Value::Bool(_))
+        (ModeParamValueKind::String, Value::Str(_)) | (ModeParamValueKind::Bool, Value::Bool(_))
     );
     if valid {
         return Ok(());
@@ -841,7 +921,7 @@ fn validate_mode_param_value(
 
 fn mode_param_value_kind_name(kind: ModeParamValueKind) -> &'static str {
     match kind {
-        ModeParamValueKind::Str => "a string/path",
+        ModeParamValueKind::String => "a string",
         ModeParamValueKind::Bool => "a boolean",
     }
 }
@@ -935,6 +1015,37 @@ mod tests {
             }
             _ => panic!("expected Command"),
         }
+    }
+
+    #[test]
+    fn id_arguments_enforce_command_entity_kind() {
+        let kill_cron = Parser::parse(":kill C1").unwrap();
+        match kill_cron {
+            Ast::Command { argument, .. } => {
+                assert_eq!(argument, Argument::IdRef(IdKind::Cron, 1));
+            }
+            _ => panic!("expected Command"),
+        }
+
+        let log_cron = Parser::parse(":log C1").unwrap();
+        match log_cron {
+            Ast::Command { argument, .. } => {
+                assert_eq!(argument, Argument::IdRef(IdKind::Cron, 1));
+            }
+            _ => panic!("expected Command"),
+        }
+
+        let pause_job = Parser::parse(":pause J1").expect_err("pause requires cron id");
+        assert_eq!(pause_job.kind, ParseErrorKind::InvalidIdRef);
+        assert!(pause_job.message.contains("C<n>"));
+
+        let fg_cron = Parser::parse(":fg C1").expect_err("fg requires job id");
+        assert_eq!(fg_cron.kind, ParseErrorKind::InvalidIdRef);
+        assert!(fg_cron.message.contains("J<n>"));
+
+        let tail_cron = Parser::parse(":tail C1").expect_err("tail requires job id");
+        assert_eq!(tail_cron.kind, ParseErrorKind::InvalidIdRef);
+        assert!(tail_cron.message.contains("J<n>"));
     }
 
     #[test]
@@ -1040,16 +1151,35 @@ mod tests {
     }
 
     #[test]
+    fn mode_params_reject_params_not_supported_by_command() {
+        let err = Parser::parse(":cron(pty=false) every 5m cargo test")
+            .expect_err("cron must not accept run-only pty param");
+        assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
+        assert!(
+            err.message
+                .contains("mode parameter `pty` is not supported by `:cron`")
+        );
+    }
+
+    #[test]
+    fn mode_params_reject_unimplemented_timeout() {
+        let err = Parser::parse(":run(timeout=1s) cargo test")
+            .expect_err("timeout is not an implemented mode parameter");
+        assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
+        assert!(err.message.contains("unknown mode parameter `timeout`"));
+    }
+
+    #[test]
     fn mode_params_reject_values_with_wrong_type() {
-        let err = Parser::parse(":run(pty=no) cargo test").expect_err("pty needs a boolean");
+        let err = Parser::parse(":run(pty=soon) cargo test").expect_err("pty needs bool");
         assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
         assert!(err.message.contains("pty"));
-        assert!(err.message.contains("boolean"));
+        assert!(err.message.contains("a boolean"));
 
-        let err = Parser::parse(":run(cwd=false) cargo test").expect_err("cwd needs a string/path");
+        let err = Parser::parse(":run(retry=-1) cargo test")
+            .expect_err("retry is not an implemented mode parameter");
         assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
-        assert!(err.message.contains("cwd"));
-        assert!(err.message.contains("string/path"));
+        assert!(err.message.contains("unknown mode parameter `retry`"));
     }
 
     #[test]
@@ -1091,6 +1221,17 @@ mod tests {
     fn parse_send_raw_rejects_unquoted_chain_operator_without_boundary() {
         let err = Parser::parse(":send J1 replace a->b").unwrap_err();
         assert!(err.message.contains("must be surrounded by whitespace"));
+    }
+
+    #[test]
+    fn parse_send_requires_job_target() {
+        let cron_target = Parser::parse(":send C1 input").expect_err("send requires job id");
+        assert_eq!(cron_target.kind, ParseErrorKind::InvalidIdRef);
+        assert!(cron_target.message.contains("J<n>"));
+
+        let text_target = Parser::parse(":send process input").expect_err("send requires id");
+        assert_eq!(text_target.kind, ParseErrorKind::InvalidIdRef);
+        assert!(text_target.message.contains("target ID"));
     }
 
     #[test]

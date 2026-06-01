@@ -12,6 +12,7 @@
 ```
 :run cargo build          # 发射 job
 :kill J1                  # 终止 job
+:kill C1                  # 移除 cron
 :jobs                     # 列出所有 job
 :scope list --tree        # 列出 scope
 :env                      # 查看 env（无参数也用 :）
@@ -22,7 +23,6 @@
 ```
 
 **设计理由**（`:` 前缀 vs `/` 前缀 vs `cmd:` 分隔符）：
-
 - `:` 在所有模式下零冲突：shell 命令、自然语言、cron 表达式都不以 `:` 开头
 - Vim/Helix/lazygit 用户有肌肉记忆（TUI 文化一致）
 - `/` 在 JOB 模式下与绝对路径 `/usr/bin/...` 冲突
@@ -39,11 +39,10 @@
 
 ### 两个主模式
 
-| 模式        | 默认包装          | 含义       | 定位 |
-| ----------- | ----------------- | ---------- | ---- |
-| **JOB** ⚡  | → `:run <input>`  | 输入即执行 | 核心 |
+| 模式 | 默认包装 | 含义 | 定位 |
+|------|---------|------|------|
+| **JOB** ⚡ | → `:run <input>` | 输入即执行 | 核心 |
 | **CRON** ⏰ | → `:cron <input>` | 输入即调度 | 核心 |
-
 - Shift+Tab 循环切换：JOB → CRON → JOB
 - `:` 前缀在任何模式下都能直接执行内建命令
 
@@ -75,14 +74,14 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 
 ### 模式转换示例
 
-| 输入                   | JOB ⚡                         | CRON ⏰                        |
-| ---------------------- | ------------------------------ | ------------------------------ |
-| `cargo build`          | `:run cargo build`             | `:cron cargo build`            |
-| `run the tests`        | `:run run the tests`           | `:cron run the tests`          |
-| `:kill J1`             | 内建 kill ✅                   | 内建 kill ✅                   |
-| `:jobs`                | 内建 jobs ✅                   | 内建 jobs ✅                   |
-| `/usr/bin/python a.py` | `:run /usr/bin/python a.py` ✅ | `:cron /usr/bin/python a.py`   |
-| `every 5m cargo test`  | `:run every 5m cargo test`     | `:cron every 5m cargo test` ✅ |
+| 输入 | JOB ⚡ | CRON ⏰ |
+|------|--------|---------|
+| `cargo build` | `:run cargo build` | `:cron cargo build` |
+| `run the tests` | `:run run the tests` | `:cron run the tests` |
+| `:kill J1` | 内建 kill ✅ | 内建 kill ✅ |
+| `:jobs` | 内建 jobs ✅ | 内建 jobs ✅ |
+| `/usr/bin/python a.py` | `:run /usr/bin/python a.py` ✅ | `:cron /usr/bin/python a.py` |
+| `every 5m cargo test` | `:run every 5m cargo test` | `:cron every 5m cargo test` ✅ |
 
 **零歧义**：`:` 开头 = 内建，否则 = 模式默认。没有命名冲突，没有 fallthrough，没有上下文依赖。
 
@@ -92,18 +91,18 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 
 ### 3.1 Job 管理
 
-| 命令      | 语法                    | 语义                         | 定位 |
-| --------- | ----------------------- | ---------------------------- | ---- |
-| `:run`    | `:run <cmd> [chain...]` | 发射 job                     | 核心 |
-| `:jobs`   | `:jobs [--json]`        | 列出所有 job 摘要            | 核心 |
-| `:wait`   | `:wait J1`              | 等待 job 进入终态            | 核心 |
-| `:out`    | `:out J1`               | 查看 job stdout snapshot     | 核心 |
-| `:tail`   | `:tail J1 [bytes]`      | 打开并持续 follow job stdout | 核心 |
-| `:err`    | `:err J1`               | 查看 job stderr snapshot     | 核心 |
-| `:send`   | `:send J1 <input>`      | 向 running job 写 stdin      | 核心 |
-| `:kill`   | `:kill J1`              | 终止 running job             | 核心 |
-| `:cancel` | `:cancel J3`            | 取消 queued job              | 核心 |
-| `:fg`     | `:fg J2`                | Job 进入前台 pty             | 核心 |
+| 命令 | 语法 | 语义 | 定位 |
+|------|------|------|------|
+| `:run` | `:run <cmd> [chain...]` | 发射 job | 核心 |
+| `:jobs` | `:jobs [--json]` | 列出所有 job 摘要 | 核心 |
+| `:wait` | `:wait J1` | 等待 job 进入终态 | 核心 |
+| `:out` | `:out J1` | 查看 job stdout snapshot | 核心 |
+| `:tail` | `:tail J1 [bytes]` | 打开并持续 follow job stdout | 核心 |
+| `:err` | `:err J1` | 查看 job stderr snapshot | 核心 |
+| `:send` | `:send J1 <input>` | 向 running job 写 stdin | 核心 |
+| `:kill` | `:kill J<n>` / `:kill C<n>` | 终止 running job 或移除 cron | 核心 |
+| `:cancel` | `:cancel J3` | 取消 queued job | 核心 |
+| `:fg` | `:fg J2` | Job 进入前台 pty | 核心 |
 
 `:run` / JOB bare input 在发射前会基于当前 scope snapshot 做**显式 word expansion**：支持前导 `~`、`$VAR`、`${VAR}`；仍保持 direct exec，不隐式走 shell，也不做 glob / command substitution / field splitting。
 
@@ -129,20 +128,23 @@ JOB 模式下的交互多行输入不再是 script 入口；需要多个顶层 i
 
 ### 3.2 Scope 管理
 
-| 命令           | 语法                          | 语义                        | 定位 |
-| -------------- | ----------------------------- | --------------------------- | ---- |
-| `:scope list`  | `:scope list [--tree]`        | 列出所有 scope              | 核心 |
-| `:scope new`   | `:scope new [--profile rust]` | 创建新 scope                | 核心 |
-| `:scope env`   | `:scope env S1`               | 查看 scope env              | 核心 |
-| `:scope fork`  | `:scope fork S1 [--name exp]` | 从 scope 派生（delta 存储） | 核心 |
-| `:scope close` | `:scope close S1`             | 归档 scope                  | 核心 |
+| 命令 | 语法 | 语义 | 定位 |
+|------|------|------|------|
+| `:scope list` | `:scope list [--tree]` | 列出所有 scope | 核心 |
+| `:scopes` | `:scopes` | 列出所有 scope（简写） | 核心 |
+
+当前实现只暴露 scope 列表和 hash；scope 是内容寻址快照（`S@...`），不是 `S1` 这类递增编号实体。`env` / `fork` / `close` 这类子命令还没有实现，不能作为当前核心命令写入用户契约。
 
 ### 3.3 Cron/定时管理
 
-| 命令     | 语法                     | 语义              | 定位 |
-| -------- | ------------------------ | ----------------- | ---- |
-| `:cron`  | `:cron <schedule> <cmd>` | 添加定时/延迟任务 | 核心 |
-| `:crons` | `:crons`                 | 列出所有定时任务  | 核心 |
+| 命令 | 语法 | 语义 | 定位 |
+|------|------|------|------|
+| `:cron` | `:cron <schedule> <cmd>` | 添加定时/延迟任务 | 核心 |
+| `:crons` | `:crons` | 列出所有定时任务 | 核心 |
+| `:pause` | `:pause C<n>` | 暂停定时任务 | 核心 |
+| `:resume` | `:resume C<n>` | 恢复定时任务 | 核心 |
+| `:kill` | `:kill C<n>` | 移除定时任务 | 核心 |
+| `:log` | `:log [C<n>]` | 查看 cron 历史日志 | 核心 |
 
 - `:crons` 现在展示**持久化 cron 历史**，而不只是在内存中的活跃注册项
 - one-shot cron 触发后会保留为 `completed`；daemon 重启时已错过的 one-shot 会保留为 `expired`，都不会再补跑
@@ -173,15 +175,15 @@ JOB 模式下的交互多行输入不再是 script 入口；需要多个顶层 i
 
 **关键字解析规则**：
 
-| 首 token             | 消耗 token 数            | 语法                                     |
-| -------------------- | ------------------------ | ---------------------------------------- |
-| `every`              | 1（duration）            | `every <dur> <cmd...>`                   |
-| `at`                 | 1-3（time [on dayspec]） | `at <time> [on <days>] <cmd...>`         |
-| `on`                 | 3（dayspec at time）     | `on <days> at <time> <cmd...>`           |
-| `in`                 | 1（duration）            | `in <dur> <cmd...>`                      |
-| `cron`               | 5（cron fields）         | `cron <f1> <f2> <f3> <f4> <f5> <cmd...>` |
-| `daily`/`hourly`/... | 0                        | `<preset> <cmd...>`                      |
-| 其他                 | 扫描 `do`                | `<5-field-crontab> do <cmd...>`          |
+| 首 token | 消耗 token 数 | 语法 |
+|---------|-------------|------|
+| `every` | 1（duration） | `every <dur> <cmd...>` |
+| `at` | 1-3（time [on dayspec]） | `at <time> [on <days>] <cmd...>` |
+| `on` | 3（dayspec at time） | `on <days> at <time> <cmd...>` |
+| `in` | 1（duration） | `in <dur> <cmd...>` |
+| `cron` | 5（cron fields） | `cron <f1> <f2> <f3> <f4> <f5> <cmd...>` |
+| `daily`/`hourly`/... | 0 | `<preset> <cmd...>` |
+| 其他 | 扫描 `do` | `<5-field-crontab> do <cmd...>` |
 
 > 完整的 cron 语法设计过程与备选方案对比见 [research/syntax-decisions.md](../research/syntax-decisions.md)。
 
@@ -190,15 +192,15 @@ JOB 模式下的交互多行输入不再是 script 入口；需要多个顶层 i
 
 ### 3.4 通用命令
 
-| 命令       | 语法                       | 语义                           | 定位 |
-| ---------- | -------------------------- | ------------------------------ | ---- |
-| `:env`     | `:env`                     | 查看当前持久化 HEAD env        | 核心 |
-| `:env set` | `:env set FOO=bar`         | 设置 env 并打印实际副作用      | 核心 |
-| `:help`    | `:help` / `:help run`      | 帮助                           | 核心 |
-| `?`        | `?`                        | 当前 mode 的详细帮助           | 核心 |
-| `:config`  | `:config` / `:config show` | 查看配置                       | 核心 |
-| `:wrap`    | `:wrap [on/off/status]`    | 查看或临时覆盖 runtime wrapper | 核心 |
-| `:exit`    | `:exit`                    | 退出 TUI                       | 核心 |
+| 命令 | 语法 | 语义 | 定位 |
+|------|------|------|------|
+| `:env` | `:env` | 查看当前持久化 HEAD env | 核心 |
+| `:env set` | `:env set FOO=bar` | 设置 env 并打印实际副作用 | 核心 |
+| `:help` | `:help` / `:help run` | 帮助 | 核心 |
+| `?` | `?` | 当前 mode 的详细帮助 | 核心 |
+| `:config` | `:config` / `:config show` | 查看配置 | 核心 |
+| `:wrap` | `:wrap [on/off/status]` | 查看或临时覆盖 runtime wrapper | 核心 |
+| `:exit` | `:exit` | 退出 TUI | 核心 |
 
 这里需要区分：
 
@@ -217,13 +219,11 @@ JOB 模式下的交互多行输入不再是 script 入口；需要多个顶层 i
 ## 四、Scope 持久化策略
 
 ### Delta 存储
-
 - fork 出的 scope 只存储 `parent_id` + `env_delta`
 - 读取时沿 parent 链合并得到完整 env
 - 大幅减少磁盘开销
 
 ### LRU 淘汰 + 引用保护
-
 - 配置 `max_persisted_scopes`
 - 超限时淘汰 `last_used` 最旧的 scope
 - **引用保护**：被 active/idle 子 scope 依赖的 parent 不可淘汰
@@ -244,11 +244,10 @@ max_script_runs = 100
 - 裁剪时优先删除最旧记录，script 只是提交层摘要，不改变 job 作为输出权威来源的设计
 
 ### 生命周期
-
 ```
 Active → Idle (队列空) → Persisted (TTL 到期，落盘)
                                     ↓
-                              Archived (LRU 淘汰 or :scope close)
+                              Archived (retention policy)
                                     ↓
                               Deleted (超出保留限制)
 ```
@@ -261,7 +260,7 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 ```
 :run(cwd=/repo, pty=false) cargo test --release
-:cron(cwd=/repo, pty=false) every 5m cargo clippy
+:cron(cwd=/repo) every 5m cargo clippy
 ```
 
 - `()` 紧跟命令名 = 模式参数（执行行为配置）
@@ -271,10 +270,10 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 ### 支持模式参数的命令
 
-| 命令      | 可用参数                         |
-| --------- | -------------------------------- |
-| `:run()`  | `cwd`, `pty`, `scope`, `wrapper` |
-| `:cron()` | `cwd`, `pty`, `scope`, `wrapper` |
+| 命令 | 可用参数 |
+|------|---------|
+| `:run()` | `cwd`, `wrapper`, `scope`, `pty` |
+| `:cron()` | `cwd`, `wrapper`, `scope` |
 
 其他命令只有位置/标志参数，无 `()` 语法。
 
@@ -286,22 +285,22 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 Pipeline 连接 **进程**，运行在同一个 Job 内部，类似 bash 的 `|`：
 
-| 操作符 | 语义               | 说明                            |
-| ------ | ------------------ | ------------------------------- |
-| `\|>`  | stdout 管道        | 前者 stdout → 后者 stdin        |
+| 操作符 | 语义 | 说明 |
+|--------|------|------|
+| `\|>` | stdout 管道 | 前者 stdout → 后者 stdin |
 | `\|&>` | stdout+stderr 管道 | 前者 stdout+stderr → 后者 stdin |
-| `\|!>` | stderr 管道        | 前者仅 stderr → 后者 stdin      |
+| `\|!>` | stderr 管道 | 前者仅 stderr → 后者 stdin |
 
 ### Chain（Job 间的编排）
 
 Chain 连接 **Job**，由 Scheduler 调度执行：
 
-| 操作符  | 语义          | 说明                   |
-| ------- | ------------- | ---------------------- |
-| `->`    | 串行-成功继续 | 前者 exit 0 才执行后者 |
-| `~>`    | 串行-忽略结果 | 无论前者结果都执行后者 |
-| `\|\|`  | 并行-全部     | 同时发射所有分支       |
-| `\|\|?` | 并行-竞速     | 任一成功即视为成功     |
+| 操作符 | 语义 | 说明 |
+|--------|------|------|
+| `->` | 串行-成功继续 | 前者 exit 0 才执行后者 |
+| `~>` | 串行-忽略结果 | 无论前者结果都执行后者 |
+| `\|\|` | 并行-全部 | 同时发射所有分支 |
+| `\|\|?` | 并行-竞速 | 任一成功即视为成功 |
 
 ### 优先级
 
@@ -343,7 +342,7 @@ Pipeline 内退出码 = 最后一个进程的退出码
 ### 重试
 
 - `:retry J3` → 当前会用原 `start_scope` 和 pipeline 重新发射一个 fresh job
-- 自动重试 mode params 尚未实现；`retry` / `retry_delay` 不属于已支持 mode params
+- 自动重试尚未实现，因此不提供 `retry` / `retry_delay` mode params，避免调用时看似生效但实际被忽略
 - downstream chain 续接 / 自动重启后继 leaf 仍未完成，语义已显式收窄，避免保留模糊 stub
 
 ---
@@ -359,17 +358,13 @@ Pipeline 内退出码 = 最后一个进程的退出码
 │ :tail <id>     follow stdout               │
 │ :err <id>      查看 stderr snapshot        │
 │ :send <id>     写入 stdin                  │
-│ :kill <id>     终止 job                    │
+│ :kill <id>     终止 job / 移除 cron        │
 │ :cancel <id>   取消排队 job                │
 │ :fg <id>       前台（pty）                 │
 │ :retry <id>    重试 failed job             │
-│ :log [id]      查看 job 历史日志           │
+│ :log [id]      查看 job / cron 历史日志    │
 ├── Scope ──────────────────────────────────┤
 │ :scope list    列出 scope                  │
-│ :scope new     创建 scope                  │
-│ :scope env     查看 scope env              │
-│ :scope fork    派生 scope（delta）          │
-│ :scope close   归档 scope                  │
 │ :scopes        列出所有 scope（简写）       │
 │ :cd <path>     修改默认 scope 的 cwd       │
 ├── Control ────────────────────────────────┤
@@ -378,6 +373,10 @@ Pipeline 内退出码 = 最后一个进程的退出码
 ├── Cron ───────────────────────────────────┤
 │ :cron <sched> <cmd>  添加定时/延迟任务     │
 │ :crons         列出定时任务                │
+│ :pause C<n>    暂停定时任务                │
+│ :resume C<n>   恢复定时任务                │
+│ :kill C<n>     移除定时任务                │
+│ :log [C<n>]    查看 cron 历史日志          │
 │   内部关键字:                              │
 │   every 5m / at 9am / on weekdays         │
 │   in 5m / daily / cron */5 * * * *        │
@@ -393,5 +392,5 @@ Pipeline 内退出码 = 最后一个进程的退出码
 │ :quit          退出 TUI                    │
 └───────────────────────────────────────────┘
 
-总计：28+ 内建命令（含 scope/cron 子命令）
+当前内建命令面以 `crates/cue-core/src/command_spec.rs` 的 `COMMAND_SPECS` 为准。
 ```

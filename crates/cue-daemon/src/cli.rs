@@ -317,14 +317,20 @@ async fn async_main(socket_path: PathBuf) -> Result<()> {
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
     let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())?;
 
-    tokio::select! {
-        _ = sigterm.recv() => info!("received SIGTERM"),
-        _ = sigint.recv()  => info!("received SIGINT"),
-    }
+    let shutdown_reason = tokio::select! {
+        _ = sigterm.recv() => {
+            info!("received SIGTERM");
+            "SIGTERM"
+        }
+        _ = sigint.recv()  => {
+            info!("received SIGINT");
+            "SIGINT"
+        }
+    };
 
     // Graceful shutdown.
     info!("cued shutting down");
-    sys.shutdown().await;
+    sys.shutdown_with_reason(shutdown_reason).await;
     drop(sys);
 
     // Give actors a moment to drain.

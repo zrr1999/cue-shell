@@ -4,12 +4,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use cue_core::ScopeHash;
 use cue_core::cron::CronStatus;
 use cue_core::job::{CancelReason, JobStatus};
 use cue_core::scope::Scope;
+use cue_core::{CronId, JobId, ScopeHash, ScriptId};
 use rusqlite::Connection;
 
 pub type SharedConnection = Arc<Mutex<Connection>>;
@@ -37,7 +38,7 @@ where
 // ── Schema migration ──
 
 /// Current schema version (bump when adding migrations).
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
 
 const MIGRATION_V1: &str = r"
 CREATE TABLE IF NOT EXISTS scopes (
@@ -61,8 +62,8 @@ CREATE TABLE IF NOT EXISTS crons (
     cwd_override TEXT,
     scope_enabled INTEGER NOT NULL DEFAULT 0,
     wrapper_enabled INTEGER NOT NULL DEFAULT 0,
-    pty_enabled INTEGER NOT NULL DEFAULT 1,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS jobs_history (
@@ -130,9 +131,10 @@ const MIGRATION_V12: &str = r"
 ALTER TABLE crons ADD COLUMN wrapper_enabled INTEGER NOT NULL DEFAULT 0;
 ";
 
-const MIGRATION_V13: &str = r"
-ALTER TABLE crons ADD COLUMN pty_enabled INTEGER NOT NULL DEFAULT 1;
-";
+const CRON_CREATED_AT_MS_EXPR: &str = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
+
+const CRON_LEGACY_CREATED_AT_MS_EXPR: &str =
+    "CAST((julianday(created_at) - 2440587.5) * 86400000 AS INTEGER)";
 
 /// Open (or create) the database at `path`, apply WAL mode and run migrations.
 pub fn open_db(path: &Path) -> Result<Connection> {
@@ -148,18 +150,23 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    let current: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let mut current: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current > SCHEMA_VERSION {
+        return Err(anyhow!(
+            "database schema version {current} is newer than supported version {SCHEMA_VERSION}"
+        ));
+    }
     if current < 1 {
         conn.execute_batch(MIGRATION_V1)
             .context("failed to run schema migration v1")?;
-        conn.pragma_update(None, "user_version", 1)?;
+        set_schema_version(conn, &mut current, 1)?;
     }
     if current < 2 {
         if !column_exists(conn, "crons", "scope_hash")? {
             conn.execute_batch(MIGRATION_V2)
                 .context("failed to run schema migration v2")?;
         }
-        conn.pragma_update(None, "user_version", 2)?;
+        set_schema_version(conn, &mut current, 2)?;
     }
     if current < 3 {
         if !column_exists(conn, "jobs_history", "start_scope")? {
@@ -172,13 +179,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
         conn.execute_batch(MIGRATION_V3)
             .context("failed to backfill jobs_history start/end scope")?;
-        conn.pragma_update(None, "user_version", 3)?;
+        set_schema_version(conn, &mut current, 3)?;
     }
     if current < 4 {
-        conn.pragma_update(None, "user_version", 4)?;
+        set_schema_version(conn, &mut current, 4)?;
     }
     if current < 5 {
-        conn.pragma_update(None, "user_version", 5)?;
+        set_schema_version(conn, &mut current, 5)?;
     }
     if current < 6 {
         if !column_exists(conn, "crons", "status")? {
@@ -191,14 +198,14 @@ fn migrate(conn: &Connection) -> Result<()> {
              WHERE status IS NULL OR status = '';",
         )
         .context("failed to backfill crons.status")?;
-        conn.pragma_update(None, "user_version", 6)?;
+        set_schema_version(conn, &mut current, 6)?;
     }
     if current < 7 {
         if !column_exists(conn, "jobs_history", "chain_id")? {
             conn.execute_batch("ALTER TABLE jobs_history ADD COLUMN chain_id TEXT;")
                 .context("failed to add jobs_history.chain_id")?;
         }
-        conn.pragma_update(None, "user_version", 7)?;
+        set_schema_version(conn, &mut current, 7)?;
     }
     if current < 8 {
         if !column_exists(conn, "jobs_history", "stderr")? {
@@ -207,41 +214,68 @@ fn migrate(conn: &Connection) -> Result<()> {
             )
             .context("failed to add jobs_history.stderr")?;
         }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        set_schema_version(conn, &mut current, 8)?;
     }
     if current < 9 {
         conn.execute_batch(MIGRATION_V9)
             .context("failed to run schema migration v9")?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        set_schema_version(conn, &mut current, 9)?;
     }
     if current < 10 {
         if !column_exists(conn, "crons", "cwd_override")? {
             conn.execute_batch(MIGRATION_V10)
                 .context("failed to run schema migration v10")?;
         }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        set_schema_version(conn, &mut current, 10)?;
     }
     if current < 11 {
         if !column_exists(conn, "crons", "scope_enabled")? {
             conn.execute_batch(MIGRATION_V11)
                 .context("failed to run schema migration v11")?;
         }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        set_schema_version(conn, &mut current, 11)?;
     }
     if current < 12 {
         if !column_exists(conn, "crons", "wrapper_enabled")? {
             conn.execute_batch(MIGRATION_V12)
                 .context("failed to run schema migration v12")?;
         }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        set_schema_version(conn, &mut current, 12)?;
     }
     if current < 13 {
-        if !column_exists(conn, "crons", "pty_enabled")? {
-            conn.execute_batch(MIGRATION_V13)
-                .context("failed to run schema migration v13")?;
+        if !column_exists(conn, "script_runs", "exit_code")? {
+            conn.execute_batch("ALTER TABLE script_runs ADD COLUMN exit_code INTEGER;")
+                .context("failed to add script_runs.exit_code")?;
         }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        if !column_exists(conn, "script_runs", "failed_item_index")? {
+            conn.execute_batch("ALTER TABLE script_runs ADD COLUMN failed_item_index INTEGER;")
+                .context("failed to add script_runs.failed_item_index")?;
+        }
+        if !column_exists(conn, "script_runs", "finished_at")? {
+            conn.execute_batch("ALTER TABLE script_runs ADD COLUMN finished_at TEXT;")
+                .context("failed to add script_runs.finished_at")?;
+        }
+        set_schema_version(conn, &mut current, 13)?;
     }
+    if current < 14 {
+        if !column_exists(conn, "crons", "created_at_ms")? {
+            conn.execute_batch("ALTER TABLE crons ADD COLUMN created_at_ms INTEGER;")
+                .context("failed to add crons.created_at_ms")?;
+        }
+        conn.execute_batch(&format!(
+            "UPDATE crons
+             SET created_at_ms = {CRON_LEGACY_CREATED_AT_MS_EXPR}
+             WHERE created_at_ms IS NULL;"
+        ))
+        .context("failed to backfill crons.created_at_ms")?;
+        set_schema_version(conn, &mut current, 14)?;
+    }
+    Ok(())
+}
+
+fn set_schema_version(conn: &Connection, current: &mut u32, version: u32) -> Result<()> {
+    conn.pragma_update(None, "user_version", version)?;
+    *current = version;
     Ok(())
 }
 
@@ -288,6 +322,43 @@ pub fn get_scope(conn: &Connection, hash: &ScopeHash) -> Result<Option<Scope>> {
         return Ok(None);
     };
 
+    Ok(Some(scope_from_row_parts(
+        hash_blob,
+        parent_blob,
+        delta_json,
+        snap_json,
+    )?))
+}
+
+pub fn list_scopes(conn: &Connection) -> Result<Vec<Scope>> {
+    let mut stmt = conn.prepare("SELECT hash, parent, delta_json, snap_json FROM scopes")?;
+    let rows = stmt.query_map([], |row| {
+        let hash_blob: Vec<u8> = row.get(0)?;
+        let parent_blob: Option<Vec<u8>> = row.get(1)?;
+        let delta_json: Option<String> = row.get(2)?;
+        let snap_json: Option<String> = row.get(3)?;
+        Ok((hash_blob, parent_blob, delta_json, snap_json))
+    })?;
+
+    let mut scopes = Vec::new();
+    for row in rows {
+        let (hash_blob, parent_blob, delta_json, snap_json) = row?;
+        scopes.push(scope_from_row_parts(
+            hash_blob,
+            parent_blob,
+            delta_json,
+            snap_json,
+        )?);
+    }
+    Ok(scopes)
+}
+
+fn scope_from_row_parts(
+    hash_blob: Vec<u8>,
+    parent_blob: Option<Vec<u8>>,
+    delta_json: Option<String>,
+    snap_json: Option<String>,
+) -> Result<Scope> {
     let hash = blob_to_scope_hash(&hash_blob)?;
     let parent = parent_blob.as_deref().map(blob_to_scope_hash).transpose()?;
     let delta = delta_json
@@ -299,12 +370,12 @@ pub fn get_scope(conn: &Connection, hash: &ScopeHash) -> Result<Option<Scope>> {
         .transpose()
         .context("corrupt snap_json")?;
 
-    Ok(Some(Scope {
+    Ok(Scope {
         hash,
         parent,
         delta,
         snapshot,
-    }))
+    })
 }
 
 /// Get the current HEAD scope hash.
@@ -356,8 +427,12 @@ pub struct StoredCron {
     pub cwd_override: Option<PathBuf>,
     pub scope_enabled: bool,
     pub wrapper_enabled: bool,
-    pub pty_enabled: bool,
-    pub age_secs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedCron {
+    pub record: StoredCron,
+    pub elapsed: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,10 +440,35 @@ pub struct StoredScriptRun {
     pub id: String,
     pub mode: String,
     pub input: String,
-    pub status: String,
+    pub status: StoredScriptRunStatus,
     pub item_count: usize,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    pub exit_code: Option<i32>,
+    pub failed_item_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredScriptRunStatus {
+    Submitted,
+    PartialError,
+    Done,
+    Failed,
+}
+
+impl StoredScriptRunStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::PartialError => "partial_error",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Failed)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,26 +561,30 @@ pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
             chain_id,
             stderr,
         ) = row?;
-        jobs.push(StoredJob {
-            id,
-            pipeline,
-            status: parse_job_status(&status_text)?,
-            exit_code,
-            start_scope: start_scope_blob
-                .as_deref()
-                .map(blob_to_scope_hash)
-                .transpose()?,
-            end_scope: end_scope_blob
-                .as_deref()
-                .map(blob_to_scope_hash)
-                .transpose()?,
-            chain_id,
-            stderr,
-        });
+        let n = parse_job_history_id(&id)?;
+        jobs.push((
+            n,
+            StoredJob {
+                id,
+                pipeline,
+                status: parse_job_status(&status_text)?,
+                exit_code,
+                start_scope: start_scope_blob
+                    .as_deref()
+                    .map(blob_to_scope_hash)
+                    .transpose()?,
+                end_scope: end_scope_blob
+                    .as_deref()
+                    .map(blob_to_scope_hash)
+                    .transpose()?,
+                chain_id,
+                stderr,
+            },
+        ));
     }
 
-    jobs.sort_by_key(|job| parse_numeric_suffix(&job.id).unwrap_or(u32::MAX));
-    Ok(jobs)
+    jobs.sort_by_key(|(n, _)| *n);
+    Ok(jobs.into_iter().map(|(_, job)| job).collect())
 }
 
 pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
@@ -493,10 +597,10 @@ pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
         .map(|path| path.to_string_lossy().into_owned());
     let scope_enabled = i64::from(cron.scope_enabled);
     let wrapper_enabled = i64::from(cron.wrapper_enabled);
-    let pty_enabled = i64::from(cron.pty_enabled);
     conn.execute(
-        "INSERT INTO crons (id, schedule, command, enabled, scope_hash, status, cwd_override, scope_enabled, wrapper_enabled, pty_enabled)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        &format!(
+            "INSERT INTO crons (id, schedule, command, enabled, scope_hash, status, cwd_override, scope_enabled, wrapper_enabled, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, {CRON_CREATED_AT_MS_EXPR})
          ON CONFLICT(id) DO UPDATE SET
               schedule = excluded.schedule,
               command = excluded.command,
@@ -505,8 +609,8 @@ pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
               status = excluded.status,
               cwd_override = excluded.cwd_override,
               scope_enabled = excluded.scope_enabled,
-              wrapper_enabled = excluded.wrapper_enabled,
-              pty_enabled = excluded.pty_enabled",
+              wrapper_enabled = excluded.wrapper_enabled"
+        ),
         rusqlite::params![
             cron.id,
             cron.schedule,
@@ -517,7 +621,6 @@ pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
             cwd_override,
             scope_enabled,
             wrapper_enabled,
-            pty_enabled,
         ],
     )?;
     Ok(())
@@ -528,32 +631,52 @@ pub fn upsert_script_run(
     script: &StoredScriptRun,
     items: &[StoredScriptItem],
 ) -> Result<()> {
-    conn.execute(
-        "INSERT INTO script_runs (id, mode, input, status, item_count, error_code, error_message)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin script run upsert transaction")?;
+    let status = script.status.as_str();
+    let failed_item_index = script.failed_item_index.map(|index| index as i64);
+    let finished = script.status.is_terminal();
+    tx.execute(
+        "INSERT INTO script_runs (
+             id, mode, input, status, item_count, error_code, error_message,
+             exit_code, failed_item_index, finished_at
+         )
+         VALUES (
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+             CASE WHEN ?10 THEN datetime('now') ELSE NULL END
+         )
          ON CONFLICT(id) DO UPDATE SET
               mode = excluded.mode,
               input = excluded.input,
               status = excluded.status,
               item_count = excluded.item_count,
               error_code = excluded.error_code,
-              error_message = excluded.error_message",
+              error_message = excluded.error_message,
+              exit_code = excluded.exit_code,
+              failed_item_index = excluded.failed_item_index,
+              finished_at = CASE WHEN ?10 THEN datetime('now') ELSE NULL END",
         rusqlite::params![
             script.id,
             script.mode,
             script.input,
-            script.status,
+            status,
             script.item_count as i64,
             script.error_code,
             script.error_message,
+            script.exit_code,
+            failed_item_index,
+            finished,
         ],
-    )?;
-    conn.execute(
+    )
+    .context("upsert script run")?;
+    tx.execute(
         "DELETE FROM script_items WHERE script_id = ?1",
         rusqlite::params![script.id],
-    )?;
+    )
+    .context("delete existing script items")?;
     for item in items {
-        conn.execute(
+        tx.execute(
             "INSERT INTO script_items (
                  script_id, item_index, source_text, kind, target_id, chain_id, job_ids_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -566,9 +689,10 @@ pub fn upsert_script_run(
                 item.chain_id,
                 serde_json::to_string(&item.job_ids).context("serialize script item job ids")?,
             ],
-        )?;
+        )
+        .context("insert script item")?;
     }
-    Ok(())
+    tx.commit().context("commit script run upsert")
 }
 
 pub fn max_script_run_id(conn: &Connection) -> Result<Option<u32>> {
@@ -577,9 +701,8 @@ pub fn max_script_run_id(conn: &Connection) -> Result<Option<u32>> {
     let mut max_id = None;
     for row in rows {
         let id = row?;
-        if let Some(n) = parse_numeric_suffix(&id) {
-            max_id = Some(max_id.unwrap_or(0).max(n));
-        }
+        let n = parse_script_run_id(&id)?;
+        max_id = Some(max_id.unwrap_or(0).max(n));
     }
     Ok(max_id)
 }
@@ -589,11 +712,17 @@ pub fn prune_job_history(conn: &Connection, keep: usize) -> Result<Vec<String>> 
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut ids = Vec::new();
     for row in rows {
-        ids.push(row?);
+        let id = row?;
+        let n = parse_job_history_id(&id)?;
+        ids.push((n, id));
     }
-    ids.sort_by_key(|id| parse_numeric_suffix(id).unwrap_or(u32::MAX));
+    ids.sort_by_key(|(n, _)| *n);
     let drop_count = ids.len().saturating_sub(keep);
-    let removed = ids.into_iter().take(drop_count).collect::<Vec<_>>();
+    let removed = ids
+        .into_iter()
+        .take(drop_count)
+        .map(|(_, id)| id)
+        .collect::<Vec<_>>();
     for id in &removed {
         conn.execute(
             "DELETE FROM jobs_history WHERE id = ?1",
@@ -608,11 +737,17 @@ pub fn prune_script_runs(conn: &Connection, keep: usize) -> Result<Vec<String>> 
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut ids = Vec::new();
     for row in rows {
-        ids.push(row?);
+        let id = row?;
+        let n = parse_script_run_id(&id)?;
+        ids.push((n, id));
     }
-    ids.sort_by_key(|id| parse_numeric_suffix(id).unwrap_or(u32::MAX));
+    ids.sort_by_key(|(n, _)| *n);
     let drop_count = ids.len().saturating_sub(keep);
-    let removed = ids.into_iter().take(drop_count).collect::<Vec<_>>();
+    let removed = ids
+        .into_iter()
+        .take(drop_count)
+        .map(|(_, id)| id)
+        .collect::<Vec<_>>();
     for id in &removed {
         conn.execute(
             "DELETE FROM script_runs WHERE id = ?1",
@@ -627,41 +762,37 @@ pub fn delete_cron(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn load_crons(conn: &Connection) -> Result<Vec<StoredCron>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, schedule, command, enabled, scope_hash,
+pub fn load_crons(conn: &Connection) -> Result<Vec<LoadedCron>> {
+    let mut stmt = conn.prepare(&format!(
+        "WITH now_ms(value) AS (SELECT {CRON_CREATED_AT_MS_EXPR})
+         SELECT id, schedule, command, scope_hash,
                 COALESCE(status, CASE WHEN enabled != 0 THEN 'scheduled' ELSE 'paused' END) AS status,
                 cwd_override,
                 COALESCE(scope_enabled, 0) AS scope_enabled,
                 COALESCE(wrapper_enabled, 0) AS wrapper_enabled,
-                COALESCE(pty_enabled, 1) AS pty_enabled,
-                CAST((julianday('now') - julianday(created_at)) * 86400 AS INTEGER) AS age_secs
-          FROM crons",
-    )?;
+                now_ms.value - COALESCE(created_at_ms, {CRON_LEGACY_CREATED_AT_MS_EXPR}) AS age_millis
+          FROM crons, now_ms"
+    ))?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
         let schedule: String = row.get(1)?;
         let command: String = row.get(2)?;
-        let enabled: i64 = row.get(3)?;
-        let scope_blob: Option<Vec<u8>> = row.get(4)?;
-        let status_text: String = row.get(5)?;
-        let cwd_override: Option<String> = row.get(6)?;
-        let scope_enabled: i64 = row.get(7)?;
-        let wrapper_enabled: i64 = row.get(8)?;
-        let pty_enabled: i64 = row.get(9)?;
-        let age_secs: i64 = row.get(10)?;
+        let scope_blob: Option<Vec<u8>> = row.get(3)?;
+        let status_text: String = row.get(4)?;
+        let cwd_override: Option<String> = row.get(5)?;
+        let scope_enabled: i64 = row.get(6)?;
+        let wrapper_enabled: i64 = row.get(7)?;
+        let age_millis: i64 = row.get(8)?;
         Ok((
             id,
             schedule,
             command,
-            enabled,
             scope_blob,
             status_text,
             cwd_override,
             scope_enabled,
             wrapper_enabled,
-            pty_enabled,
-            age_secs,
+            age_millis,
         ))
     })?;
 
@@ -671,44 +802,45 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<StoredCron>> {
             id,
             schedule,
             command,
-            enabled,
             scope_blob,
             status_text,
             cwd_override,
             scope_enabled,
             wrapper_enabled,
-            pty_enabled,
-            age_secs,
+            age_millis,
         ) = row?;
-        let status = match parse_cron_status(&status_text) {
-            Ok(status) => status,
-            Err(_) => {
-                if enabled != 0 {
-                    CronStatus::Scheduled
-                } else {
-                    CronStatus::Paused
-                }
-            }
-        };
-        crons.push(StoredCron {
-            id,
-            schedule,
-            command,
-            status,
-            scope_hash: scope_blob.as_deref().map(blob_to_scope_hash).transpose()?,
-            cwd_override: cwd_override.map(PathBuf::from),
-            scope_enabled: scope_enabled != 0,
-            wrapper_enabled: wrapper_enabled != 0,
-            pty_enabled: pty_enabled != 0,
-            age_secs,
-        });
+        let n = parse_cron_id(&id)?;
+        let status =
+            parse_cron_status(&status_text).with_context(|| format!("parse cron {id} status"))?;
+        crons.push((
+            n,
+            LoadedCron {
+                record: StoredCron {
+                    id,
+                    schedule,
+                    command,
+                    status,
+                    scope_hash: scope_blob.as_deref().map(blob_to_scope_hash).transpose()?,
+                    cwd_override: cwd_override.map(PathBuf::from),
+                    scope_enabled: scope_enabled != 0,
+                    wrapper_enabled: wrapper_enabled != 0,
+                },
+                elapsed: duration_from_nonnegative_millis(age_millis)
+                    .context("load cron elapsed age")?,
+            },
+        ));
     }
 
-    crons.sort_by_key(|cron| parse_numeric_suffix(&cron.id).unwrap_or(u32::MAX));
-    Ok(crons)
+    crons.sort_by_key(|(n, _)| *n);
+    Ok(crons.into_iter().map(|(_, cron)| cron).collect())
 }
 
 // ── Helpers ──
+
+fn duration_from_nonnegative_millis(millis: i64) -> Result<Duration> {
+    let millis = u64::try_from(millis).context("cron created_at is in the future")?;
+    Ok(Duration::from_millis(millis))
+}
 
 fn parse_job_status(text: &str) -> Result<JobStatus> {
     if let Ok(status) = serde_json::from_str(text) {
@@ -738,13 +870,27 @@ fn parse_cron_status(text: &str) -> Result<CronStatus> {
         "paused" | "disabled" => Ok(CronStatus::Paused),
         "completed" | "done" => Ok(CronStatus::Completed),
         "expired" => Ok(CronStatus::Expired),
+        "failed" => Ok(CronStatus::Failed),
         other => anyhow::bail!("unknown cron status {other:?}"),
     }
 }
 
-fn parse_numeric_suffix(id: &str) -> Option<u32> {
-    let digits = id.trim_start_matches(|ch: char| ch.is_ascii_alphabetic());
-    digits.parse().ok()
+fn parse_cron_id(id: &str) -> Result<u32> {
+    id.parse::<CronId>()
+        .map(|id| id.0)
+        .with_context(|| format!("invalid cron id {id}"))
+}
+
+fn parse_job_history_id(id: &str) -> Result<u32> {
+    id.parse::<JobId>()
+        .map(|id| id.0)
+        .with_context(|| format!("invalid job history id {id}"))
+}
+
+fn parse_script_run_id(id: &str) -> Result<u32> {
+    id.parse::<ScriptId>()
+        .map(|id| id.0)
+        .with_context(|| format!("invalid script run id {id}"))
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -802,6 +948,61 @@ mod tests {
     }
 
     #[test]
+    fn failed_later_migration_preserves_last_successful_version() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "
+            CREATE VIEW crons AS
+            SELECT
+                'C1' AS id,
+                'every 5m' AS schedule,
+                'echo hi' AS command,
+                1 AS enabled,
+                NULL AS scope_hash,
+                datetime('now') AS created_at;
+            CREATE TABLE jobs_history (
+                id          TEXT PRIMARY KEY,
+                pipeline    TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                exit_code   INTEGER,
+                scope_hash  BLOB,
+                start_scope BLOB,
+                end_scope   BLOB,
+                chain_id    TEXT,
+                stderr      TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                finished_at TEXT
+            );
+            PRAGMA user_version = 8;
+            ",
+        )
+        .expect("seed broken v8 database");
+
+        let error = migrate(&conn).expect_err("v10 must fail against a crons view");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read user_version");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to run schema migration v10")
+        );
+        assert_eq!(version, 9);
+    }
+
+    #[test]
+    fn migration_rejects_newer_schema_version() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("set future schema version");
+
+        let error = migrate(&conn).expect_err("future schema must be rejected");
+
+        assert!(error.to_string().contains("newer than supported version"));
+    }
+
+    #[test]
     fn scope_roundtrip() {
         let conn = in_memory_db();
         let snap = EnvSnapshot {
@@ -816,6 +1017,32 @@ mod tests {
         assert_eq!(loaded.hash, scope.hash);
         assert!(loaded.parent.is_none());
         assert!(loaded.snapshot.is_some());
+    }
+
+    #[test]
+    fn list_scopes_returns_persisted_scopes() {
+        let conn = in_memory_db();
+        let root = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            cwd: PathBuf::from("/tmp/root"),
+        });
+        let child = Scope::fork(
+            root.hash,
+            root.snapshot.as_ref().expect("root snapshot"),
+            cue_core::scope::EnvDelta {
+                set: BTreeMap::from([("FOO".into(), "bar".into())]),
+                unset: vec![],
+                cwd: Some(PathBuf::from("/tmp/child")),
+            },
+        );
+        insert_scope(&conn, &root).unwrap();
+        insert_scope(&conn, &child).unwrap();
+
+        let scopes = list_scopes(&conn).unwrap();
+        let hashes = scopes.iter().map(|scope| scope.hash).collect::<Vec<_>>();
+
+        assert!(hashes.contains(&root.hash));
+        assert!(hashes.contains(&child.hash));
     }
 
     #[test]
@@ -855,6 +1082,50 @@ mod tests {
     }
 
     #[test]
+    fn load_job_history_rejects_invalid_ids() {
+        let conn = in_memory_db();
+        conn.execute(
+            "INSERT INTO jobs_history (id, pipeline, status)
+             VALUES ('not-a-job', 'echo bad', '\"Done\"')",
+            [],
+        )
+        .unwrap();
+
+        let error = load_job_history(&conn).unwrap_err();
+
+        assert!(error.to_string().contains("invalid job history id"));
+    }
+
+    #[test]
+    fn prune_job_history_rejects_invalid_ids_without_deleting_valid_rows() {
+        let conn = in_memory_db();
+        conn.execute(
+            "INSERT INTO jobs_history (id, pipeline, status)
+             VALUES ('J1', 'echo ok', '\"Done\"')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_history (id, pipeline, status)
+             VALUES ('bad-job', 'echo bad', '\"Done\"')",
+            [],
+        )
+        .unwrap();
+
+        let error = prune_job_history(&conn, 0).unwrap_err();
+
+        assert!(error.to_string().contains("invalid job history id"));
+        let valid_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_history WHERE id = 'J1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(valid_count, 1);
+    }
+
+    #[test]
     fn cron_roundtrip() {
         let conn = in_memory_db();
         let cron = StoredCron {
@@ -866,23 +1137,262 @@ mod tests {
             cwd_override: Some(PathBuf::from("/tmp/cue-cron-cwd")),
             scope_enabled: true,
             wrapper_enabled: true,
-            pty_enabled: false,
-            age_secs: 0,
         };
 
         upsert_cron(&conn, &cron).unwrap();
         let loaded = load_crons(&conn).unwrap();
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, cron.id);
-        assert_eq!(loaded[0].schedule, cron.schedule);
-        assert_eq!(loaded[0].command, cron.command);
-        assert_eq!(loaded[0].status, cron.status);
-        assert_eq!(loaded[0].scope_hash, cron.scope_hash);
-        assert_eq!(loaded[0].cwd_override, cron.cwd_override);
-        assert_eq!(loaded[0].scope_enabled, cron.scope_enabled);
-        assert_eq!(loaded[0].wrapper_enabled, cron.wrapper_enabled);
-        assert_eq!(loaded[0].pty_enabled, cron.pty_enabled);
+        let loaded = &loaded[0].record;
+        assert_eq!(loaded.id, cron.id);
+        assert_eq!(loaded.schedule, cron.schedule);
+        assert_eq!(loaded.command, cron.command);
+        assert_eq!(loaded.status, cron.status);
+        assert_eq!(loaded.scope_hash, cron.scope_hash);
+        assert_eq!(loaded.cwd_override, cron.cwd_override);
+        assert_eq!(loaded.scope_enabled, cron.scope_enabled);
+        assert_eq!(loaded.wrapper_enabled, cron.wrapper_enabled);
+    }
+
+    #[test]
+    fn failed_cron_status_roundtrips() {
+        let conn = in_memory_db();
+        let cron = StoredCron {
+            id: "C4".into(),
+            schedule: "in 1s".into(),
+            command: "echo due".into(),
+            status: CronStatus::Failed,
+            scope_hash: Some(ScopeHash([4; 32])),
+            cwd_override: None,
+            scope_enabled: false,
+            wrapper_enabled: false,
+        };
+
+        upsert_cron(&conn, &cron).unwrap();
+        let loaded = load_crons(&conn).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].record.status, CronStatus::Failed);
+    }
+
+    #[test]
+    fn cron_load_uses_legacy_enabled_only_when_status_is_null() {
+        let conn = in_memory_db();
+        conn.execute(
+            "INSERT INTO crons (id, schedule, command, enabled, scope_hash)
+             VALUES ('C5', 'every 5m', 'echo legacy', 0, ?1)",
+            rusqlite::params![vec![5u8; 32]],
+        )
+        .unwrap();
+
+        let loaded = load_crons(&conn).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].record.status, CronStatus::Paused);
+    }
+
+    #[test]
+    fn cron_load_preserves_millisecond_age() {
+        let conn = in_memory_db();
+        let cron = StoredCron {
+            id: "C7".into(),
+            schedule: "in 1500ms".into(),
+            command: "echo soon".into(),
+            status: CronStatus::Scheduled,
+            scope_hash: Some(ScopeHash([7; 32])),
+            cwd_override: None,
+            scope_enabled: false,
+            wrapper_enabled: false,
+        };
+        upsert_cron(&conn, &cron).unwrap();
+        conn.execute(
+            &format!(
+                "UPDATE crons
+                 SET created_at_ms = {CRON_CREATED_AT_MS_EXPR} - 1500
+                 WHERE id = 'C7'"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let loaded = load_crons(&conn).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].elapsed >= Duration::from_millis(1500));
+        assert!(loaded[0].elapsed < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn cron_load_rejects_invalid_status_text() {
+        let conn = in_memory_db();
+        conn.execute(
+            "INSERT INTO crons (id, schedule, command, enabled, scope_hash, status)
+             VALUES ('C6', 'every 5m', 'echo invalid', 1, ?1, 'unknown')",
+            rusqlite::params![vec![6u8; 32]],
+        )
+        .unwrap();
+
+        let error = load_crons(&conn).unwrap_err();
+
+        assert!(error.to_string().contains("parse cron C6 status"));
+    }
+
+    #[test]
+    fn load_crons_rejects_invalid_ids() {
+        let conn = in_memory_db();
+        conn.execute(
+            "INSERT INTO crons (id, schedule, command, enabled, scope_hash, status)
+             VALUES ('not-a-cron', 'every 5m', 'echo invalid', 1, ?1, 'scheduled')",
+            rusqlite::params![vec![6u8; 32]],
+        )
+        .unwrap();
+
+        let error = load_crons(&conn).unwrap_err();
+
+        assert!(error.to_string().contains("invalid cron id"));
+    }
+
+    #[test]
+    fn script_run_upsert_rolls_back_when_items_cannot_be_written() {
+        let conn = in_memory_db();
+        let original = StoredScriptRun {
+            id: "R1".into(),
+            mode: "job".into(),
+            input: "echo old".into(),
+            status: StoredScriptRunStatus::Submitted,
+            item_count: 1,
+            error_code: None,
+            error_message: None,
+            exit_code: None,
+            failed_item_index: None,
+        };
+        let original_items = vec![StoredScriptItem {
+            script_id: "R1".into(),
+            item_index: 0,
+            source_text: "echo old".into(),
+            kind: "job".into(),
+            target_id: Some("J1".into()),
+            chain_id: None,
+            job_ids: vec!["J1".into()],
+        }];
+        upsert_script_run(&conn, &original, &original_items).unwrap();
+
+        conn.execute_batch("DROP TABLE script_items;").unwrap();
+        let updated = StoredScriptRun {
+            id: "R1".into(),
+            mode: "job".into(),
+            input: "echo new".into(),
+            status: StoredScriptRunStatus::PartialError,
+            item_count: 0,
+            error_code: Some("INTERNAL".into()),
+            error_message: Some("write failed".into()),
+            exit_code: None,
+            failed_item_index: None,
+        };
+
+        let error = upsert_script_run(&conn, &updated, &[]).unwrap_err();
+        assert!(error.to_string().contains("delete existing script items"));
+
+        let (input, status, item_count, error_code): (String, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT input, status, item_count, error_code FROM script_runs WHERE id = 'R1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(input, "echo old");
+        assert_eq!(status, "submitted");
+        assert_eq!(item_count, 1);
+        assert_eq!(error_code, None);
+    }
+
+    #[test]
+    fn script_run_terminal_state_persists_exit_and_failed_item() {
+        let conn = in_memory_db();
+        let script = StoredScriptRun {
+            id: "R2".into(),
+            mode: "job".into(),
+            input: "false".into(),
+            status: StoredScriptRunStatus::Failed,
+            item_count: 1,
+            error_code: None,
+            error_message: None,
+            exit_code: Some(7),
+            failed_item_index: Some(0),
+        };
+        let items = vec![StoredScriptItem {
+            script_id: "R2".into(),
+            item_index: 0,
+            source_text: "false".into(),
+            kind: "job".into(),
+            target_id: Some("J2".into()),
+            chain_id: None,
+            job_ids: vec!["J2".into()],
+        }];
+
+        upsert_script_run(&conn, &script, &items).unwrap();
+
+        let (status, exit_code, failed_item_index, finished_at): (
+            String,
+            Option<i32>,
+            Option<i64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, exit_code, failed_item_index, finished_at
+                 FROM script_runs WHERE id = 'R2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(exit_code, Some(7));
+        assert_eq!(failed_item_index, Some(0));
+        assert!(finished_at.is_some());
+    }
+
+    #[test]
+    fn max_script_run_id_rejects_invalid_ids() {
+        let conn = in_memory_db();
+        conn.execute(
+            "INSERT INTO script_runs (id, mode, input, status, item_count)
+             VALUES ('not-a-script', 'job', 'echo bad', 'submitted', 1)",
+            [],
+        )
+        .unwrap();
+
+        let error = max_script_run_id(&conn).unwrap_err();
+
+        assert!(error.to_string().contains("invalid script run id"));
+    }
+
+    #[test]
+    fn prune_script_runs_rejects_invalid_ids_without_deleting_valid_rows() {
+        let conn = in_memory_db();
+        conn.execute(
+            "INSERT INTO script_runs (id, mode, input, status, item_count)
+             VALUES ('R1', 'job', 'echo ok', 'submitted', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO script_runs (id, mode, input, status, item_count)
+             VALUES ('bad-script', 'job', 'echo bad', 'submitted', 1)",
+            [],
+        )
+        .unwrap();
+
+        let error = prune_script_runs(&conn, 0).unwrap_err();
+
+        assert!(error.to_string().contains("invalid script run id"));
+        let valid_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM script_runs WHERE id = 'R1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(valid_count, 1);
     }
 
     #[test]

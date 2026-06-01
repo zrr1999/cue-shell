@@ -3,18 +3,17 @@
 //! Maintains an in-memory cache backed by SQLite.  The "HEAD" pointer
 //! tracks the current active scope (analogous to git HEAD).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 
 use rusqlite::Connection;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use cue_core::ScopeHash;
 use cue_core::scope::{EnvSnapshot, Scope};
+use cue_core::{EventChannel, ScopeHash};
 
-use super::{ActorSystem, EventBusMsg, ScopeStoreMsg};
+use super::{ActorSystem, ScopeStoreMsg, publish_event as publish_actor_event};
 use crate::storage;
 
 use cue_core::ipc::EventPayload;
@@ -22,17 +21,15 @@ use cue_core::ipc::EventPayload;
 /// Spawn the ScopeStore actor task.
 ///
 /// Initialises a root scope from the current process environment.
-pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: ActorSystem) {
-    tokio::spawn(async move {
-        let db = storage::shared_connection(conn);
-        let (mut cache, mut current_head, restored) = match load_initial_scope(&db).await {
-            Ok(initial) => initial,
-            Err(e) => {
-                error!("scope_store: failed to load initial scope: {e}");
-                return;
-            }
-        };
+pub async fn spawn(
+    mut rx: mpsc::Receiver<ScopeStoreMsg>,
+    conn: Connection,
+    sys: ActorSystem,
+) -> Result<()> {
+    let db = storage::shared_connection(conn);
+    let (mut cache, mut current_head, restored) = load_initial_scope(&db).await?;
 
+    tokio::spawn(async move {
         if restored {
             info!(%current_head, "scope_store: restored persisted head scope");
         } else {
@@ -46,32 +43,27 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
                 }
 
                 ScopeStoreMsg::GetScope { hash, reply } => {
-                    // Check cache first, then SQLite.
-                    let scope = if let Some(scope) = cache.get(&hash) {
-                        Ok(Some(scope.clone()))
-                    } else {
-                        match storage::with_connection(&db, move |conn| {
-                            storage::get_scope(conn, &hash)
-                        })
-                        .await
-                        {
-                            Ok(Some(scope)) => {
-                                cache.insert(scope.hash, scope.clone());
-                                Ok(Some(scope))
-                            }
-                            Ok(None) => Ok(None),
-                            Err(error) => {
-                                error!("scope_store: db error: {error}");
-                                Err(error)
-                            }
-                        }
-                    };
+                    let scope = load_scope(&mut cache, &db, hash).await;
+                    if let Err(error) = &scope {
+                        error!("scope_store: db error: {error}");
+                    }
                     let _ = reply.send(scope);
                 }
 
                 ScopeStoreMsg::GetHeadSnapshot { reply } => {
-                    let snap = cache.get(&current_head).and_then(|s| s.snapshot.clone());
-                    let _ = reply.send(snap);
+                    let snapshot = match load_scope(&mut cache, &db, current_head).await {
+                        Ok(Some(scope)) => scope.snapshot.ok_or_else(|| {
+                            anyhow::anyhow!("HEAD scope {current_head} has no snapshot")
+                        }),
+                        Ok(None) => Err(anyhow::anyhow!("HEAD scope {current_head} not found")),
+                        Err(error) => {
+                            Err(anyhow::anyhow!("load HEAD scope {current_head}: {error}"))
+                        }
+                    };
+                    if let Err(error) = &snapshot {
+                        error!("scope_store: get head snapshot failed: {error}");
+                    }
+                    let _ = reply.send(snapshot);
                 }
 
                 ScopeStoreMsg::CreateRoot { snapshot, reply } => {
@@ -93,16 +85,16 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
                     let old_hash = current_head;
                     current_head = hash;
 
-                    let _ = sys
-                        .event_bus
-                        .send(EventBusMsg::Publish {
-                            payload: EventPayload::HeadChanged {
-                                old_hash: old_hash.to_string(),
-                                new_hash: current_head.to_string(),
-                            },
-                            channel: "scopes".into(),
-                        })
-                        .await;
+                    publish_actor_event(
+                        "scope_store",
+                        &sys.event_bus,
+                        EventChannel::Scopes,
+                        EventPayload::HeadChanged {
+                            old_hash: old_hash.to_string(),
+                            new_hash: current_head.to_string(),
+                        },
+                    )
+                    .await;
 
                     let _ = reply.send(Ok(hash));
                 }
@@ -144,38 +136,28 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
                     let old_hash = current_head;
                     current_head = child_hash;
 
-                    let _ = sys
-                        .event_bus
-                        .send(EventBusMsg::Publish {
-                            payload: EventPayload::HeadChanged {
-                                old_hash: old_hash.to_string(),
-                                new_hash: current_head.to_string(),
-                            },
-                            channel: "scopes".into(),
-                        })
-                        .await;
+                    publish_actor_event(
+                        "scope_store",
+                        &sys.event_bus,
+                        EventChannel::Scopes,
+                        EventPayload::HeadChanged {
+                            old_hash: old_hash.to_string(),
+                            new_hash: current_head.to_string(),
+                        },
+                    )
+                    .await;
 
                     let _ = reply.send(Ok(child_hash));
                 }
 
                 ScopeStoreMsg::Derive { base, delta, reply } => {
-                    let parent_scope = if let Some(scope) = cache.get(&base) {
-                        Some(scope.clone())
-                    } else {
-                        match storage::with_connection(&db, move |conn| {
-                            storage::get_scope(conn, &base)
-                        })
-                        .await
-                        {
-                            Ok(Some(scope)) => {
-                                cache.insert(scope.hash, scope.clone());
-                                Some(scope)
-                            }
-                            Ok(None) => None,
-                            Err(e) => {
-                                error!("scope_store: db error: {e}");
-                                None
-                            }
+                    let parent_scope = match load_scope(&mut cache, &db, base).await {
+                        Ok(scope) => scope,
+                        Err(error) => {
+                            error!("scope_store: db error: {error}");
+                            let _ =
+                                reply.send(Err(anyhow::anyhow!("load base scope {base}: {error}")));
+                            continue;
                         }
                     };
                     let Some(parent) = parent_scope else {
@@ -214,28 +196,72 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
                 }
 
                 ScopeStoreMsg::ListScopes { reply } => {
-                    let mut scopes: Vec<cue_core::ipc::ScopeInfo> = cache
-                        .values()
-                        .map(|scope| {
-                            let snapshot = scope.snapshot.as_ref();
-                            cue_core::ipc::ScopeInfo {
-                                hash: scope.hash.to_string(),
-                                parent: scope.parent.map(|p| p.to_string()),
-                                cwd: snapshot
-                                    .map(|s| s.cwd.display().to_string())
-                                    .unwrap_or_default(),
-                                env_count: snapshot.map(|s| s.env.len()).unwrap_or(0),
+                    let scopes = match storage::with_connection(&db, storage::list_scopes).await {
+                        Ok(scopes) => scopes,
+                        Err(error) => {
+                            error!("scope_store: list scopes failed: {error}");
+                            let _ =
+                                reply.send(Err(anyhow::anyhow!("list persisted scopes: {error}")));
+                            continue;
+                        }
+                    };
+                    let mut scope_infos = Vec::with_capacity(scopes.len());
+                    let mut list_error = None;
+                    for scope in scopes {
+                        let info = match scope_info(&scope) {
+                            Ok(info) => info,
+                            Err(error) => {
+                                list_error = Some(error);
+                                break;
                             }
-                        })
-                        .collect();
+                        };
+                        cache.insert(scope.hash, scope.clone());
+                        scope_infos.push(info);
+                    }
+                    if let Some(error) = list_error {
+                        error!("scope_store: list scopes failed: {error}");
+                        let _ = reply.send(Err(anyhow::anyhow!("list persisted scopes: {error}")));
+                        continue;
+                    }
+                    let mut scopes = scope_infos;
                     scopes.sort_by(|a, b| a.hash.cmp(&b.hash));
-                    let _ = reply.send((current_head, scopes));
+                    let _ = reply.send(Ok((current_head, scopes)));
                 }
             }
         }
 
         debug!("scope_store: stopped");
     });
+    Ok(())
+}
+
+async fn load_scope(
+    cache: &mut HashMap<ScopeHash, Scope>,
+    db: &storage::SharedConnection,
+    hash: ScopeHash,
+) -> Result<Option<Scope>> {
+    if let Some(scope) = cache.get(&hash) {
+        return Ok(Some(scope.clone()));
+    }
+
+    let scope = storage::with_connection(db, move |conn| storage::get_scope(conn, &hash)).await?;
+    if let Some(scope) = &scope {
+        cache.insert(scope.hash, scope.clone());
+    }
+    Ok(scope)
+}
+
+fn scope_info(scope: &Scope) -> Result<cue_core::ipc::ScopeInfo> {
+    let snapshot = scope
+        .snapshot
+        .as_ref()
+        .with_context(|| format!("scope {} has no snapshot", scope.hash))?;
+    Ok(cue_core::ipc::ScopeInfo {
+        hash: scope.hash.to_string(),
+        parent: scope.parent.map(|p| p.to_string()),
+        cwd: snapshot.cwd.display().to_string(),
+        env_count: snapshot.env.len(),
+    })
 }
 
 async fn load_initial_scope(
@@ -265,7 +291,7 @@ async fn create_and_persist_root_scope(
     let mut cache = HashMap::new();
 
     let env: BTreeMap<String, String> = std::env::vars().collect();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let cwd = std::env::current_dir().context("read current working directory for root scope")?;
     let snapshot = EnvSnapshot { env, cwd };
     let root = Scope::root(snapshot);
     let head = root.hash;
@@ -285,9 +311,9 @@ async fn create_and_persist_root_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::{ACTOR_CHANNEL_CAP, GatewayMsg, ProcessMgrMsg, SchedulerMsg};
+    use crate::actor::{ACTOR_CHANNEL_CAP, EventBusMsg, GatewayMsg, ProcessMgrMsg, SchedulerMsg};
     use cue_core::scope::EnvSnapshot;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::oneshot;
 
@@ -385,7 +411,7 @@ mod tests {
             event_bus: event_tx,
             config: crate::config::Config::default(),
         };
-        spawn(scope_rx, conn, sys);
+        spawn(scope_rx, conn, sys).await.expect("spawn scope store");
 
         let (head_tx, head_rx) = oneshot::channel();
         scope_tx
@@ -456,7 +482,7 @@ mod tests {
             event_bus: event_tx,
             config: crate::config::Config::default(),
         };
-        spawn(scope_rx, conn, sys);
+        spawn(scope_rx, conn, sys).await.expect("spawn scope store");
 
         let (head_tx, head_rx) = oneshot::channel();
         scope_tx
@@ -488,6 +514,232 @@ mod tests {
             .expect("scope sender")
             .expect_err("storage failure should be reported");
         assert!(error.to_string().contains("no such table"));
+
+        let _ = scope_tx.send(ScopeStoreMsg::Shutdown).await;
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[tokio::test]
+    async fn derive_reports_base_scope_storage_errors() {
+        let dir = make_temp_dir();
+        let db_path = dir.join("scope.db");
+        let conn = storage::open_db(&db_path).expect("open scope db");
+
+        let (gateway_tx, _gateway_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel::<SchedulerMsg>(ACTOR_CHANNEL_CAP);
+        let (process_tx, _process_rx) = mpsc::channel::<ProcessMgrMsg>(ACTOR_CHANNEL_CAP);
+        let (scope_tx, scope_rx) = mpsc::channel::<ScopeStoreMsg>(ACTOR_CHANNEL_CAP);
+        let (event_tx, _event_rx) = mpsc::channel::<EventBusMsg>(ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx,
+            scope_store: scope_tx.clone(),
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+        };
+        spawn(scope_rx, conn, sys).await.expect("spawn scope store");
+
+        let (head_tx, head_rx) = oneshot::channel();
+        scope_tx
+            .send(ScopeStoreMsg::GetHead { reply: head_tx })
+            .await
+            .expect("request head");
+        tokio::time::timeout(std::time::Duration::from_secs(1), head_rx)
+            .await
+            .expect("head reply")
+            .expect("head sender");
+
+        let external = Connection::open(&db_path).expect("open external db");
+        external
+            .execute_batch("DROP TABLE scopes;")
+            .expect("drop scopes table");
+        drop(external);
+
+        let (derive_tx, derive_rx) = oneshot::channel();
+        scope_tx
+            .send(ScopeStoreMsg::Derive {
+                base: ScopeHash([99; 32]),
+                delta: cue_core::scope::EnvDelta {
+                    set: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
+                    unset: vec![],
+                    cwd: None,
+                },
+                reply: derive_tx,
+            })
+            .await
+            .expect("request derive");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), derive_rx)
+            .await
+            .expect("derive reply")
+            .expect("derive sender")
+            .expect_err("storage failure should be reported");
+        assert!(error.to_string().contains("load base scope"));
+        assert!(error.to_string().contains("no such table"));
+
+        let _ = scope_tx.send(ScopeStoreMsg::Shutdown).await;
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[tokio::test]
+    async fn list_scopes_reads_persisted_scopes_not_only_cache() {
+        let dir = make_temp_dir();
+        let db_path = dir.join("scope.db");
+        let conn = storage::open_db(&db_path).expect("open scope db");
+        let root = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            cwd: PathBuf::from("/tmp/root"),
+        });
+        let child = Scope::fork(
+            root.hash,
+            root.snapshot.as_ref().expect("root snapshot"),
+            cue_core::scope::EnvDelta {
+                set: BTreeMap::new(),
+                unset: vec![],
+                cwd: Some(PathBuf::from("/tmp/child")),
+            },
+        );
+        storage::insert_scope(&conn, &root).expect("insert root scope");
+        storage::insert_scope(&conn, &child).expect("insert child scope");
+        storage::set_head(&conn, &child.hash).expect("set head");
+
+        let (gateway_tx, _gateway_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel::<SchedulerMsg>(ACTOR_CHANNEL_CAP);
+        let (process_tx, _process_rx) = mpsc::channel::<ProcessMgrMsg>(ACTOR_CHANNEL_CAP);
+        let (scope_tx, scope_rx) = mpsc::channel::<ScopeStoreMsg>(ACTOR_CHANNEL_CAP);
+        let (event_tx, _event_rx) = mpsc::channel::<EventBusMsg>(ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx,
+            scope_store: scope_tx.clone(),
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+        };
+        spawn(scope_rx, conn, sys).await.expect("spawn scope store");
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        scope_tx
+            .send(ScopeStoreMsg::ListScopes { reply: reply_tx })
+            .await
+            .expect("request list scopes");
+        let (_head, scopes) = tokio::time::timeout(std::time::Duration::from_secs(1), reply_rx)
+            .await
+            .expect("list scopes reply")
+            .expect("list scopes sender")
+            .expect("list scopes result");
+        let hashes = scopes
+            .iter()
+            .map(|scope| scope.hash.as_str())
+            .collect::<Vec<_>>();
+        let root_hash = root.hash.to_string();
+        let child_hash = child.hash.to_string();
+
+        assert!(hashes.contains(&root_hash.as_str()));
+        assert!(hashes.contains(&child_hash.as_str()));
+
+        let _ = scope_tx.send(ScopeStoreMsg::Shutdown).await;
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[tokio::test]
+    async fn list_scopes_rejects_scope_without_snapshot() {
+        let dir = make_temp_dir();
+        let db_path = dir.join("scope.db");
+        let conn = storage::open_db(&db_path).expect("open scope db");
+        let root = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([(String::from("PATH"), String::from("/usr/bin"))]),
+            cwd: PathBuf::from("/tmp/root"),
+        });
+        let missing_snapshot = Scope {
+            hash: ScopeHash([9; 32]),
+            parent: Some(root.hash),
+            delta: None,
+            snapshot: None,
+        };
+        storage::insert_scope(&conn, &root).expect("insert root scope");
+        storage::insert_scope(&conn, &missing_snapshot).expect("insert broken scope");
+        storage::set_head(&conn, &root.hash).expect("set head");
+
+        let (gateway_tx, _gateway_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel::<SchedulerMsg>(ACTOR_CHANNEL_CAP);
+        let (process_tx, _process_rx) = mpsc::channel::<ProcessMgrMsg>(ACTOR_CHANNEL_CAP);
+        let (scope_tx, scope_rx) = mpsc::channel::<ScopeStoreMsg>(ACTOR_CHANNEL_CAP);
+        let (event_tx, _event_rx) = mpsc::channel::<EventBusMsg>(ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx,
+            scope_store: scope_tx.clone(),
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+        };
+        spawn(scope_rx, conn, sys).await.expect("spawn scope store");
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        scope_tx
+            .send(ScopeStoreMsg::ListScopes { reply: reply_tx })
+            .await
+            .expect("request list scopes");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), reply_rx)
+            .await
+            .expect("list scopes reply")
+            .expect("list scopes sender")
+            .expect_err("snapshotless scope should be reported");
+        assert!(error.to_string().contains("has no snapshot"));
+
+        let _ = scope_tx.send(ScopeStoreMsg::Shutdown).await;
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[tokio::test]
+    async fn list_scopes_reports_storage_errors() {
+        let dir = make_temp_dir();
+        let db_path = dir.join("scope.db");
+        let conn = storage::open_db(&db_path).expect("open scope db");
+
+        let (gateway_tx, _gateway_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel::<SchedulerMsg>(ACTOR_CHANNEL_CAP);
+        let (process_tx, _process_rx) = mpsc::channel::<ProcessMgrMsg>(ACTOR_CHANNEL_CAP);
+        let (scope_tx, scope_rx) = mpsc::channel::<ScopeStoreMsg>(ACTOR_CHANNEL_CAP);
+        let (event_tx, _event_rx) = mpsc::channel::<EventBusMsg>(ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx,
+            scope_store: scope_tx.clone(),
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+        };
+        spawn(scope_rx, conn, sys).await.expect("spawn scope store");
+
+        let (head_tx, head_rx) = oneshot::channel();
+        scope_tx
+            .send(ScopeStoreMsg::GetHead { reply: head_tx })
+            .await
+            .expect("request head");
+        tokio::time::timeout(std::time::Duration::from_secs(1), head_rx)
+            .await
+            .expect("head reply")
+            .expect("head sender");
+
+        let external = Connection::open(&db_path).expect("open external db");
+        external
+            .execute_batch("DROP TABLE scopes;")
+            .expect("drop scopes table");
+        drop(external);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        scope_tx
+            .send(ScopeStoreMsg::ListScopes { reply: reply_tx })
+            .await
+            .expect("request list scopes");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), reply_rx)
+            .await
+            .expect("list scopes reply")
+            .expect("list scopes sender")
+            .expect_err("storage failure should be reported");
+        assert!(error.to_string().contains("list persisted scopes"));
 
         let _ = scope_tx.send(ScopeStoreMsg::Shutdown).await;
         std::fs::remove_dir_all(dir).expect("remove temp dir");

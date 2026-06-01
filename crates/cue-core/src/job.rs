@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+/// Exit code used when a job has no process-provided exit status.
+///
+/// This covers spawn failures, explicit cancellation, explicit kill handling,
+/// and rare platform cases where the OS wait status cannot be represented as a
+/// numeric exit code.
+pub const EXIT_CODE_UNAVAILABLE: i32 = -1;
+
 /// Job lifecycle state (unidirectional state machine).
 ///
 /// ```text

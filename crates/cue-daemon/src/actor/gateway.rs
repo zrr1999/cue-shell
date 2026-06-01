@@ -11,12 +11,14 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use cue_core::command_spec::{MODE_PARAM_SPECS, command_names, command_spec};
+use cue_core::EventChannel;
+use cue_core::command_spec::{command_names, command_spec, mode_param_specs_for_command};
 use cue_core::ipc::{
     CompletionItem, CompletionKind, EventPayload, HighlightKind, HighlightSpan, MAX_MESSAGE_SIZE,
     Message, OkPayload, RequestPayload, ResponsePayload, encode_message, error_code,
 };
 
+use crate::parser::resolver::ResolvedCommand;
 use crate::parser::token::Token;
 use crate::parser::{Parser, Resolver, Tokenizer};
 
@@ -114,14 +116,7 @@ pub async fn spawn(
                     request_id,
                     payload,
                 } => {
-                    let guard = clients.lock().await;
-                    if let Some(sender) = guard.get(&client_id) {
-                        if sender.try_send((request_id, payload)).is_err() {
-                            warn!(%client_id, "gateway: response channel full/closed");
-                        }
-                    } else {
-                        warn!(%client_id, "gateway: no such client for response");
-                    }
+                    queue_response_for_client(&clients, client_id, request_id, payload).await;
                 }
 
                 GatewayMsg::SendEvent { client_id, payload } => {
@@ -136,14 +131,6 @@ pub async fn spawn(
                     } else {
                         warn!(%client_id, "gateway: no such client for direct event");
                     }
-                }
-
-                GatewayMsg::PushEvent { payload, channel } => {
-                    // Delegate to event bus.
-                    let _ = sys
-                        .event_bus
-                        .send(EventBusMsg::Publish { payload, channel })
-                        .await;
                 }
 
                 GatewayMsg::Shutdown => {
@@ -189,18 +176,6 @@ async fn handle_client(
     {
         let mut guard = event_clients.lock().await;
         guard.insert(client_id, evt_tx.clone());
-    }
-
-    // Auto-subscribe to default channels.
-    for channel in ["jobs"] {
-        let _ = sys
-            .event_bus
-            .send(EventBusMsg::Subscribe {
-                client_id,
-                channel: channel.to_string(),
-                sender: evt_tx.clone(),
-            })
-            .await;
     }
 
     // Split stream.
@@ -263,17 +238,25 @@ async fn handle_client(
         let mut guard = event_clients.lock().await;
         guard.remove(&client_id);
     }
-    let _ = sys
+    if sys
         .event_bus
         .send(EventBusMsg::UnsubscribeAll { client_id })
-        .await;
-    let _ = sys
+        .await
+        .is_err()
+    {
+        debug!(%client_id, "gateway: event bus unavailable during client cleanup");
+    }
+    if sys
         .process_mgr
         .send(super::ProcessMgrMsg::DetachFg {
             client_id,
             reason: "client disconnected".into(),
         })
-        .await;
+        .await
+        .is_err()
+    {
+        debug!(%client_id, "gateway: process manager unavailable during client cleanup");
+    }
 }
 
 /// Route an incoming request to the appropriate actor.
@@ -309,14 +292,14 @@ async fn route_request(
                                 .context("send inline script rejection")?;
                             return Ok(());
                         }
-                        sys.scheduler
-                            .send(SchedulerMsg::Eval {
-                                client_id,
-                                request_id,
-                                command,
-                            })
-                            .await
-                            .context("send to scheduler")?;
+                        send_scheduler_eval(
+                            sys,
+                            client_id,
+                            request_id,
+                            command,
+                            "send to scheduler",
+                        )
+                        .await?;
                     }
                     Err(e) => {
                         // Parse/resolve error → respond immediately.
@@ -358,14 +341,14 @@ async fn route_request(
                         {
                             *source = cue_core::ipc::ScriptSource::File { path };
                         }
-                        sys.scheduler
-                            .send(SchedulerMsg::Eval {
-                                client_id,
-                                request_id,
-                                command,
-                            })
-                            .await
-                            .context("send script to scheduler")?;
+                        send_scheduler_eval(
+                            sys,
+                            client_id,
+                            request_id,
+                            command,
+                            "send script to scheduler",
+                        )
+                        .await?;
                     }
                     Err(e) => {
                         sys.gateway
@@ -398,36 +381,36 @@ async fn route_request(
         }
 
         RequestPayload::ListJobs { limit } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::ListJobs { limit },
-                })
-                .await
-                .context("send list jobs to scheduler")?;
+            send_scheduler_eval(
+                sys,
+                client_id,
+                request_id,
+                ResolvedCommand::ListJobs { limit },
+                "send list jobs to scheduler",
+            )
+            .await?;
         }
 
         RequestPayload::ListCrons { limit } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::ListCrons { limit },
-                })
-                .await
-                .context("send list crons to scheduler")?;
+            send_scheduler_eval(
+                sys,
+                client_id,
+                request_id,
+                ResolvedCommand::ListCrons { limit },
+                "send list crons to scheduler",
+            )
+            .await?;
         }
 
         RequestPayload::ListScopes { limit } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::ListScopes { limit },
-                })
-                .await
-                .context("send list scopes to scheduler")?;
+            send_scheduler_eval(
+                sys,
+                client_id,
+                request_id,
+                ResolvedCommand::ListScopes { limit },
+                "send list scopes to scheduler",
+            )
+            .await?;
         }
 
         RequestPayload::ShowLog {
@@ -435,18 +418,18 @@ async fn route_request(
             limit,
             tail_bytes,
         } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::ShowLog {
-                        id,
-                        limit,
-                        tail_bytes,
-                    },
-                })
-                .await
-                .context("send show log to scheduler")?;
+            send_scheduler_eval(
+                sys,
+                client_id,
+                request_id,
+                ResolvedCommand::ShowLog {
+                    id,
+                    limit,
+                    tail_bytes,
+                },
+                "send show log to scheduler",
+            )
+            .await?;
         }
 
         RequestPayload::JobOutput {
@@ -454,70 +437,84 @@ async fn route_request(
             stdout_bytes,
             stderr_bytes,
         } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::JobOutput {
-                        id,
-                        stdout_bytes,
-                        stderr_bytes,
-                    },
-                })
-                .await
-                .context("send job output to scheduler")?;
+            send_scheduler_eval(
+                sys,
+                client_id,
+                request_id,
+                ResolvedCommand::JobOutput {
+                    id,
+                    stdout_bytes,
+                    stderr_bytes,
+                },
+                "send job output to scheduler",
+            )
+            .await?;
         }
 
         RequestPayload::KillJob { id } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::KillJob { id },
-                })
-                .await
-                .context("send kill job to scheduler")?;
+            send_scheduler_eval(
+                sys,
+                client_id,
+                request_id,
+                ResolvedCommand::KillJob { id },
+                "send kill job to scheduler",
+            )
+            .await?;
         }
 
         RequestPayload::RemoveCron { id } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::RemoveCron { id },
-                })
-                .await
-                .context("send remove cron to scheduler")?;
+            send_scheduler_eval(
+                sys,
+                client_id,
+                request_id,
+                ResolvedCommand::RemoveCron { id },
+                "send remove cron to scheduler",
+            )
+            .await?;
         }
 
         RequestPayload::ShowEnv { tail_bytes } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::ShowEnv { tail_bytes },
-                })
-                .await
-                .context("send show env to scheduler")?;
+            send_scheduler_eval(
+                sys,
+                client_id,
+                request_id,
+                ResolvedCommand::ShowEnv { tail_bytes },
+                "send show env to scheduler",
+            )
+            .await?;
         }
 
         RequestPayload::ShowConfig { tail_bytes } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::ShowConfig { tail_bytes },
-                })
-                .await
-                .context("send show config to scheduler")?;
+            send_scheduler_eval(
+                sys,
+                client_id,
+                request_id,
+                ResolvedCommand::ShowConfig { tail_bytes },
+                "send show config to scheduler",
+            )
+            .await?;
         }
 
         RequestPayload::Subscribe { channels } => {
-            for ch in channels {
+            let channels = match EventChannel::parse_list(&channels) {
+                Ok(channels) => channels,
+                Err(error) => {
+                    sys.gateway
+                        .send(GatewayMsg::SendResponse {
+                            client_id,
+                            request_id,
+                            payload: invalid_event_channel_response(error.input()),
+                        })
+                        .await
+                        .context("send invalid subscribe response")?;
+                    return Ok(());
+                }
+            };
+            for channel in channels {
                 sys.event_bus
                     .send(EventBusMsg::Subscribe {
                         client_id,
-                        channel: ch,
+                        channel,
                         sender: evt_tx.clone(),
                     })
                     .await?;
@@ -532,12 +529,23 @@ async fn route_request(
         }
 
         RequestPayload::Unsubscribe { channels } => {
-            for ch in channels {
+            let channels = match EventChannel::parse_list(&channels) {
+                Ok(channels) => channels,
+                Err(error) => {
+                    sys.gateway
+                        .send(GatewayMsg::SendResponse {
+                            client_id,
+                            request_id,
+                            payload: invalid_event_channel_response(error.input()),
+                        })
+                        .await
+                        .context("send invalid unsubscribe response")?;
+                    return Ok(());
+                }
+            };
+            for channel in channels {
                 sys.event_bus
-                    .send(EventBusMsg::Unsubscribe {
-                        client_id,
-                        channel: ch,
-                    })
+                    .send(EventBusMsg::Unsubscribe { client_id, channel })
                     .await?;
             }
             sys.gateway
@@ -550,14 +558,14 @@ async fn route_request(
         }
 
         RequestPayload::FgAttach { id } => {
-            sys.scheduler
-                .send(SchedulerMsg::Eval {
-                    client_id,
-                    request_id,
-                    command: crate::parser::resolver::ResolvedCommand::Fg { id },
-                })
-                .await
-                .context("send fg attach to scheduler")?;
+            send_scheduler_eval(
+                sys,
+                client_id,
+                request_id,
+                ResolvedCommand::Fg { id },
+                "send fg attach to scheduler",
+            )
+            .await?;
         }
 
         RequestPayload::FgDetach {} => {
@@ -685,10 +693,57 @@ async fn route_request(
     Ok(())
 }
 
+async fn send_scheduler_eval(
+    sys: &ActorSystem,
+    client_id: u64,
+    request_id: u32,
+    command: ResolvedCommand,
+    context: &'static str,
+) -> Result<()> {
+    sys.scheduler
+        .send(SchedulerMsg::Eval {
+            client_id,
+            request_id,
+            command: Box::new(command),
+        })
+        .await
+        .context(context)
+}
+
+async fn queue_response_for_client(
+    clients: &ClientMap,
+    client_id: u64,
+    request_id: u32,
+    payload: ResponsePayload,
+) {
+    let sender = {
+        let guard = clients.lock().await;
+        guard.get(&client_id).cloned()
+    };
+
+    if let Some(sender) = sender {
+        if sender.send((request_id, payload)).await.is_err() {
+            warn!(%client_id, "gateway: response channel closed");
+        }
+    } else {
+        warn!(%client_id, "gateway: no such client for response");
+    }
+}
+
 fn inline_script_disabled_response() -> ResponsePayload {
     ResponsePayload::err(
         error_code::NOT_SUPPORTED,
         "interactive multiline script submissions have been removed; write the items to a .cue file and run `cue run path/to/file.cue`",
+    )
+}
+
+fn invalid_event_channel_response(channel: &str) -> ResponsePayload {
+    ResponsePayload::err(
+        error_code::INVALID_REQUEST,
+        format!(
+            "invalid event channel `{channel}`; expected {}",
+            EventChannel::EXPECTED
+        ),
     )
 }
 
@@ -733,9 +788,8 @@ fn complete_input(input: &str, cursor: usize) -> Vec<CompletionItem> {
         .unwrap_or(input)
         .trim_start();
 
-    if let Some(param_prefix) = mode_param_key_prefix(prefix) {
-        return MODE_PARAM_SPECS
-            .iter()
+    if let Some((command, param_prefix)) = mode_param_key_prefix(prefix) {
+        return mode_param_specs_for_command(command)
             .filter(|param| param.name.starts_with(param_prefix))
             .map(|param| CompletionItem {
                 label: param.name.into(),
@@ -766,11 +820,11 @@ fn complete_input(input: &str, cursor: usize) -> Vec<CompletionItem> {
     Vec::new()
 }
 
-fn mode_param_key_prefix(prefix: &str) -> Option<&str> {
+fn mode_param_key_prefix(prefix: &str) -> Option<(&str, &str)> {
     let open = prefix.rfind('(')?;
     let command = prefix[..open].strip_prefix(':')?;
     let command = command.split_whitespace().next().unwrap_or(command);
-    if !command_spec(command)?.accepts_mode_params {
+    if !command_spec(command)?.accepts_mode_params() {
         return None;
     }
     let params = &prefix[open + 1..];
@@ -784,7 +838,7 @@ fn mode_param_key_prefix(prefix: &str) -> Option<&str> {
     if current.contains('=') {
         return None;
     }
-    Some(current)
+    Some((command, current))
 }
 
 fn highlight_input(input: &str) -> Vec<HighlightSpan> {
@@ -796,7 +850,6 @@ fn highlight_input(input: &str) -> Vec<HighlightSpan> {
                     Token::Command(_) => HighlightKind::CommandName,
                     Token::ModeParenOpen
                     | Token::ModeParenClose
-                    | Token::ParamKey(_)
                     | Token::ParamEq
                     | Token::ParamValue(_)
                     | Token::Comma => HighlightKind::ModeParam,
@@ -876,6 +929,135 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn response_dispatch_waits_for_client_capacity() {
+        let clients: ClientMap =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send((1, ResponsePayload::ack())).await.unwrap();
+        clients.lock().await.insert(7, tx);
+
+        let dispatch = queue_response_for_client(&clients, 7, 2, ResponsePayload::ack());
+        tokio::pin!(dispatch);
+
+        tokio::select! {
+            () = &mut dispatch => panic!("response dispatch should wait for client capacity"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.0, 1);
+        dispatch.await;
+
+        let second = rx.recv().await.unwrap();
+        assert_eq!(second.0, 2);
+    }
+
+    fn test_actor_system(
+        event_bus: mpsc::Sender<EventBusMsg>,
+        gateway: mpsc::Sender<GatewayMsg>,
+    ) -> ActorSystem {
+        let (scheduler, _scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (process_mgr, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scope_store, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        ActorSystem {
+            gateway,
+            scheduler,
+            process_mgr,
+            scope_store,
+            event_bus,
+            config: crate::config::Config::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_request_registers_only_requested_channels() {
+        let (event_bus_tx, mut event_bus_rx) = mpsc::channel(2);
+        let (gateway_tx, mut gateway_rx) = mpsc::channel(1);
+        let sys = test_actor_system(event_bus_tx, gateway_tx);
+        let (evt_tx, mut evt_rx) = mpsc::channel(1);
+
+        route_request(
+            7,
+            42,
+            RequestPayload::subscribe(&[EventChannel::System]),
+            &sys,
+            &evt_tx,
+        )
+        .await
+        .unwrap();
+
+        match event_bus_rx.recv().await.unwrap() {
+            EventBusMsg::Subscribe {
+                client_id,
+                channel,
+                sender,
+            } => {
+                assert_eq!(client_id, 7);
+                assert_eq!(channel, EventChannel::System);
+                sender
+                    .try_send(EventPayload::ShuttingDown {
+                        reason: "test".into(),
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    evt_rx.try_recv().unwrap(),
+                    EventPayload::ShuttingDown { .. }
+                ));
+            }
+            _ => panic!("expected explicit system subscription"),
+        }
+
+        match gateway_rx.recv().await.unwrap() {
+            GatewayMsg::SendResponse {
+                client_id,
+                request_id,
+                payload,
+            } => {
+                assert_eq!(client_id, 7);
+                assert_eq!(request_id, 42);
+                assert!(matches!(payload, ResponsePayload::Ok(OkPayload::Ack {})));
+            }
+            _ => panic!("expected subscribe ack"),
+        }
+        assert!(event_bus_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn subscribe_rejects_unknown_event_channels() {
+        let (event_bus_tx, mut event_bus_rx) = mpsc::channel(1);
+        let (gateway_tx, mut gateway_rx) = mpsc::channel(1);
+        let sys = test_actor_system(event_bus_tx, gateway_tx);
+        let (evt_tx, _evt_rx) = mpsc::channel(1);
+
+        route_request(
+            7,
+            42,
+            RequestPayload::Subscribe {
+                channels: vec!["output:C1".into()],
+            },
+            &sys,
+            &evt_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(event_bus_rx.try_recv().is_err());
+        match gateway_rx.recv().await.unwrap() {
+            GatewayMsg::SendResponse {
+                client_id,
+                request_id,
+                payload: ResponsePayload::Err { code, message },
+            } => {
+                assert_eq!(client_id, 7);
+                assert_eq!(request_id, 42);
+                assert_eq!(code, error_code::INVALID_REQUEST);
+                assert!(message.contains("invalid event channel `output:C1`"));
+            }
+            _ => panic!("expected invalid subscription response"),
+        }
+    }
+
     #[test]
     fn completion_uses_shared_command_specs() {
         let items = complete_input(":ta", 3);
@@ -884,9 +1066,12 @@ mod tests {
 
     #[test]
     fn completion_uses_shared_mode_param_specs() {
-        let items = complete_input(":run(pt", 7);
+        let items = complete_input(":run(p", 6);
         assert!(items.iter().any(|item| item.label == "pty"));
-        assert!(!items.iter().any(|item| item.label == "timeout"));
+        assert!(!items.iter().any(|item| item.label == "retry"));
+
+        let cron_items = complete_input(":cron(p", 7);
+        assert!(!cron_items.iter().any(|item| item.label == "pty"));
     }
 
     #[test]

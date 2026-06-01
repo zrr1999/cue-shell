@@ -528,6 +528,54 @@ async fn test_simple_job_execution() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cue_run_receives_direct_job_output_without_output_subscription() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("cue-run-direct-output");
+        let script_path = env.root.join("direct-output.cue");
+        fs::write(
+            &script_path,
+            ":run(pty=false) sh -c \"printf 'early-out\\n'; printf 'early-err\\n' >&2\"\n",
+        )
+        .expect("write cue script");
+
+        let mut child = env.spawn_daemon();
+        let _stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cue"))
+            .arg("run")
+            .arg(&script_path)
+            .env("CUE_SOCKET", &env.socket)
+            .env("XDG_RUNTIME_DIR", &env.root)
+            .env("XDG_DATA_HOME", env.root.join("data"))
+            .env("XDG_STATE_HOME", env.root.join("state"))
+            .env("XDG_CONFIG_HOME", env.root.join("config"))
+            .env("HOME", &env.root)
+            .output()
+            .await
+            .expect("run cue script");
+
+        assert!(
+            output.status.success(),
+            "cue run failed: stdout=\n{}\nstderr=\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("early-out"),
+            "stdout did not contain script stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("early-err"),
+            "stderr did not contain script stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restart_restores_jobs_and_scope_head() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("persist");
@@ -1690,9 +1738,12 @@ async fn test_gateway_stdio_bridge_shares_state_and_keeps_output_subscriptions_p
         let mut local = wait_for_socket(&env.socket, &mut child).await;
         let (mut remote, remote_relay) = connect_bridge(&env.socket).await;
 
+        subscribe(&mut local, 1, vec!["jobs"]).await;
+        subscribe(&mut remote, 1, vec!["jobs"]).await;
+
         let create_resp = roundtrip(
             &mut remote,
-            1,
+            2,
             RequestPayload::Eval {
                 input: script_path.display().to_string(),
                 mode: Mode::Job,
@@ -1705,7 +1756,7 @@ async fn test_gateway_stdio_bridge_shares_state_and_keeps_output_subscriptions_p
             other => panic!("expected JobCreated from bridged client, got {other:?}"),
         };
 
-        subscribe(&mut local, 1, vec![format!("output:{job_id}")]).await;
+        subscribe(&mut local, 2, vec![format!("output:{job_id}")]).await;
 
         let local_msgs = collect_until(&mut local, Duration::from_secs(5), |msg| {
             matches!(

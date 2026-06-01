@@ -23,7 +23,6 @@ complete. Interactive JOB multiline input is not a script-mode entry point; see
 ## 2. Implementation
 
 **Hand-written recursive descent** — no parser combinator dependencies.
-
 - Full control over error messages, recovery, and completion suggestions
 - Tokenizer is a state machine with context-sensitive `()` handling
 - Parser produces an unresolved AST; Resolver validates IDs, scopes, injects mode defaults
@@ -40,9 +39,8 @@ enum Token {
     // Mode params (context: immediately after Command)
     ModeParenOpen,          // ( — mode params context
     ModeParenClose,         // ) — mode params context
-    ParamKey(String),       // cwd, pty, scope, wrapper
     ParamEq,               // =
-    ParamValue(Value),      // 3, "30s", true, ...
+    ParamValue(Value),      // true, false
     Comma,                  // ,
 
     // Operators (chain layer)
@@ -62,7 +60,7 @@ enum Token {
 
     // Content
     Word(String),           // command arguments, filenames, flags
-    IdRef(IdKind, u32),     // J1, C3, S0
+    IdRef(IdKind, u32),     // J1, C3
 
     // Whitespace (preserved for highlighting, stripped for parsing)
     Whitespace(String),
@@ -73,12 +71,10 @@ enum Token {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum IdKind { Job, Cron, Scope }
+enum IdKind { Job, Cron }
 
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
-    Int(i64),
-    Duration(Duration),
     Str(String),
     Bool(bool),
 }
@@ -87,7 +83,6 @@ enum Value {
 ### `()` Disambiguation
 
 Tokenizer uses positional context:
-
 - Previous non-whitespace token is `Command(...)` → `ModeParenOpen` / `ModeParenClose`
 - Otherwise → `GroupOpen` / `GroupClose`
 
@@ -119,7 +114,7 @@ enum Argument {
     IdRef(IdKind, u32),         // for :kill, :out, :fg, :retry, etc.
     Text(String),               // for :send and similar text-taking commands
     CronExpr {                  // for :cron
-        schedule: CronSchedule,
+        schedule: CronScheduleAst,
         body: ChainNode,
     },
     Empty,                      // for :jobs, :crons, :scopes, :help
@@ -147,12 +142,12 @@ struct PipeSegment {
 
 enum PipeOp { Stdout, All, Stderr }  // |>  |&>  |!>
 
-/// Cron schedule variants
-enum CronSchedule {
+/// Unresolved cron schedule variants. Resolver validates into core CronSchedule.
+enum CronScheduleAst {
     Every(Duration),                         // every 5m
     At(TimeSpec),                            // at 03:00
     In(Duration),                            // in 30s (one-shot)
-    Cron(String),                            // cron "0 */5 * * *"
+    Cron(String),                            // validated into core CrontabSchedule
 }
 ```
 
@@ -210,9 +205,9 @@ The Resolver transforms `Ast` → `RequestPayload`:
    - CRON ⏰ → `:cron`
 
 2. **Argument type validation**: ensures command gets correct argument type
-   - `:run` expects Chain, `:kill` expects IdRef, `:send` expects Text, etc.
+    - `:run` expects Chain, `:kill` expects IdRef, `:send` expects Text, etc.
 
-3. **ID resolution**: validates J1/C3/S0 references exist (queries cued state)
+3. **ID resolution**: validates J1/C3 references exist (queries cued state)
 
 4. **Mode params merge**: per-invocation params override server.toml defaults
 
@@ -225,7 +220,7 @@ The Resolver transforms `Ast` → `RequestPayload`:
 1. Tokenize up to cursor position
 2. Determine context:
    - After `:` → command name completion (run, kill, jobs, ...)
-   - After `:cmd(` → mode param key completion (cwd, pty, scope, wrapper)
+   - After `:cmd(` → command-specific mode param key completion
    - After `=` in mode params → value completion (based on param type)
    - After IdRef prefix `J` → active job ID completion
    - After word → filesystem path / command completion
@@ -294,31 +289,31 @@ TUI highlights the error span in red and shows the message inline.
 
 Which argument type each command expects:
 
-| Command   | Argument                             | Mode Params                  |
-| --------- | ------------------------------------ | ---------------------------- |
-| `:run`    | Chain                                | ✓ (cwd, pty, scope, wrapper) |
-| `:cron`   | Chain（resolver 再拆 schedule/body） | ✓ (cwd, pty, scope, wrapper) |
-| `:kill`   | IdRef                                | ✗                            |
-| `:retry`  | IdRef                                | ✗                            |
-| `:out`    | IdRef                                | ✗                            |
-| `:tail`   | IdRef + optional bytes               | ✗                            |
-| `:err`    | IdRef                                | ✗                            |
-| `:fg`     | IdRef                                | ✗                            |
-| `:wait`   | IdRef                                | ✗                            |
-| `:send`   | Text (`J<n> <input>`)                | ✗                            |
-| `:cancel` | IdRef                                | ✗                            |
-| `:jobs`   | Empty                                | ✗                            |
-| `:crons`  | Empty                                | ✗                            |
-| `:scopes` | Empty                                | ✗                            |
-| `:env`    | Text (subcommand)                    | ✗                            |
-| `:cd`     | Text (path)                          | ✗                            |
-| `:scope`  | Text (subcommand)                    | ✗                            |
-| `:help`   | Empty or Text                        | ✗                            |
-| `:pause`  | IdRef                                | ✗                            |
-| `:resume` | IdRef                                | ✗                            |
-| `:config` | Text                                 | ✗                            |
-| `:wrap`   | Text (`on`, `off`, `status`)         | ✗                            |
-| `:log`    | IdRef or Empty                       | ✗                            |
-| `:clear`  | Empty                                | ✗                            |
-| `:quit`   | Empty                                | ✗                            |
-| `:exit`   | Empty                                | ✗                            |
+| Command | Argument | Mode Params |
+|---|---|---|
+| `:run` | Chain | ✓ (cwd, wrapper, scope, pty) |
+| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, wrapper, scope) |
+| `:kill` | Job/Cron IdRef (`J<n>` or `C<n>`) | ✗ |
+| `:retry` | Job IdRef (`J<n>`) | ✗ |
+| `:out` | Job IdRef (`J<n>`) | ✗ |
+| `:tail` | Job IdRef (`J<n>`) + optional bytes | ✗ |
+| `:err` | Job IdRef (`J<n>`) | ✗ |
+| `:fg` | Job IdRef (`J<n>`) | ✗ |
+| `:wait` | Job IdRef (`J<n>`) | ✗ |
+| `:send` | Job target + raw text (`J<n> <input>`) | ✗ |
+| `:cancel` | Job IdRef (`J<n>`) | ✗ |
+| `:jobs` | Empty | ✗ |
+| `:crons` | Empty | ✗ |
+| `:scopes` | Empty | ✗ |
+| `:env` | Text (subcommand) | ✗ |
+| `:cd` | Text (path) | ✗ |
+| `:scope` | Text (`list`; other subcommands not implemented) | ✗ |
+| `:help` | Empty or Text | ✗ |
+| `:pause` | Cron IdRef (`C<n>`) | ✗ |
+| `:resume` | Cron IdRef (`C<n>`) | ✗ |
+| `:config` | Text | ✗ |
+| `:wrap` | Text (`on`, `off`, `status`) | ✗ |
+| `:log` | Job/Cron IdRef (`J<n>` or `C<n>`) or Empty | ✗ |
+| `:clear` | Empty | ✗ |
+| `:quit` | Empty | ✗ |
+| `:exit` | Empty | ✗ |

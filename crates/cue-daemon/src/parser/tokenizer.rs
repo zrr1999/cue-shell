@@ -4,7 +4,6 @@
 //! - `(` immediately after a `Command` token → `ModeParenOpen`
 //! - `(` elsewhere → `GroupOpen`
 
-use super::duration::parse_duration_str;
 use super::token::{IdKind, Span, Spanned, Token, Value};
 
 /// Tokenizer state machine.
@@ -164,11 +163,14 @@ impl<'a> Tokenizer<'a> {
 
             b')' => {
                 self.pos += 1;
-                if self.in_mode_params {
+                let token = if self.in_mode_params {
                     self.in_mode_params = false;
-                }
+                    Token::ModeParenClose
+                } else {
+                    Token::GroupClose
+                };
                 self.last_significant = Some(TokenClass::Other);
-                Token::GroupClose
+                token
             }
 
             b'-' if self.peek_at(1) == Some(b'>')
@@ -214,24 +216,13 @@ impl<'a> Tokenizer<'a> {
         })
     }
 
-    /// Tokenize after `(` when in mode-params context.
-    /// Returns a sequence of param tokens, consuming up to and including `)`.
+    /// Return the already-consumed mode-param opening paren.
+    /// Subsequent calls continue in mode-param state until `ModeParenClose`.
     fn tokenize_mode_params(
         &mut self,
         paren_start: usize,
         open_tok: Token,
     ) -> Result<Spanned, TokenizeError> {
-        // We've already consumed `(`. We need to return ModeParenOpen first,
-        // then subsequent calls will read key=value pairs.
-        // But our tokenizer is single-token-at-a-time, so we store the open token
-        // and let subsequent next_token calls handle the interior.
-
-        // Actually, for simplicity in a single-pass tokenizer, let's collect
-        // all mode params inline and return them as individual tokens.
-        // We'll switch to a "mode params" sub-state.
-
-        // For now, return just the ModeParenOpen. The parser will know to
-        // expect params until ModeParenClose.
         Ok(Spanned {
             token: open_tok,
             span: Span::new(paren_start, self.pos),
@@ -293,7 +284,8 @@ impl<'a> Tokenizer<'a> {
     fn tokenize_word(&mut self) -> Result<Token, TokenizeError> {
         let start = self.pos;
 
-        // Check for ID ref: J1, C3, S0
+        // Check for job/cron ID refs. Scopes are content-addressed hashes, not
+        // numeric parser IDs.
         if let Some(kind) = self.try_id_kind() {
             let prefix_pos = self.pos;
             self.pos += 1; // skip prefix letter
@@ -382,7 +374,6 @@ impl<'a> Tokenizer<'a> {
         match self.peek()? {
             b'J' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Job),
             b'C' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Cron),
-            b'S' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Scope),
             _ => None,
         }
     }
@@ -561,31 +552,17 @@ fn is_delimiter(b: u8) -> bool {
 
 /// Try to parse a word as a typed value (for mode params).
 fn try_parse_value(s: &str) -> Option<Value> {
-    // Bool
     if s == "true" {
         return Some(Value::Bool(true));
     }
     if s == "false" {
         return Some(Value::Bool(false));
     }
-
-    // Duration: 30s, 5m, 1h, 500ms
-    if let Some(d) = parse_duration_str(s) {
-        return Some(Value::Duration(d));
-    }
-
-    // Integer
-    if let Ok(n) = s.parse::<i64>() {
-        return Some(Value::Int(n));
-    }
-
     None
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     fn tokens(input: &str) -> Vec<Token> {
@@ -637,7 +614,7 @@ mod tests {
                 Token::Word("pty".into()),
                 Token::ParamEq,
                 Token::ParamValue(Value::Bool(false)),
-                Token::GroupClose, // Will be ModeParenClose after parser context
+                Token::ModeParenClose,
                 Token::Word("cargo".into()),
                 Token::Word("test".into()),
                 Token::Eof,
@@ -711,6 +688,19 @@ mod tests {
     }
 
     #[test]
+    fn numeric_scope_labels_stay_words() {
+        let toks = tokens("echo S1");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("S1".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
     fn oversized_id_refs_stay_words_instead_of_wrapping_to_zero() {
         let toks = tokens("echo J4294967296");
         assert_eq!(
@@ -738,17 +728,6 @@ mod tests {
                 Token::Word("c".into()),
                 Token::Eof,
             ]
-        );
-    }
-
-    #[test]
-    fn duration_values() {
-        assert_eq!(parse_duration_str("30s"), Some(Duration::from_secs(30)));
-        assert_eq!(parse_duration_str("5m"), Some(Duration::from_secs(300)));
-        assert_eq!(parse_duration_str("1h"), Some(Duration::from_secs(3600)));
-        assert_eq!(
-            parse_duration_str("500ms"),
-            Some(Duration::from_millis(500))
         );
     }
 
@@ -1026,20 +1005,20 @@ mod tests {
     #[test]
     fn comma_in_mode_params_still_separates() {
         // Inside mode params, commas should still separate key=val pairs.
-        let toks = tokens(":run(pty=false,wrapper=true) cargo test");
+        let toks = tokens(":run(cwd=/tmp,pty=false) cargo test");
         assert_eq!(
             toks,
             vec![
                 Token::Command("run".into()),
                 Token::ModeParenOpen,
+                Token::Word("cwd".into()),
+                Token::ParamEq,
+                Token::Word("/tmp".into()),
+                Token::Comma,
                 Token::Word("pty".into()),
                 Token::ParamEq,
                 Token::ParamValue(Value::Bool(false)),
-                Token::Comma,
-                Token::Word("wrapper".into()),
-                Token::ParamEq,
-                Token::ParamValue(Value::Bool(true)),
-                Token::GroupClose,
+                Token::ModeParenClose,
                 Token::Word("cargo".into()),
                 Token::Word("test".into()),
                 Token::Eof,

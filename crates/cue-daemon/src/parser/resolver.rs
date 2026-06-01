@@ -7,8 +7,9 @@
 //! 4. AST → cue_core types conversion
 
 use cue_core::command::{ModeParams, ParamValue};
-use cue_core::command_spec::{MODE_PARAM_SPECS, ModeParamValueKind, command_spec};
-use cue_core::cron::{CronPreset, CronSchedule, parse_day_filter, parse_time_of_day};
+use cue_core::cron::{
+    CronPreset, CronSchedule, CrontabSchedule, parse_day_filter, parse_time_of_day,
+};
 use cue_core::ipc::ScriptSource;
 use cue_core::mode::Mode;
 use cue_core::pipeline::{self as core_pipeline};
@@ -193,7 +194,6 @@ impl Resolver {
         argument: Argument,
         span: Span,
     ) -> Result<ResolvedCommand, ParseError> {
-        validate_mode_params(name, &mode_params, span)?;
         let params = convert_mode_params(mode_params);
 
         Ok(match name {
@@ -343,80 +343,10 @@ fn convert_pipeline(p: Pipeline) -> core_pipeline::Pipeline {
     }
 }
 
-fn validate_mode_params(
-    command: &str,
-    params: &[(String, Value)],
-    span: Span,
-) -> Result<(), ParseError> {
-    if params.is_empty() {
-        return Ok(());
-    }
-
-    let Some(spec) = command_spec(command) else {
-        return Ok(());
-    };
-    if !spec.accepts_mode_params {
-        return Err(ParseError {
-            span,
-            message: format!(":{command} does not accept mode params"),
-            kind: ParseErrorKind::InvalidModeParam,
-            suggestions: vec![],
-        });
-    }
-
-    let known_params = MODE_PARAM_SPECS
-        .iter()
-        .map(|spec| spec.name)
-        .collect::<std::collections::BTreeSet<_>>();
-    for (key, value) in params {
-        let Some(param_spec) = MODE_PARAM_SPECS.iter().find(|spec| spec.name == key) else {
-            return Err(ParseError {
-                span,
-                message: format!(
-                    "unknown mode param `{key}` for :{command}; supported: {}",
-                    known_params.iter().copied().collect::<Vec<_>>().join(", ")
-                ),
-                kind: ParseErrorKind::InvalidModeParam,
-                suggestions: known_params.iter().map(|name| format!("{name}=")).collect(),
-            });
-        };
-
-        if !mode_param_value_matches(param_spec.value_kind, value) {
-            return Err(ParseError {
-                span,
-                message: format!(
-                    "mode param `{key}` for :{command} expects {}",
-                    mode_param_kind_name(param_spec.value_kind)
-                ),
-                kind: ParseErrorKind::InvalidModeParam,
-                suggestions: vec![format!("{}={}", param_spec.name, param_spec.value_hint)],
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn mode_param_value_matches(kind: ModeParamValueKind, value: &Value) -> bool {
-    matches!(
-        (kind, value),
-        (ModeParamValueKind::Bool, Value::Bool(_)) | (ModeParamValueKind::Str, Value::Str(_))
-    )
-}
-
-fn mode_param_kind_name(kind: ModeParamValueKind) -> &'static str {
-    match kind {
-        ModeParamValueKind::Bool => "a boolean",
-        ModeParamValueKind::Str => "a string/path",
-    }
-}
-
 fn convert_mode_params(params: Vec<(String, Value)>) -> ModeParams {
     let mut mp = ModeParams::new();
     for (key, value) in params {
         let pv = match value {
-            Value::Int(n) => ParamValue::Int(n),
-            Value::Duration(d) => ParamValue::Duration(d),
             Value::Str(s) => ParamValue::Str(s),
             Value::Bool(b) => ParamValue::Bool(b),
         };
@@ -506,17 +436,22 @@ fn extract_optional_text(arg: Argument) -> Option<String> {
 /// schedule time cannot be parsed (e.g. invalid time format).
 fn convert_cron_schedule(ast: &CronScheduleAst) -> Option<CronSchedule> {
     match ast {
-        CronScheduleAst::Every(d) => Some(CronSchedule::Interval(*d)),
+        CronScheduleAst::Every(d) if !d.is_zero() => Some(CronSchedule::Interval(*d)),
         CronScheduleAst::At { time, days } => {
             let time_secs = parse_time_of_day(time)?;
-            let day_filter = days.as_ref().and_then(|d| parse_day_filter(d));
+            let day_filter = match days {
+                Some(days) => Some(parse_day_filter(days)?),
+                None => None,
+            };
             Some(CronSchedule::TimeOfDay {
                 time_secs,
                 days: day_filter,
             })
         }
-        CronScheduleAst::In(d) => Some(CronSchedule::Delay(*d)),
-        CronScheduleAst::Crontab(expr) => Some(CronSchedule::Crontab(expr.clone())),
+        CronScheduleAst::In(d) if !d.is_zero() => Some(CronSchedule::Delay(*d)),
+        CronScheduleAst::Crontab(expr) => {
+            Some(CronSchedule::Crontab(CrontabSchedule::parse(expr)?))
+        }
         CronScheduleAst::Preset(name) => {
             let preset = match name.as_str() {
                 "daily" => CronPreset::Daily,
@@ -527,6 +462,7 @@ fn convert_cron_schedule(ast: &CronScheduleAst) -> Option<CronSchedule> {
             };
             Some(CronSchedule::Preset(preset))
         }
+        CronScheduleAst::Every(_) | CronScheduleAst::In(_) => None,
     }
 }
 
@@ -994,7 +930,9 @@ mod tests {
             ResolvedCommand::Cron {
                 schedule, chain, ..
             } => {
-                assert!(matches!(schedule, CronSchedule::Crontab(e) if e == "*/5 * * * *"));
+                assert!(
+                    matches!(schedule, CronSchedule::Crontab(e) if e.as_str() == "*/5 * * * *")
+                );
                 let pipeline = leaf_pipeline(chain);
                 assert_eq!(pipeline.segments[0].command, vec!["curl", "api/health"]);
             }
@@ -1029,6 +967,46 @@ mod tests {
     }
 
     #[test]
+    fn resolve_bare_cron_rejects_invalid_day_filter() {
+        let ast = CueParser::parse("at 9am on noday cargo test").unwrap();
+        let error =
+            Resolver::resolve(ast, Mode::Cron).expect_err("invalid day filter must be rejected");
+
+        assert_eq!(error.kind, ParseErrorKind::InvalidCronSchedule);
+    }
+
+    #[test]
+    fn resolve_bare_cron_rejects_signed_duration() {
+        let ast = CueParser::parse("every +1h cargo test").unwrap();
+        let error =
+            Resolver::resolve(ast, Mode::Cron).expect_err("signed duration must be rejected");
+
+        assert_eq!(error.kind, ParseErrorKind::InvalidCronSchedule);
+    }
+
+    #[test]
+    fn resolve_bare_cron_rejects_zero_duration_schedule() {
+        for input in ["every 0s cargo test", "in 0s cargo test"] {
+            let ast = CueParser::parse(input).unwrap();
+            let error =
+                Resolver::resolve(ast, Mode::Cron).expect_err("zero schedule must be rejected");
+
+            assert_eq!(error.kind, ParseErrorKind::InvalidCronSchedule);
+        }
+    }
+
+    #[test]
+    fn resolve_bare_cron_rejects_invalid_crontab_fields() {
+        for input in ["cron 60 * * * * echo bad", "*/0 * * * * do echo bad"] {
+            let ast = CueParser::parse(input).unwrap();
+            let error =
+                Resolver::resolve(ast, Mode::Cron).expect_err("invalid crontab must be rejected");
+
+            assert_eq!(error.kind, ParseErrorKind::InvalidCronSchedule);
+        }
+    }
+
+    #[test]
     fn resolve_kill() {
         let cmd = resolve(":kill J1", Mode::Job);
         match cmd {
@@ -1039,37 +1017,13 @@ mod tests {
 
     #[test]
     fn resolve_with_params() {
-        let cmd = resolve(":run(pty=false,wrapper=true) cargo test", Mode::Job);
+        let cmd = resolve(":run(pty=false) cargo test", Mode::Job);
         match cmd {
             ResolvedCommand::Run { params, .. } => {
                 assert!(!params.pty_enabled());
-                assert_eq!(params.wrapper_enabled(), Some(true));
             }
             _ => panic!("expected Run"),
         }
-    }
-
-    #[test]
-    fn rejects_mode_params_on_commands_that_do_not_accept_them() {
-        let error = CueParser::parse(":jobs(pty=false)").expect_err("mode params should fail");
-        assert_eq!(error.kind, ParseErrorKind::InvalidModeParam);
-        assert!(error.message.contains("does not accept mode params"));
-    }
-
-    #[test]
-    fn rejects_unknown_mode_params() {
-        let error = CueParser::parse(":run(timeout=30s) cargo test")
-            .expect_err("unknown param should fail");
-        assert_eq!(error.kind, ParseErrorKind::InvalidModeParam);
-        assert!(error.message.contains("unknown mode parameter `timeout`"));
-    }
-
-    #[test]
-    fn rejects_wrong_mode_param_types() {
-        let error =
-            CueParser::parse(":run(pty=no) cargo test").expect_err("wrong type should fail");
-        assert_eq!(error.kind, ParseErrorKind::InvalidModeParam);
-        assert!(error.message.contains("expects a boolean"));
     }
 
     #[test]
@@ -1117,10 +1071,21 @@ mod tests {
         let cmd = resolve(":cron cron */5 * * * * echo hello", Mode::Job);
         match cmd {
             ResolvedCommand::Cron { schedule, .. } => {
-                assert!(matches!(schedule, CronSchedule::Crontab(e) if e == "*/5 * * * *"));
+                assert!(
+                    matches!(schedule, CronSchedule::Crontab(e) if e.as_str() == "*/5 * * * *")
+                );
             }
             _ => panic!("expected Cron"),
         }
+    }
+
+    #[test]
+    fn resolve_cron_command_rejects_invalid_crontab_fields() {
+        let ast = CueParser::parse(":cron cron 60 * * * * echo bad").unwrap();
+        let error =
+            Resolver::resolve(ast, Mode::Job).expect_err("invalid crontab must be rejected");
+
+        assert_eq!(error.kind, ParseErrorKind::InvalidCronSchedule);
     }
 
     #[test]
@@ -1129,10 +1094,19 @@ mod tests {
             let input = match spec.arg_kind {
                 CommandArgKind::Chain => format!(":{} echo ok", spec.name),
                 CommandArgKind::Cron => format!(":{} every 5m echo ok", spec.name),
-                CommandArgKind::Id => format!(":{} J1", spec.name),
-                CommandArgKind::Tail => format!(":{} J1 1024", spec.name),
+                CommandArgKind::Id(allowed) => {
+                    format!(":{} {}", spec.name, allowed.first_example())
+                }
+                CommandArgKind::Tail(allowed) => {
+                    format!(":{} {} 1024", spec.name, allowed.first_example())
+                }
                 CommandArgKind::Text => format!(":{} J1 hello", spec.name),
-                CommandArgKind::OptionalId => format!(":{} J1", spec.name),
+                CommandArgKind::TargetText(allowed) => {
+                    format!(":{} {} hello", spec.name, allowed.first_example())
+                }
+                CommandArgKind::OptionalId(allowed) => {
+                    format!(":{} {}", spec.name, allowed.first_example())
+                }
                 CommandArgKind::OptionalText => format!(":{} status", spec.name),
                 CommandArgKind::Empty => format!(":{}", spec.name),
             };

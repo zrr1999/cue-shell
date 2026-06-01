@@ -78,12 +78,13 @@ pub fn parse_transport_snapshot(
 ) -> Result<TransportSettingsSnapshot> {
     let document: Value =
         toml::from_str(text).with_context(|| format!("parse config {}", path.display()))?;
-    Ok(snapshot_from_value(
+    snapshot_from_value(
         path.to_path_buf(),
         using_legacy_config,
         &document,
         detected_hosts,
-    ))
+    )
+    .with_context(|| format!("parse transport settings {}", path.display()))
 }
 
 pub fn save_default_transport_profile(
@@ -131,20 +132,13 @@ fn snapshot_from_value(
     using_legacy_config: bool,
     document: &Value,
     detected_hosts: &BTreeSet<String>,
-) -> TransportSettingsSnapshot {
-    let auto_detect_ssh = transport_auto_detect_ssh(document);
-    let default_profile = transport_table(document)
-        .and_then(|transport| transport.get("default_profile"))
-        .and_then(Value::as_str)
-        .filter(|profile| !profile.is_empty())
-        .unwrap_or("local")
-        .to_string();
+) -> Result<TransportSettingsSnapshot> {
+    let auto_detect_ssh = transport_auto_detect_ssh(document)?;
+    let default_profile = transport_default_profile(document)?;
 
     let empty_detected = BTreeSet::new();
     let mut profiles = merged_profile_summaries(
-        transport_table(document)
-            .and_then(|transport| transport.get("profiles"))
-            .and_then(Value::as_table),
+        transport_profiles_table(document)?,
         if auto_detect_ssh {
             detected_hosts
         } else {
@@ -169,13 +163,13 @@ fn snapshot_from_value(
         });
     }
 
-    TransportSettingsSnapshot {
+    Ok(TransportSettingsSnapshot {
         source_path,
         using_legacy_config,
         auto_detect_ssh,
         default_profile,
         profiles,
-    }
+    })
 }
 
 fn merged_profile_summaries(
@@ -229,11 +223,16 @@ fn summarize_profile(name: &str, profile: &Value) -> TransportProfileSummary {
         };
     };
 
-    match table
-        .get("transport")
-        .and_then(Value::as_str)
-        .unwrap_or("unix")
-    {
+    let Some(transport) = table.get("transport").and_then(Value::as_str) else {
+        return TransportProfileSummary {
+            name: name.to_string(),
+            transport: "invalid".into(),
+            detail: "profile is missing transport".into(),
+            source: TransportProfileSource::Configured,
+        };
+    };
+
+    match transport {
         "unix" => TransportProfileSummary {
             name: name.to_string(),
             transport: "unix".into(),
@@ -280,13 +279,7 @@ fn summarize_profile(name: &str, profile: &Value) -> TransportProfileSummary {
 fn summarize_local_profile(profile: Option<&Value>) -> TransportProfileSummary {
     let socket = profile
         .and_then(Value::as_table)
-        .filter(|table| {
-            table
-                .get("transport")
-                .and_then(Value::as_str)
-                .unwrap_or("unix")
-                == "unix"
-        })
+        .filter(|table| table.get("transport").and_then(Value::as_str) == Some("unix"))
         .and_then(|table| table.get("socket"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
@@ -304,11 +297,42 @@ fn transport_table(document: &Value) -> Option<&Map<String, Value>> {
     document.get("transport")?.as_table()
 }
 
-fn transport_auto_detect_ssh(document: &Value) -> bool {
-    transport_table(document)
-        .and_then(|transport| transport.get("auto_detect_ssh"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
+fn transport_auto_detect_ssh(document: &Value) -> Result<bool> {
+    let Some(value) =
+        transport_table(document).and_then(|transport| transport.get("auto_detect_ssh"))
+    else {
+        return Ok(true);
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| anyhow::anyhow!("transport.auto_detect_ssh must be a boolean"))
+}
+
+fn transport_default_profile(document: &Value) -> Result<String> {
+    let Some(value) =
+        transport_table(document).and_then(|transport| transport.get("default_profile"))
+    else {
+        return Ok(default_profile_name());
+    };
+    let profile = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("transport.default_profile must be a string"))?;
+    if profile.is_empty() {
+        Ok(default_profile_name())
+    } else {
+        Ok(profile.to_string())
+    }
+}
+
+fn transport_profiles_table(document: &Value) -> Result<Option<&Map<String, Value>>> {
+    let Some(value) = transport_table(document).and_then(|transport| transport.get("profiles"))
+    else {
+        return Ok(None);
+    };
+    value
+        .as_table()
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("transport.profiles must be a table"))
 }
 
 fn update_default_profile(document: &mut Value, profile_name: &str) {
@@ -471,6 +495,59 @@ transport = "ssh"
     }
 
     #[test]
+    fn configured_profile_without_transport_is_invalid() {
+        let snapshot = parse_transport_snapshot(
+            Path::new("client.toml"),
+            false,
+            r#"
+[transport]
+default_profile = "remote"
+
+[transport.profiles.remote]
+destination = "devbox"
+"#,
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot
+                .profiles
+                .iter()
+                .find(|profile| profile.name == "remote")
+                .map(|profile| (profile.transport.as_str(), profile.detail.as_str())),
+            Some(("invalid", "profile is missing transport"))
+        );
+    }
+
+    #[test]
+    fn local_profile_without_transport_does_not_override_builtin_local() {
+        let snapshot = parse_transport_snapshot(
+            Path::new("client.toml"),
+            false,
+            r#"
+[transport]
+default_profile = "local"
+
+[transport.profiles.local]
+socket = "/tmp/ignored.sock"
+"#,
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.profiles.first(),
+            Some(&TransportProfileSummary {
+                name: "local".into(),
+                transport: "unix".into(),
+                detail: format!("socket: {}", default_socket_path().display()),
+                source: TransportProfileSource::Local,
+            })
+        );
+    }
+
+    #[test]
     fn snapshot_adds_detected_ssh_hosts_and_keeps_local() {
         let snapshot = parse_transport_snapshot(
             Path::new("client.toml"),
@@ -569,6 +646,54 @@ auto_detect_ssh = false
                 .iter()
                 .any(|profile| profile.name == "devbox")
         );
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_auto_detect_ssh_type() {
+        let error = parse_transport_snapshot(
+            Path::new("client.toml"),
+            false,
+            r#"
+[transport]
+auto_detect_ssh = "false"
+"#,
+            &Default::default(),
+        )
+        .expect_err("invalid auto_detect_ssh type should fail");
+
+        assert!(format!("{error:#}").contains("transport.auto_detect_ssh must be a boolean"));
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_default_profile_type() {
+        let error = parse_transport_snapshot(
+            Path::new("client.toml"),
+            false,
+            r#"
+[transport]
+default_profile = 7
+"#,
+            &Default::default(),
+        )
+        .expect_err("invalid default_profile type should fail");
+
+        assert!(format!("{error:#}").contains("transport.default_profile must be a string"));
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_profiles_shape() {
+        let error = parse_transport_snapshot(
+            Path::new("client.toml"),
+            false,
+            r#"
+[transport]
+profiles = "remote"
+"#,
+            &Default::default(),
+        )
+        .expect_err("invalid profiles shape should fail");
+
+        assert!(format!("{error:#}").contains("transport.profiles must be a table"));
     }
 
     #[test]

@@ -106,6 +106,11 @@ submission order:
 
 - stdout chunks for the current item are written to the caller's stdout
 - stderr chunks for the current item are written to the caller's stderr
+- output for jobs spawned by a `RunScript` request is delivered directly to the
+  requesting client, while still being published on normal `output:J<n>`
+  channels for other observers
+- terminal `ScriptFinished` status is delivered directly to the requesting
+  client, while still being published on the `jobs` channel for other observers
 - the daemon remains the canonical owner of job output logs
 - TUI/script history may show the `R<n> -> item -> C/J` mapping and final status
 

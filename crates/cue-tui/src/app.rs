@@ -14,14 +14,15 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use cue_core::Mode;
 use cue_core::command_spec::command_names;
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
-    CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload, ResponsePayload,
-    ScriptItemInfo, ScriptItemResult, ScriptRunStatus, ScriptSource, ScriptSubmitError, Stream,
+    ChainInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload,
+    ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptRunStatus, ScriptSource,
+    ScriptSubmitError, Stream,
 };
 use cue_core::job::JobStatus;
+use cue_core::{EventChannel, JobId, Mode};
 use ratatui::layout::{Constraint, Layout, Rect};
 use tui_term::vt100;
 
@@ -131,7 +132,15 @@ struct PendingSubmission {
     input: String,
     mode: Mode,
     warnings: Vec<String>,
-    silent: bool,
+    kind: PendingSubmissionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingSubmissionKind {
+    User,
+    Silent { description: String },
+    DisplaySubscribe { id: String },
+    DisplayUnsubscribe { id: String },
 }
 
 enum FgSessionKind {
@@ -280,18 +289,49 @@ impl PendingSubmission {
             input,
             mode,
             warnings,
-            silent: false,
+            kind: PendingSubmissionKind::User,
         }
     }
 
+    #[cfg(test)]
     fn silent() -> Self {
+        Self::silent_request("silent request")
+    }
+
+    fn silent_request(description: impl Into<String>) -> Self {
         Self {
             card_index: None,
             input: String::new(),
             mode: Mode::default(),
             warnings: Vec::new(),
-            silent: true,
+            kind: PendingSubmissionKind::Silent {
+                description: description.into(),
+            },
         }
+    }
+
+    fn display_subscribe(id: String) -> Self {
+        Self {
+            card_index: None,
+            input: String::new(),
+            mode: Mode::default(),
+            warnings: Vec::new(),
+            kind: PendingSubmissionKind::DisplaySubscribe { id },
+        }
+    }
+
+    fn display_unsubscribe(id: String) -> Self {
+        Self {
+            card_index: None,
+            input: String::new(),
+            mode: Mode::default(),
+            warnings: Vec::new(),
+            kind: PendingSubmissionKind::DisplayUnsubscribe { id },
+        }
+    }
+
+    fn is_user_visible(&self) -> bool {
+        matches!(self.kind, PendingSubmissionKind::User)
     }
 }
 
@@ -339,6 +379,7 @@ pub struct AppState {
     fg_session: Option<FgSession>,
     display_tabs: Vec<DisplayTab>,
     active_display_tab: Option<usize>,
+    /// Output job IDs confirmed subscribed on the current connection.
     display_subscriptions: Vec<String>,
     job_picker: Option<JobPickerState>,
     target_settings: Option<TargetSettingsState>,
@@ -794,49 +835,155 @@ impl AppState {
         card_index
     }
 
-    fn sync_display_subscriptions(&mut self) {
-        let desired = self
-            .display_tabs
+    fn desired_display_subscriptions(&self) -> BTreeSet<String> {
+        self.display_tabs
             .iter()
             .filter_map(|tab| match (&tab.target, tab.follow) {
                 (DisplayTarget::Output { id, .. }, true) => Some(id.clone()),
                 _ => None,
             })
-            .collect::<BTreeSet<_>>();
-        let current = self
-            .display_subscriptions
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-
-        for id in desired.difference(&current) {
-            let _ = self.enqueue_silent_request(
-                RequestPayload::Subscribe {
-                    channels: vec![format!("output:{id}")],
-                },
-                "output subscribe",
-            );
-        }
-        for id in current.difference(&desired) {
-            let _ = self.enqueue_silent_request(
-                RequestPayload::Unsubscribe {
-                    channels: vec![format!("output:{id}")],
-                },
-                "output unsubscribe",
-            );
-        }
-
-        self.display_subscriptions = desired.into_iter().collect();
+            .collect()
     }
 
-    fn restore_display_subscriptions(&mut self) {
-        for id in self.display_subscriptions.clone() {
-            let _ = self.enqueue_silent_request(
-                RequestPayload::Subscribe {
-                    channels: vec![format!("output:{id}")],
-                },
-                "output resubscribe",
-            );
+    fn current_display_subscriptions(&self) -> BTreeSet<String> {
+        self.display_subscriptions.iter().cloned().collect()
+    }
+
+    fn pending_display_subscription_requests(&self) -> (BTreeSet<String>, BTreeSet<String>) {
+        let mut subscribes = BTreeSet::new();
+        let mut unsubscribes = BTreeSet::new();
+        for pending in self.pending_submissions.values() {
+            match &pending.kind {
+                PendingSubmissionKind::DisplaySubscribe { id } => {
+                    subscribes.insert(id.clone());
+                }
+                PendingSubmissionKind::DisplayUnsubscribe { id } => {
+                    unsubscribes.insert(id.clone());
+                }
+                PendingSubmissionKind::User | PendingSubmissionKind::Silent { .. } => {}
+            }
+        }
+        (subscribes, unsubscribes)
+    }
+
+    fn set_display_subscriptions(&mut self, subscriptions: BTreeSet<String>) {
+        self.display_subscriptions = subscriptions.into_iter().collect();
+    }
+
+    fn confirm_display_subscribe(&mut self, id: &str) {
+        let mut current = self.current_display_subscriptions();
+        current.insert(id.to_string());
+        self.set_display_subscriptions(current);
+    }
+
+    fn confirm_display_unsubscribe(&mut self, id: &str) {
+        let mut current = self.current_display_subscriptions();
+        current.remove(id);
+        self.set_display_subscriptions(current);
+    }
+
+    fn handle_pending_ack(&mut self, pending: &PendingSubmission) {
+        match &pending.kind {
+            PendingSubmissionKind::DisplaySubscribe { id } => {
+                self.confirm_display_subscribe(id);
+                self.sync_display_subscriptions();
+            }
+            PendingSubmissionKind::DisplayUnsubscribe { id } => {
+                self.confirm_display_unsubscribe(id);
+                self.sync_display_subscriptions();
+            }
+            PendingSubmissionKind::User | PendingSubmissionKind::Silent { .. } => {}
+        }
+    }
+
+    fn disable_display_follow(&mut self, id: &str) {
+        let mut changed = false;
+        for tab in &mut self.display_tabs {
+            if tab.follow
+                && matches!(
+                    &tab.target,
+                    DisplayTarget::Output {
+                        id: existing_id,
+                        ..
+                    } if existing_id == id
+                )
+            {
+                tab.follow = false;
+                changed = true;
+            }
+        }
+        if changed {
+            self.sync_display_subscriptions();
+        }
+    }
+
+    fn handle_pending_error(&mut self, pending: &PendingSubmission, code: &str, message: &str) {
+        match &pending.kind {
+            PendingSubmissionKind::Silent { description } => {
+                tracing::warn!(
+                    request = %description,
+                    code = %code,
+                    message = %message,
+                    "silent request failed"
+                );
+            }
+            PendingSubmissionKind::DisplaySubscribe { id } => {
+                tracing::warn!(
+                    job_id = %id,
+                    code = %code,
+                    message = %message,
+                    "output subscription failed"
+                );
+                self.disable_display_follow(id);
+            }
+            PendingSubmissionKind::DisplayUnsubscribe { id } => {
+                tracing::warn!(
+                    job_id = %id,
+                    code = %code,
+                    message = %message,
+                    "output unsubscription failed"
+                );
+            }
+            PendingSubmissionKind::User => {}
+        }
+    }
+
+    fn sync_display_subscriptions(&mut self) {
+        let desired = self.desired_display_subscriptions();
+        let current = self.current_display_subscriptions();
+        let (pending_subscribes, pending_unsubscribes) =
+            self.pending_display_subscription_requests();
+
+        for id in desired.difference(&current).cloned().collect::<Vec<_>>() {
+            if pending_subscribes.contains(&id) {
+                continue;
+            }
+            let Some(channel) = output_channel_for_job_id(&id) else {
+                self.disable_display_follow(&id);
+                continue;
+            };
+            if self.enqueue_silent_request(
+                RequestPayload::subscribe(&[channel]),
+                "output subscribe",
+                PendingSubmission::display_subscribe(id.clone()),
+            ) {
+                tracing::debug!(job_id = %id, "queued output subscription");
+            }
+        }
+        for id in current.difference(&desired).cloned().collect::<Vec<_>>() {
+            if pending_unsubscribes.contains(&id) {
+                continue;
+            }
+            let Some(channel) = output_channel_for_job_id(&id) else {
+                continue;
+            };
+            if self.enqueue_silent_request(
+                RequestPayload::unsubscribe(&[channel]),
+                "output unsubscribe",
+                PendingSubmission::display_unsubscribe(id.clone()),
+            ) {
+                tracing::debug!(job_id = %id, "queued output unsubscription");
+            }
         }
     }
 
@@ -934,17 +1081,9 @@ impl AppState {
     }
 
     fn clear_display_pane(&mut self) {
-        let subscribed = std::mem::take(&mut self.display_subscriptions);
-        for id in subscribed {
-            let _ = self.enqueue_silent_request(
-                RequestPayload::Unsubscribe {
-                    channels: vec![format!("output:{id}")],
-                },
-                "output unsubscribe",
-            );
-        }
         self.display_tabs.clear();
         self.active_display_tab = None;
+        self.sync_display_subscriptions();
         self.close_target_settings();
     }
 
@@ -1352,13 +1491,18 @@ impl AppState {
         self.update(AppMsg::Submit(format!(":kill {target_id}")));
     }
 
-    fn enqueue_silent_request(&mut self, payload: RequestPayload, description: &str) -> bool {
+    fn enqueue_silent_request(
+        &mut self,
+        payload: RequestPayload,
+        description: &str,
+        pending: PendingSubmission,
+    ) -> bool {
         let Some(writer) = &self.writer else {
             return false;
         };
         match writer.try_send(payload) {
             Ok(request_id) => {
-                self.track_pending_submission(request_id, PendingSubmission::silent());
+                self.track_pending_submission(request_id, pending);
                 true
             }
             Err(error) => {
@@ -1370,10 +1514,13 @@ impl AppState {
 
     fn subscribe_core_channels(&mut self) {
         let _ = self.enqueue_silent_request(
-            RequestPayload::Subscribe {
-                channels: vec!["jobs".into(), "crons".into(), "system".into()],
-            },
+            RequestPayload::subscribe(&[
+                EventChannel::Jobs,
+                EventChannel::Crons,
+                EventChannel::System,
+            ]),
             "core subscriptions",
+            PendingSubmission::silent_request("core subscriptions"),
         );
     }
 
@@ -1385,6 +1532,7 @@ impl AppState {
                     mode,
                 },
                 input,
+                PendingSubmission::silent_request(input),
             ) {
                 break;
             }
@@ -1398,6 +1546,7 @@ impl AppState {
                 mode: Mode::Cron,
             },
             ":crons",
+            PendingSubmission::silent_request(":crons"),
         );
     }
 
@@ -1474,20 +1623,22 @@ impl AppState {
     }
 
     fn send_fg_detach(&self) {
-        if let Some(writer) = &self.writer {
-            writer.send(RequestPayload::FgDetach {});
-        }
+        self.send_foreground_request(RequestPayload::FgDetach {}, "foreground detach");
     }
 
     fn send_fg_input(&self, data: Vec<u8>) {
-        if let Some(writer) = &self.writer {
-            writer.send(RequestPayload::FgInput { data });
-        }
+        self.send_foreground_request(RequestPayload::FgInput { data }, "foreground input");
     }
 
     fn send_fg_resize(&self, cols: u16, rows: u16) {
-        if let Some(writer) = &self.writer {
-            writer.send(RequestPayload::FgResize { cols, rows });
+        self.send_foreground_request(RequestPayload::FgResize { cols, rows }, "foreground resize");
+    }
+
+    fn send_foreground_request(&self, payload: RequestPayload, description: &str) {
+        if let Some(writer) = &self.writer
+            && let Err(error) = writer.send(payload)
+        {
+            tracing::warn!("failed to send {description}: {error}");
         }
     }
 
@@ -1503,7 +1654,7 @@ impl AppState {
     fn fail_pending_submissions(&mut self, message: &str) {
         let pending = std::mem::take(&mut self.pending_submissions);
         for (_, pending) in pending {
-            if pending.silent {
+            if !pending.is_user_visible() {
                 continue;
             }
             self.show_submission_result(&pending, message.to_string(), CardStatus::Error, None);
@@ -1987,7 +2138,7 @@ impl AppState {
                 self.sync_mode_views();
                 self.subscribe_core_channels();
                 self.request_sidebar_snapshots();
-                self.restore_display_subscriptions();
+                self.sync_display_subscriptions();
                 self.refresh_clear_action();
             }
 
@@ -1996,6 +2147,7 @@ impl AppState {
                 self.fg_session = None;
                 self.connected = false;
                 self.writer = None;
+                self.display_subscriptions.clear();
                 self.close_job_picker();
                 self.status_bar.update(StatusBarMsg::SetConnected(false));
             }
@@ -2003,6 +2155,7 @@ impl AppState {
             AppMsg::ReconnectFailed { message } => {
                 self.connected = false;
                 self.writer = None;
+                self.display_subscriptions.clear();
                 self.status_bar.update(StatusBarMsg::SetConnected(false));
                 if let Some(state) = self.target_settings.as_mut() {
                     state.notice = Some(match self.pending_reconnect_profile_name.as_deref() {
@@ -2021,7 +2174,7 @@ impl AppState {
                 self.sync_mode_views();
                 self.subscribe_core_channels();
                 self.request_sidebar_snapshots();
-                self.restore_display_subscriptions();
+                self.sync_display_subscriptions();
                 self.refresh_clear_action();
                 // If this reconnect was triggered by a live target switch, apply
                 // the new profile name and show confirmation.
@@ -2040,15 +2193,16 @@ impl AppState {
                 match payload {
                     ResponsePayload::Ok(ok) => match ok {
                         OkPayload::Ack {} => {
-                            if let Some(pending) = pending.as_ref()
-                                && !pending.silent
-                            {
-                                self.show_submission_result(
-                                    pending,
-                                    format_ack_message(&pending.input),
-                                    CardStatus::Success,
-                                    None,
-                                );
+                            if let Some(pending) = pending.as_ref() {
+                                self.handle_pending_ack(pending);
+                                if pending.is_user_visible() {
+                                    self.show_submission_result(
+                                        pending,
+                                        format_ack_message(&pending.input),
+                                        CardStatus::Success,
+                                        None,
+                                    );
+                                }
                             }
                         }
                         OkPayload::ScriptCreated {
@@ -2107,7 +2261,7 @@ impl AppState {
                                 self.sync_sidebar_items();
                             }
                             if let Some(pending) = pending.as_ref()
-                                && !pending.silent
+                                && pending.is_user_visible()
                             {
                                 let card_index = self.show_submission_result(
                                     pending,
@@ -2147,7 +2301,7 @@ impl AppState {
                             );
                             self.sync_sidebar_items();
                             if let Some(pending) = pending.as_ref()
-                                && !pending.silent
+                                && pending.is_user_visible()
                             {
                                 let card_index = if let Some(card_index) = pending.card_index {
                                     self.main_view.set_card_label(card_index, job_id.clone());
@@ -2170,7 +2324,7 @@ impl AppState {
                             warnings,
                         } => {
                             if let Some(pending) = pending.as_ref()
-                                && !pending.silent
+                                && pending.is_user_visible()
                             {
                                 let body = decorate_submission_output(
                                     &warnings,
@@ -2179,7 +2333,7 @@ impl AppState {
                                 let card_index = self.show_submission_result(
                                     pending,
                                     body,
-                                    CardStatus::Success,
+                                    card_status_for_chain(&chain),
                                     Some(chain_id.clone()),
                                 );
                                 // Register chain → card mapping and annotate the card.
@@ -2194,7 +2348,7 @@ impl AppState {
                         }
                         OkPayload::FgAttached { id } => {
                             let card_index = if let Some(pending) = pending.as_ref()
-                                && !pending.silent
+                                && pending.is_user_visible()
                             {
                                 Some(self.show_submission_result(
                                     pending,
@@ -2217,7 +2371,7 @@ impl AppState {
                             self.upsert_cron(cron_id.clone(), label, CronStatus::Scheduled);
                             self.sync_sidebar_items();
                             if let Some(pending) = pending.as_ref()
-                                && !pending.silent
+                                && pending.is_user_visible()
                             {
                                 self.show_submission_result(
                                     pending,
@@ -2227,9 +2381,9 @@ impl AppState {
                                 );
                             }
                         }
-                        OkPayload::ScopeCreated { hash, summary, .. } => {
+                        OkPayload::ScopeCreated { hash, summary } => {
                             if let Some(pending) = pending.as_ref()
-                                && !pending.silent
+                                && pending.is_user_visible()
                             {
                                 self.show_submission_result(
                                     pending,
@@ -2244,7 +2398,7 @@ impl AppState {
                             self.replace_jobs(list);
                             self.sync_sidebar_items();
                             if let Some(pending) = pending.as_ref()
-                                && !pending.silent
+                                && pending.is_user_visible()
                             {
                                 self.show_submission_result(
                                     pending,
@@ -2259,7 +2413,7 @@ impl AppState {
                             self.replace_crons(list);
                             self.sync_sidebar_items();
                             if let Some(pending) = pending.as_ref()
-                                && !pending.silent
+                                && pending.is_user_visible()
                             {
                                 self.show_submission_result(
                                     pending,
@@ -2271,7 +2425,7 @@ impl AppState {
                         }
                         OkPayload::EvalText { text } => {
                             if let Some(pending) = pending.as_ref()
-                                && !pending.silent
+                                && pending.is_user_visible()
                             {
                                 self.show_submission_result(
                                     pending,
@@ -2290,7 +2444,7 @@ impl AppState {
                             truncated,
                         } => {
                             if let Some(pending) = pending.as_ref()
-                                && !pending.silent
+                                && pending.is_user_visible()
                             {
                                 let request =
                                     display_request_from_submission(&pending.input, pending.mode)
@@ -2323,7 +2477,7 @@ impl AppState {
                         }
                         _ => {
                             if let Some(pending) = pending.as_ref()
-                                && !pending.silent
+                                && pending.is_user_visible()
                             {
                                 let text = format!("{ok:?}");
                                 self.show_submission_result(
@@ -2336,15 +2490,17 @@ impl AppState {
                         }
                     },
                     ResponsePayload::Err { code, message } => {
-                        if let Some(pending) = pending.as_ref()
-                            && !pending.silent
-                        {
-                            self.show_submission_result(
-                                pending,
-                                format!("Error [{code}]: {message}"),
-                                CardStatus::Error,
-                                None,
-                            );
+                        if let Some(pending) = pending.as_ref() {
+                            if pending.is_user_visible() {
+                                self.show_submission_result(
+                                    pending,
+                                    format!("Error [{code}]: {message}"),
+                                    CardStatus::Error,
+                                    None,
+                                );
+                            } else {
+                                self.handle_pending_error(pending, &code, &message);
+                            }
                         }
                     }
                 }
@@ -2353,6 +2509,17 @@ impl AppState {
             AppMsg::ServerEvent(event) => match event {
                 EventPayload::OutputChunk { id, stream, data } => {
                     self.append_display_output(&id, stream, &data);
+                }
+                EventPayload::OutputChunkBinary { id, stream, base64 } => {
+                    match BASE64_STANDARD.decode(base64.as_bytes()) {
+                        Ok(bytes) => {
+                            let data = String::from_utf8_lossy(&bytes);
+                            self.append_display_output(&id, stream, &data);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%id, "invalid binary output chunk: {error}");
+                        }
+                    }
                 }
                 EventPayload::OutputEof { .. } => {}
                 EventPayload::JobCreated {
@@ -2402,23 +2569,10 @@ impl AppState {
                     self.cron_job_cards.remove(&job_id);
                     self.sync_sidebar_items();
                 }
-                EventPayload::ChainStarted { chain } => {
-                    if let Some(&card_index) = self.chain_cards.get(&chain.id) {
-                        let running_step = chain
-                            .jobs
-                            .iter()
-                            .position(|j| j.status == cue_core::job::JobStatus::Running)
-                            .unwrap_or(0);
-                        if chain.total_jobs > 1 {
-                            self.main_view.update(MainViewMsg::SetCardChainLabel {
-                                index: card_index,
-                                label: chain_step_label(&chain.id, running_step, chain.total_jobs),
-                            });
-                        }
-                    }
-                }
                 EventPayload::ChainProgress { chain } => {
                     if let Some(&card_index) = self.chain_cards.get(&chain.id) {
+                        self.main_view
+                            .set_card_status(card_index, card_status_for_chain(&chain));
                         let running_step = chain
                             .jobs
                             .iter()
@@ -2438,16 +2592,6 @@ impl AppState {
                                 label: chain_step_label(&chain.id, running_step, chain.total_jobs),
                             });
                         }
-                    }
-                }
-                EventPayload::ChainFinished { chain_id, success } => {
-                    if let Some(&card_index) = self.chain_cards.get(&chain_id) {
-                        let status = if success {
-                            CardStatus::Success
-                        } else {
-                            CardStatus::Error
-                        };
-                        self.main_view.set_card_status(card_index, status);
                     }
                 }
                 EventPayload::ScriptFinished {
@@ -2818,6 +2962,16 @@ fn normalize_command_label(input: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+fn output_channel_for_job_id(id: &str) -> Option<EventChannel> {
+    match id.parse::<JobId>() {
+        Ok(job_id) => Some(EventChannel::Output(job_id)),
+        Err(error) => {
+            tracing::warn!(job_id = %id, "invalid output subscription target: {error}");
+            None
+        }
+    }
 }
 
 fn summarize_script_source(source: &str) -> String {
@@ -3374,6 +3528,31 @@ fn card_status_for_job(status: &JobStatus) -> CardStatus {
     }
 }
 
+fn card_status_for_chain(chain: &ChainInfo) -> CardStatus {
+    if chain.jobs.iter().any(|job| {
+        matches!(
+            job.status,
+            JobStatus::Failed | JobStatus::Killed | JobStatus::Cancelled(_)
+        )
+    }) {
+        return CardStatus::Error;
+    }
+    if chain
+        .jobs
+        .iter()
+        .any(|job| job.status == JobStatus::Running)
+    {
+        return CardStatus::Streaming;
+    }
+    if chain.total_jobs > 0
+        && chain.jobs.len() == chain.total_jobs
+        && chain.jobs.iter().all(|job| job.status == JobStatus::Done)
+    {
+        return CardStatus::Success;
+    }
+    CardStatus::Pending
+}
+
 fn builtin_command_candidates(word: &str) -> Vec<String> {
     let prefix = word.strip_prefix(':').unwrap_or(word);
     command_names()
@@ -3628,6 +3807,7 @@ fn cron_status_icon(status: CronStatus) -> &'static str {
         CronStatus::Paused => "⏸",
         CronStatus::Completed => "✅",
         CronStatus::Expired => "⌛",
+        CronStatus::Failed => "✖",
     }
 }
 
@@ -3645,6 +3825,7 @@ fn format_cron_status(status: CronStatus) -> &'static str {
         CronStatus::Paused => "paused",
         CronStatus::Completed => "completed",
         CronStatus::Expired => "expired",
+        CronStatus::Failed => "failed",
     }
 }
 
@@ -3664,6 +3845,71 @@ mod tests {
 
     fn queue_pending(state: &mut AppState, id: u32, pending: PendingSubmission) {
         state.track_pending_submission(id, pending);
+    }
+
+    fn attach_test_writer(state: &mut AppState) -> tokio::io::DuplexStream {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let client = crate::client::CuedClient::from_stream(client_stream);
+        let (_reader, writer) = client.into_split();
+        state.writer = Some(crate::client::spawn_writer_task(writer));
+        state.connected = true;
+        server_stream
+    }
+
+    fn pending_display_subscribe_id(state: &AppState, expected_job_id: &str) -> u32 {
+        state
+            .pending_submissions
+            .iter()
+            .find_map(|(request_id, pending)| match &pending.kind {
+                PendingSubmissionKind::DisplaySubscribe { id } if id == expected_job_id => {
+                    Some(*request_id)
+                }
+                _ => None,
+            })
+            .expect("pending display subscribe request")
+    }
+
+    fn pending_display_unsubscribe_id(state: &AppState, expected_job_id: &str) -> u32 {
+        state
+            .pending_submissions
+            .iter()
+            .find_map(|(request_id, pending)| match &pending.kind {
+                PendingSubmissionKind::DisplayUnsubscribe { id } if id == expected_job_id => {
+                    Some(*request_id)
+                }
+                _ => None,
+            })
+            .expect("pending display unsubscribe request")
+    }
+
+    #[test]
+    fn output_subscription_channel_requires_job_id() {
+        assert_eq!(
+            output_channel_for_job_id("J7"),
+            Some(EventChannel::Output(JobId(7)))
+        );
+        assert!(output_channel_for_job_id("C7").is_none());
+    }
+
+    fn chain_info(id: &str, statuses: Vec<JobStatus>) -> ChainInfo {
+        ChainInfo {
+            id: id.into(),
+            pipeline: "build -> test".into(),
+            total_jobs: statuses.len(),
+            jobs: statuses
+                .into_iter()
+                .enumerate()
+                .map(|(index, status)| cue_core::ipc::ChainJobInfo {
+                    index,
+                    pipeline: format!("step {index}"),
+                    status,
+                    job_id: Some(format!("J{}", index + 1)),
+                    start_scope: None,
+                    end_scope: None,
+                    open_hint: Some(JobOpenHint::Stream),
+                })
+                .collect(),
+        }
     }
 
     #[test]
@@ -3964,7 +4210,6 @@ mod tests {
             id: 1,
             payload: ResponsePayload::Ok(OkPayload::ScopeCreated {
                 hash: "S@abc12345".into(),
-                label: Some("cd /tmp".into()),
                 summary: "S@abc12345\ncwd: /old -> /tmp".into(),
             }),
         });
@@ -3991,13 +4236,172 @@ mod tests {
             stream: cue_core::ipc::Stream::Stdout,
             data: "world\n".into(),
         }));
+        state.update(AppMsg::ServerEvent(EventPayload::OutputChunkBinary {
+            id: "J1".into(),
+            stream: cue_core::ipc::Stream::Stdout,
+            base64: BASE64_STANDARD.encode([0xff, b'b', b'i', b'n', b'\n']),
+        }));
         state.update(AppMsg::ServerEvent(EventPayload::OutputChunk {
             id: "J2".into(),
             stream: cue_core::ipc::Stream::Stdout,
             data: "ignored\n".into(),
         }));
 
-        assert_eq!(state.display_pane_content(), "hello\nworld\n");
+        assert_eq!(
+            state.display_pane_content(),
+            format!("hello\nworld\n{}", String::from_utf8_lossy(b"\xffbin\n"))
+        );
+    }
+
+    #[test]
+    fn failed_follow_subscription_is_not_marked_active() {
+        let mut state = AppState::new();
+        state.show_output_display(
+            "J1".into(),
+            DisplayStream::Stdout,
+            "hello\n".into(),
+            false,
+            true,
+        );
+
+        assert!(state.display_subscriptions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn follow_subscription_becomes_active_only_after_ack() {
+        let mut state = AppState::new();
+        let _server_stream = attach_test_writer(&mut state);
+
+        state.show_output_display(
+            "J1".into(),
+            DisplayStream::Stdout,
+            "hello\n".into(),
+            false,
+            true,
+        );
+
+        let request_id = pending_display_subscribe_id(&state, "J1");
+        assert!(state.display_subscriptions.is_empty());
+
+        state.update(AppMsg::Response {
+            id: request_id,
+            payload: ResponsePayload::Ok(OkPayload::Ack {}),
+        });
+
+        assert_eq!(state.display_subscriptions, vec!["J1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn failed_follow_subscription_response_is_not_marked_active() {
+        let mut state = AppState::new();
+        let _server_stream = attach_test_writer(&mut state);
+
+        state.show_output_display(
+            "J1".into(),
+            DisplayStream::Stdout,
+            "hello\n".into(),
+            false,
+            true,
+        );
+
+        let request_id = pending_display_subscribe_id(&state, "J1");
+        state.update(AppMsg::Response {
+            id: request_id,
+            payload: ResponsePayload::Err {
+                code: "event_bus".into(),
+                message: "subscribe failed".into(),
+            },
+        });
+
+        assert!(state.display_subscriptions.is_empty());
+        assert_eq!(
+            state.display_tab_labels(),
+            vec![" stdout J1  × ".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_retries_follow_subscription_after_offline_open() {
+        let mut state = AppState::new();
+        state.show_output_display(
+            "J1".into(),
+            DisplayStream::Stdout,
+            "hello\n".into(),
+            false,
+            true,
+        );
+        assert!(state.display_subscriptions.is_empty());
+
+        let (client_stream, _server_stream) = tokio::io::duplex(4096);
+        let client = crate::client::CuedClient::from_stream(client_stream);
+        let (_reader, writer) = client.into_split();
+        state.update(AppMsg::Reconnected {
+            writer: crate::client::spawn_writer_task(writer),
+        });
+
+        let request_id = pending_display_subscribe_id(&state, "J1");
+        assert!(state.display_subscriptions.is_empty());
+        state.update(AppMsg::Response {
+            id: request_id,
+            payload: ResponsePayload::Ok(OkPayload::Ack {}),
+        });
+
+        assert_eq!(state.display_subscriptions, vec!["J1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn disconnect_clears_active_follow_subscriptions() {
+        let mut state = AppState::new();
+        let _server_stream = attach_test_writer(&mut state);
+
+        state.show_output_display(
+            "J1".into(),
+            DisplayStream::Stdout,
+            "hello\n".into(),
+            false,
+            true,
+        );
+        let request_id = pending_display_subscribe_id(&state, "J1");
+        state.update(AppMsg::Response {
+            id: request_id,
+            payload: ResponsePayload::Ok(OkPayload::Ack {}),
+        });
+        assert_eq!(state.display_subscriptions, vec!["J1".to_string()]);
+
+        state.update(AppMsg::Disconnected);
+
+        assert!(state.display_subscriptions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_follow_tab_keeps_subscription_active_until_unsubscribe_ack() {
+        let mut state = AppState::new();
+        let _server_stream = attach_test_writer(&mut state);
+
+        state.show_output_display(
+            "J1".into(),
+            DisplayStream::Stdout,
+            "hello\n".into(),
+            false,
+            true,
+        );
+        let subscribe_id = pending_display_subscribe_id(&state, "J1");
+        state.update(AppMsg::Response {
+            id: subscribe_id,
+            payload: ResponsePayload::Ok(OkPayload::Ack {}),
+        });
+
+        state.close_display_tab(0);
+
+        let unsubscribe_id = pending_display_unsubscribe_id(&state, "J1");
+        assert_eq!(state.display_subscriptions, vec!["J1".to_string()]);
+
+        state.update(AppMsg::Response {
+            id: unsubscribe_id,
+            payload: ResponsePayload::Ok(OkPayload::Ack {}),
+        });
+
+        assert!(state.display_subscriptions.is_empty());
     }
 
     #[test]
@@ -5038,10 +5442,10 @@ destination = "devbox"
         state.update(AppMsg::Response {
             id: 1,
             payload: ResponsePayload::Ok(OkPayload::ChainCreated {
-                chain_id: "C1".into(),
+                chain_id: "CH1".into(),
                 job_ids: vec!["J1".into()],
                 chain: cue_core::ipc::ChainInfo {
-                    id: "C1".into(),
+                    id: "CH1".into(),
                     pipeline: "sleep 4 -> ls".into(),
                     total_jobs: 1,
                     jobs: vec![],
@@ -5052,7 +5456,43 @@ destination = "devbox"
 
         assert_eq!(state.jobs[0].label, "sleep 4");
         assert_eq!(state.jobs[0].start_scope.as_deref(), Some("S@abc12345"));
-        assert_eq!(state.main_view.cards.last().unwrap().output, "C1: J1");
+        assert_eq!(state.main_view.cards.last().unwrap().output, "CH1: J1");
+    }
+
+    #[test]
+    fn chain_card_status_follows_chain_progress_snapshot() {
+        let mut state = AppState::new();
+        let card_index = state.main_view.push_card("build -> test".into(), Mode::Job);
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(
+                Some(card_index),
+                "build -> test".into(),
+                Mode::Job,
+                Vec::new(),
+            ),
+        );
+
+        state.update(AppMsg::Response {
+            id: 1,
+            payload: ResponsePayload::Ok(OkPayload::ChainCreated {
+                chain_id: "CH1".into(),
+                job_ids: vec!["J1".into()],
+                chain: chain_info("CH1", vec![JobStatus::Running, JobStatus::Pending]),
+                warnings: Vec::new(),
+            }),
+        });
+
+        let card = state.main_view.cards.last().unwrap();
+        assert_eq!(card.status, CardStatus::Streaming);
+
+        state.update(AppMsg::ServerEvent(EventPayload::ChainProgress {
+            chain: chain_info("CH1", vec![JobStatus::Failed, JobStatus::Pending]),
+        }));
+
+        let card = state.main_view.cards.last().unwrap();
+        assert_eq!(card.status, CardStatus::Error);
     }
 
     #[test]

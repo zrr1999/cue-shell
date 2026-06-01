@@ -1,13 +1,10 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 /// A typed parameter value used in mode params `()`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ParamValue {
-    Int(i64),
-    Duration(Duration),
     Str(String),
     Bool(bool),
 }
@@ -54,8 +51,8 @@ impl ModeParams {
         }
     }
 
-    /// Whether `:run` may apply scope-transform leaves (`cd`, `env set`) to
-    /// the chain scope. Defaults to false when unspecified.
+    /// Whether the submitted chain may apply scope-transform leaves (`cd`,
+    /// `env set`) to its chain scope. Defaults to false when unspecified.
     pub fn scope(&self) -> Option<bool> {
         match self.get("scope") {
             Some(ParamValue::Bool(b)) => Some(*b),

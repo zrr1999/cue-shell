@@ -117,8 +117,9 @@ cue run examples/hello.cue
 A script run gets an id such as `R12`. Top-level items run in file order with
 fail-fast semantics: if one item exits non-zero, later items are not submitted
 and `cue run` exits with that code. Output still belongs canonically to jobs,
-while `cue run` subscribes to live output and mirrors stdout/stderr to the
-calling terminal.
+while the daemon delivers script job output and terminal script status directly
+to the `cue run` process so stdout/stderr and the final exit code do not depend
+on event-channel subscriptions.
 
 Interactive JOB multiline input is not a script entry point; put multi-item
 workflows in a `.cue` file. See [`docs/design/cue-script.md`](docs/design/cue-script.md)

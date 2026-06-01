@@ -50,7 +50,7 @@ pub struct Card {
     pub status: CardStatus,
     /// Optional short ID label (e.g. "J1").
     pub label: Option<String>,
-    /// Optional chain step label (e.g. "chain:C1/1/3").
+    /// Optional chain step label (e.g. "chain:CH1/1/3").
     pub chain_label: Option<String>,
 }
 
@@ -325,7 +325,7 @@ impl Component for MainView {
     }
 }
 
-/// Format a chain step label string, e.g. `chain:C1/1/3`.
+/// Format a chain step label string, e.g. `chain:CH1/1/3`.
 pub fn chain_step_label(chain_id: &str, step_index: usize, total: usize) -> String {
     format!("chain:{}/{}/{}", chain_id, step_index + 1, total)
 }
@@ -387,17 +387,17 @@ mod tests {
 
     #[test]
     fn chain_step_label_format() {
-        assert_eq!(chain_step_label("C1", 0, 3), "chain:C1/1/3");
-        assert_eq!(chain_step_label("C2", 2, 3), "chain:C2/3/3");
-        assert_eq!(chain_step_label("C10", 0, 1), "chain:C10/1/1");
+        assert_eq!(chain_step_label("CH1", 0, 3), "chain:CH1/1/3");
+        assert_eq!(chain_step_label("CH2", 2, 3), "chain:CH2/3/3");
+        assert_eq!(chain_step_label("CH10", 0, 1), "chain:CH10/1/1");
     }
 
     #[test]
     fn card_chain_label_field() {
         let mut card = Card::new("sleep 1 -> echo done".into(), Mode::Job);
         assert!(card.chain_label.is_none());
-        card.chain_label = Some(chain_step_label("C1", 0, 2));
-        assert_eq!(card.chain_label.as_deref(), Some("chain:C1/1/2"));
+        card.chain_label = Some(chain_step_label("CH1", 0, 2));
+        assert_eq!(card.chain_label.as_deref(), Some("chain:CH1/1/2"));
     }
 
     #[test]
@@ -406,8 +406,11 @@ mod tests {
         let idx = view.push_card("cmd1 -> cmd2".into(), Mode::Job);
         view.update(MainViewMsg::SetCardChainLabel {
             index: idx,
-            label: "chain:C1/1/2".into(),
+            label: "chain:CH1/1/2".into(),
         });
-        assert_eq!(view.cards[idx].chain_label.as_deref(), Some("chain:C1/1/2"));
+        assert_eq!(
+            view.cards[idx].chain_label.as_deref(),
+            Some("chain:CH1/1/2")
+        );
     }
 }

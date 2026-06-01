@@ -8,6 +8,7 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 
 use crate::cron::CronStatus;
+use crate::event_channel::EventChannel;
 use crate::job::JobStatus;
 use crate::mode::Mode;
 
@@ -108,6 +109,24 @@ pub enum RequestPayload {
     Shutdown {},
 }
 
+impl RequestPayload {
+    pub fn subscribe(channels: &[EventChannel]) -> Self {
+        Self::Subscribe {
+            channels: event_channel_names(channels),
+        }
+    }
+
+    pub fn unsubscribe(channels: &[EventChannel]) -> Self {
+        Self::Unsubscribe {
+            channels: event_channel_names(channels),
+        }
+    }
+}
+
+fn event_channel_names(channels: &[EventChannel]) -> Vec<String> {
+    channels.iter().map(ToString::to_string).collect()
+}
+
 // ── Responses (cued → Client) ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,12 +144,6 @@ pub enum OkPayload {
         source: ScriptSource,
         items: Vec<ScriptItemInfo>,
         submit_error: Option<ScriptSubmitError>,
-    },
-    ScriptFinished {
-        script_id: String,
-        status: ScriptRunStatus,
-        exit_code: i32,
-        failed_item_index: Option<usize>,
     },
     JobCreated {
         job_id: String,
@@ -154,7 +167,6 @@ pub enum OkPayload {
     },
     ScopeCreated {
         hash: String,
-        label: Option<String>,
         summary: String,
     },
 
@@ -238,19 +250,14 @@ pub enum EventPayload {
         chain_index: Option<usize>,
         chain_total: Option<usize>,
     },
-    ChainStarted {
-        chain: ChainInfo,
-    },
     ChainProgress {
         chain: ChainInfo,
-    },
-    ChainFinished {
-        chain_id: String,
-        success: bool,
     },
     ScriptFinished {
         script_id: String,
         status: ScriptRunStatus,
+        /// Numeric process exit code, or `job::EXIT_CODE_UNAVAILABLE` when no
+        /// process-provided status exists.
         exit_code: i32,
         failed_item_index: Option<usize>,
     },
@@ -283,10 +290,6 @@ pub enum EventPayload {
     },
 
     // Scopes channel
-    ScopeCreated {
-        hash: String,
-        label: Option<String>,
-    },
     HeadChanged {
         old_hash: String,
         new_hash: String,
@@ -306,7 +309,6 @@ pub enum EventPayload {
     ShuttingDown {
         reason: String,
     },
-    DaemonReady {},
 }
 
 /// Output stream type.
@@ -492,6 +494,7 @@ pub enum HighlightKind {
 /// Standard IPC error codes.
 pub mod error_code {
     pub const NOT_FOUND: &str = "NOT_FOUND";
+    pub const INVALID_REQUEST: &str = "INVALID_REQUEST";
     pub const INVALID_STATE: &str = "INVALID_STATE";
     pub const INVALID_SCOPE: &str = "INVALID_SCOPE";
     pub const INVALID_SYNTAX: &str = "INVALID_SYNTAX";
@@ -590,6 +593,30 @@ mod tests {
             assert_eq!(mode, Mode::Job);
         } else {
             panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn subscription_request_constructors_use_event_channel_wire_names() {
+        let subscribe = RequestPayload::subscribe(&[
+            EventChannel::Jobs,
+            EventChannel::Crons,
+            EventChannel::Output(crate::JobId(7)),
+        ]);
+        match subscribe {
+            RequestPayload::Subscribe { channels } => {
+                assert_eq!(channels, vec!["jobs", "crons", "output:J7"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let unsubscribe =
+            RequestPayload::unsubscribe(&[EventChannel::Scopes, EventChannel::System]);
+        match unsubscribe {
+            RequestPayload::Unsubscribe { channels } => {
+                assert_eq!(channels, vec!["scopes", "system"]);
+            }
+            _ => panic!("wrong variant"),
         }
     }
 
@@ -750,6 +777,46 @@ mod tests {
                 assert_eq!(status, ScriptRunStatus::Failed);
                 assert_eq!(exit_code, 2);
                 assert_eq!(failed_item_index, Some(1));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn scope_created_payload_has_no_label_field() {
+        let payload = ResponsePayload::Ok(OkPayload::ScopeCreated {
+            hash: "S@abc12345".into(),
+            summary: "S@abc12345\ncwd: /old -> /tmp".into(),
+        });
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("label"));
+
+        let decoded: ResponsePayload = serde_json::from_str(&json).unwrap();
+        match decoded {
+            ResponsePayload::Ok(OkPayload::ScopeCreated { hash, summary }) => {
+                assert_eq!(hash, "S@abc12345");
+                assert!(summary.contains("cwd: /old -> /tmp"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn scope_events_roundtrip_as_head_changes() {
+        let msg = Message::Event {
+            payload: EventPayload::HeadChanged {
+                old_hash: "S@old00000".into(),
+                new_hash: "S@new00000".into(),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: Message = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Message::Event {
+                payload: EventPayload::HeadChanged { old_hash, new_hash },
+            } => {
+                assert_eq!(old_hash, "S@old00000");
+                assert_eq!(new_hash, "S@new00000");
             }
             _ => panic!("wrong variant"),
         }
