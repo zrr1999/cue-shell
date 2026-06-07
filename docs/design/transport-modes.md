@@ -653,7 +653,8 @@ pub async fn run_relay(stdin: impl AsyncRead, stdout: impl AsyncWrite, upstream:
 
 4. **Reconnect**: the relay should reconnect to the upstream using the same
    `spawn_connection_manager` infrastructure from `cue-client`. When upstream
-   reconnects, notify all active local clients with a `DaemonReady` event.
+   reconnects, the relay must resubscribe upstream channels and let local
+   clients verify readiness through the normal Ping/response path.
 
 ---
 

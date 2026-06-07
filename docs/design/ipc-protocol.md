@@ -42,7 +42,7 @@ enum Message {
 
 ```json
 // Request: Eval (core job command)
-{"type": "request", "id": 1, "payload": {"Eval": {"input": ":run(retry=3) cargo test", "mode": "Job"}}}
+{"type": "request", "id": 1, "payload": {"Eval": {"input": ":run(pty=false) cargo test", "mode": "Job"}}}
 
 // Response (success — Eval resolved to a serial chain)
 {"type": "response", "id": 1, "payload": {"Ok": {"ChainCreated": {"chain_id": "CH1", "job_ids": ["J1"], "chain": {"id": "CH1", "pipeline": "cargo test -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo test", "status": "Running", "job_id": "J1", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": null, "start_scope": null, "end_scope": null, "open_hint": null}]}}}}}
@@ -50,8 +50,17 @@ enum Message {
 // Response (error)
 {"type": "response", "id": 1, "payload": {"Err": {"code": "INVALID_SYNTAX", "message": "cue chain operator `|?|` must be surrounded by whitespace"}}}
 
-// Response (success — Eval resolved to a multiline script submission)
-{"type": "response", "id": 4, "payload": {"Ok": {"ScriptCreated": {"script_id": "R7", "items": [{"index": 0, "source": "cargo test", "result": {"kind": "job", "job_id": "J9", "start_scope": "S@32b17bec", "open_hint": "Stream"}}, {"index": 1, "source": "cargo fmt -> cargo clippy", "result": {"kind": "chain", "chain_id": "CH5", "job_ids": ["J10", "J11"], "chain": {"id": "CH5", "pipeline": "cargo fmt -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo fmt", "status": "Running", "job_id": "J10", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": "J11", "start_scope": null, "end_scope": null, "open_hint": null}]}}}], "submit_error": null}}}}
+// Request: RunScript (file-script body loaded by cue-cli)
+{"type": "request", "id": 4, "payload": {"RunScript": {"path": "scripts/build.cue", "input": "cargo test\ncargo fmt -> cargo clippy", "mode": "Job"}}}
+
+// Response (success — file script submission created)
+{"type": "response", "id": 4, "payload": {"Ok": {"ScriptCreated": {"script_id": "R7", "source": {"kind": "file", "path": "scripts/build.cue"}, "items": [{"index": 0, "source": "cargo test", "result": {"kind": "job", "job_id": "J9", "start_scope": "S@32b17bec", "open_hint": "Stream"}}, {"index": 1, "source": "cargo fmt -> cargo clippy", "result": {"kind": "chain", "chain_id": "CH5", "job_ids": ["J10", "J11"], "chain": {"id": "CH5", "pipeline": "cargo fmt -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo fmt", "status": "Running", "job_id": "J10", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": "J11", "start_scope": null, "end_scope": null, "open_hint": null}]}}}], "submit_error": null}}}}
+
+// Event (script terminal aggregate status; sent directly to the RunScript requester and published on jobs for other observers)
+{"type": "event", "payload": {"ScriptFinished": {"script_id": "R7", "status": "done", "exit_code": 0, "failed_item_index": null}}}
+
+// Event (output for jobs spawned by RunScript is sent directly to the requesting client and published on output:J<n> for other observers)
+{"type": "event", "payload": {"OutputChunk": {"id": "J9", "stream": "Stdout", "data": "test output\n"}}}
 
 // Request: Subscribe (protocol command)
 {"type": "request", "id": 2, "payload": {"Subscribe": {"channels": ["jobs", "crons", "output:J1"]}}}
@@ -69,6 +78,7 @@ enum Message {
 **Request-Response + Event Stream**, multiplexed on a single connection.
 
 Flow:
+
 1. Client connects to Unix socket
 2. Client sends `Subscribe` request to register interest channels
 3. cued responds with `Ok`
@@ -85,34 +95,54 @@ struct SubscribeRequest {
 ```
 
 Channel types:
+
 - `"jobs"` — all job state changes (created, state transitions, removed)
 - `"crons"` — all cron state changes
 - `"output:<id>"` — stdout/stderr chunks for a specific job (e.g., `"output:J1"`)
 - `"scopes"` — scope creation, HEAD changes
 - `"system"` — cued status, shutdown notices
 
+Channel names are a closed protocol set. `Subscribe` / `Unsubscribe` requests
+with an unknown channel or an `output:<id>` channel whose id is not a Job ID are
+rejected with `INVALID_REQUEST`.
+
 Operations:
+
 - `Subscribe { channels }` — add channels (additive, no duplicates)
 - `Unsubscribe { channels }` — remove channels
 
+The daemon does not add implicit subscriptions; clients must subscribe before
+relying on pushed events from a channel.
 TUI default subscription on connect: `["jobs", "crons", "system"]`
 `:out J1` triggers additional: `Subscribe { channels: ["output:J1"] }`
+`RunScript` is the exception to subscription-only delivery: output from jobs
+spawned by that request and terminal `ScriptFinished` status are also delivered
+directly to the requesting client. Output is published to other `output:J<n>`
+subscribers and terminal status is published to other `jobs` subscribers, so
+`cue run` does not race daemon-side execution against event-channel
+subscriptions or receive duplicate direct-delivery events.
 
 ## 6. Request Types (Client → cued)
 
 ### Design: Eval-centric
 
-All user commands go through a single `Eval` request. cued owns the full parser
-(Tokenizer → Parser → Resolver). Structured requests are only used for
-protocol-level operations that don't correspond to user-typed commands.
+Interactive user commands go through `Eval`. File scripts use the structured
+`RunScript` request so the client can attach source-path metadata while cued
+still owns parsing (Tokenizer → Parser → Resolver). Other structured requests
+are protocol-level operations that don't correspond to user-typed commands.
 
 ```rust
 enum RequestPayload {
     // === User commands (raw string, parsed by cued) ===
     Eval { input: String, mode: Mode },
-    // input: raw user input, e.g. ":run(retry=3) cargo test -> cargo build"
+    // input: raw user input, e.g. ":run(pty=false) cargo test -> cargo build"
     //        or bare input "cargo test" (cued applies mode default)
     // mode: current TUI mode (JOB/CRON) for bare input resolution
+
+    RunScript { path: String, input: String, mode: Mode },
+    // path: user-facing .cue file path, used as script source metadata
+    // input: file contents already loaded by cue-cli
+    // mode: default mode used for bare items inside the file
 
     // === Protocol commands (structured, not user-typed) ===
 
@@ -161,9 +191,10 @@ enum OkPayload {
     Ack {},  // generic success (Subscribe, Kill, FgDetach, etc.)
     ScriptCreated {
         script_id: String,
+        source: ScriptSource,  // Inline or File { path }
         items: Vec<ScriptItemInfo>,
         submit_error: Option<ScriptSubmitError>,
-    },  // one multiline submission; items are ack-ordered during creation but run asynchronously after creation
+    },
     JobCreated {
         job_id: String,
         start_scope: Option<String>,
@@ -174,7 +205,7 @@ enum OkPayload {
     },  // scope snapshot used when the job starts; open_hint tells the TUI whether running jobs should open as :out or :fg
     ChainCreated { chain_id: String, job_ids: Vec<String>, chain: ChainInfo },
     CronAdded { cron_id: String },
-    ScopeCreated { hash: String, label: Option<String>, summary: String },
+    ScopeCreated { hash: String, summary: String },
 
     JobInfo(JobInfo),
     JobList(Vec<JobInfo>),
@@ -196,7 +227,7 @@ enum OkPayload {
     HighlightResult { spans: Vec<HighlightSpan> },
 
     FgAttached { id: String },  // J<n> = live PTY attach
-    Pong {},
+    Pong { version: Option<String> },  // `version` reports cued's build version; `None` from older daemons
 }
 
 struct PageInfo {
@@ -249,6 +280,12 @@ enum EventPayload {
         chain_total: Option<usize>,
     },
     ChainProgress { chain: ChainInfo },
+    ScriptFinished {
+        script_id: String,
+        status: ScriptRunStatus,
+        exit_code: i32,  // `EXIT_CODE_UNAVAILABLE` (-1) when no process exit status exists
+        failed_item_index: Option<usize>,
+    },
     JobRemoved { job_id: String },
 
     // Cron events (channel: "crons")
@@ -263,7 +300,6 @@ enum EventPayload {
     OutputEof { id: String },  // process closed its output
 
     // Scope events (channel: "scopes")
-    ScopeCreated { hash: String, label: Option<String> },
     HeadChanged { old_hash: String, new_hash: String },
 
     // :fg events (no channel — only sent to fg-attached client)
@@ -272,7 +308,6 @@ enum EventPayload {
 
     // System events (channel: "system")
     ShuttingDown { reason: String },
-    DaemonReady {},
 }
 
 struct JobInfo {
@@ -299,6 +334,16 @@ struct ScriptItemInfo {
     index: usize,
     source: String,
     result: ScriptItemResult,
+}
+
+enum ScriptSource {
+    Inline,
+    File { path: String },
+}
+
+enum ScriptRunStatus {
+    Done,
+    Failed,
 }
 
 enum ScriptItemResult {
@@ -352,6 +397,7 @@ Job scope fields are intentionally split:
 ## 9. :fg Full-Duplex Proxy Mode
 
 When client sends `FgAttach { id: "J1" }`:
+
 1. cued responds `FgAttached { id: "J1" }`
 2. Connection enters **fg proxy mode** for this job:
    - Client → cued: `FgInput { data }` messages (raw keystrokes)
@@ -366,16 +412,16 @@ During fg mode, other Request/Response and Event messages continue normally on t
 
 Standard error codes returned in `Err { code, message }`:
 
-| Code | Meaning |
-|---|---|
-| `NOT_FOUND` | Job/Cron/Scope not found |
-| `INVALID_STATE` | Operation not valid in current state (e.g., :fg on Done job) |
-| `INVALID_SCOPE` | Referenced scope hash not found |
-| `INVALID_SYNTAX` | Malformed pipeline/chain/cron expression |
-| `ALREADY_EXISTS` | Duplicate operation (e.g., already fg-attached) |
-| `NOT_SUPPORTED` | Operation not supported |
-| `PERMISSION_DENIED` | Operation rejected by policy |
-| `INTERNAL` | Unexpected cued error |
+| Code                | Meaning                                                      |
+| ------------------- | ------------------------------------------------------------ |
+| `NOT_FOUND`         | Job/Cron/Scope not found                                     |
+| `INVALID_STATE`     | Operation not valid in current state (e.g., :fg on Done job) |
+| `INVALID_SCOPE`     | Referenced scope hash not found                              |
+| `INVALID_SYNTAX`    | Malformed pipeline/chain/cron expression                     |
+| `ALREADY_EXISTS`    | Duplicate operation (e.g., already fg-attached)              |
+| `NOT_SUPPORTED`     | Operation not supported                                      |
+| `PERMISSION_DENIED` | Operation rejected by policy                                 |
+| `INTERNAL`          | Unexpected cued error                                        |
 
 ## 11. Connection Lifecycle
 

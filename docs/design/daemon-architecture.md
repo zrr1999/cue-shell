@@ -126,7 +126,13 @@ State: subscriber registry (Gateway handles per-client routing)
 - **Output ring buffer**: per-Job, fixed size (default 1 MiB), circular overwrite
   - Source of truth for OutputChunk events pushed to clients
   - Also serves `:out J1` tail queries for recent output
-- **Active state**: running Jobs, Chains, and Crons (in respective Actors)
+  - File-script jobs also send each output chunk directly to the `RunScript`
+    requester; the output channel remains available for other subscribed clients
+    without echoing the same chunks back to the requester
+- **Active state**: running Jobs, Chains, Scripts, and Crons (in respective Actors)
+  - File-script completion sends `ScriptFinished` directly to the `RunScript`
+    requester and publishes the same status on the `jobs` channel for other
+    observers
 
 ### Layer 2: File System (Output Persistence)
 
@@ -148,7 +154,6 @@ CREATE TABLE scopes (
     hash        TEXT PRIMARY KEY,   -- blake3 hex
     parent_hash TEXT REFERENCES scopes(hash),
     delta       TEXT NOT NULL,      -- JSON: {"set": {...}, "unset": [...], "cwd": "..."}
-    label       TEXT,               -- human label (S0, S1, ...)
     created_at  TEXT NOT NULL       -- ISO 8601
 );
 
@@ -237,8 +242,7 @@ macOS fallback: `$XDG_*` vars respected if set, otherwise:
    c. ProcessManager
    d. Scheduler (with Cron timers)
    e. Gateway (bind Unix socket)
-10. Emit DaemonReady event
-11. Enter tokio runtime main loop
+10. Enter tokio runtime main loop
 ```
 
 ## 7. Shutdown Sequence (Drain Mode)
@@ -278,7 +282,7 @@ When TUI/CLI tries to connect and finds no socket:
 1. TUI: connect($SOCKET_PATH) → ENOENT / ECONNREFUSED
 2. TUI: fork+exec `cued start --auto`
 3. TUI: retry connect with exponential backoff (100ms, 200ms, 400ms, ... max 5s)
-4. cued: emit DaemonReady → TUI connects successfully
+4. cued: bind socket and respond to Ping → TUI connects successfully
 5. If all retries fail: TUI shows "Failed to start cued daemon" error
 ```
 

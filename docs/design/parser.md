@@ -11,10 +11,14 @@ Raw input (String)
   → Resolver   → ResolvedCommand (validated, ready for execution)
 ```
 
-Client sends `Eval { input }` over IPC; cued runs the full pipeline.
+Interactive clients send `Eval { input }` over IPC; cued runs the full pipeline.
+File scripts are loaded through `cue run <file.cue>` and use the same parser with
+a file-script source mode.
 
-Multiline input is parsed as a **top-level script**: newline separates items only
-at top level, and only when the current chain is already syntactically complete.
+File-script bodies are parsed as a **top-level script**: newline separates items
+only at top level, and only when the current chain is already syntactically
+complete. Interactive JOB multiline input is not a script-mode entry point; see
+[cue-script.md](cue-script.md).
 
 ## 2. Implementation
 
@@ -35,9 +39,8 @@ enum Token {
     // Mode params (context: immediately after Command)
     ModeParenOpen,          // ( — mode params context
     ModeParenClose,         // ) — mode params context
-    ParamKey(String),       // cwd, retry, retry_delay, ...
     ParamEq,               // =
-    ParamValue(Value),      // 3, "30s", true, ...
+    ParamValue(Value),      // true, false
     Comma,                  // ,
 
     // Operators (chain layer)
@@ -57,7 +60,7 @@ enum Token {
 
     // Content
     Word(String),           // command arguments, filenames, flags
-    IdRef(IdKind, u32),     // J1, C3, S0
+    IdRef(IdKind, u32),     // J1, C3
 
     // Whitespace (preserved for highlighting, stripped for parsing)
     Whitespace(String),
@@ -68,12 +71,10 @@ enum Token {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum IdKind { Job, Cron, Scope }
+enum IdKind { Job, Cron }
 
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
-    Int(i64),
-    Duration(Duration),
     Str(String),
     Bool(bool),
 }
@@ -113,7 +114,7 @@ enum Argument {
     IdRef(IdKind, u32),         // for :kill, :out, :fg, :retry, etc.
     Text(String),               // for :send and similar text-taking commands
     CronExpr {                  // for :cron
-        schedule: CronSchedule,
+        schedule: CronScheduleAst,
         body: ChainNode,
     },
     Empty,                      // for :jobs, :crons, :scopes, :help
@@ -141,12 +142,12 @@ struct PipeSegment {
 
 enum PipeOp { Stdout, All, Stderr }  // |>  |&>  |!>
 
-/// Cron schedule variants
-enum CronSchedule {
+/// Unresolved cron schedule variants. Resolver validates into core CronSchedule.
+enum CronScheduleAst {
     Every(Duration),                         // every 5m
     At(TimeSpec),                            // at 03:00
     In(Duration),                            // in 30s (one-shot)
-    Cron(String),                            // cron "0 */5 * * *"
+    Cron(String),                            // validated into core CrontabSchedule
 }
 ```
 
@@ -189,7 +190,7 @@ schedule    = "every" DURATION
 
 Notes:
 
-- newline is a script-item separator only at the top level
+- in file-script source mode, newline is a script-item separator only at the top level
 - newline inside an unfinished chain behaves like whitespace, so operators can be
   wrapped across lines naturally
 - resolver can therefore return either one normal command or one script command
@@ -202,11 +203,13 @@ The Resolver transforms `Ast` → `RequestPayload`:
 1. **Mode injection**: `BareInput` → wraps with default command per current mode
    - JOB ⚡ → `:run`
    - CRON ⏰ → `:cron`
+   - `.cue` file scripts resolve bare top-level items in JOB mode, so `echo hi`
+     in a script is equivalent to `:run echo hi` while preserving source text
 
 2. **Argument type validation**: ensures command gets correct argument type
     - `:run` expects Chain, `:kill` expects IdRef, `:send` expects Text, etc.
 
-3. **ID resolution**: validates J1/C3/S0 references exist (queries cued state)
+3. **ID resolution**: validates J1/C3 references exist (queries cued state)
 
 4. **Mode params merge**: per-invocation params override server.toml defaults
 
@@ -219,7 +222,7 @@ The Resolver transforms `Ast` → `RequestPayload`:
 1. Tokenize up to cursor position
 2. Determine context:
    - After `:` → command name completion (run, kill, jobs, ...)
-   - After `:cmd(` → mode param key completion (cwd, retry, retry_delay, ...)
+   - After `:cmd(` → command-specific mode param key completion
    - After `=` in mode params → value completion (based on param type)
    - After IdRef prefix `J` → active job ID completion
    - After word → filesystem path / command completion
@@ -248,7 +251,7 @@ struct HighlightSpan {
 enum HighlightKind {
     CommandPrefix,   // :
     CommandName,     // run, kill, ...
-    ModeParam,       // retry=3
+    ModeParam,       // pty=false
     Operator,        // ->, |||, &&, |>, ...
     IdRef,           // J1, A2
     Word,            // arguments
@@ -290,29 +293,29 @@ Which argument type each command expects:
 
 | Command | Argument | Mode Params |
 |---|---|---|
-| `:run` | Chain | ✓ (cwd, retry, retry_delay, timeout, wrapper) |
-| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, retry, retry_delay, timeout, wrapper) |
-| `:kill` | IdRef | ✗ |
-| `:retry` | IdRef | ✗ |
-| `:out` | IdRef | ✗ |
-| `:tail` | IdRef + optional bytes | ✗ |
-| `:err` | IdRef | ✗ |
-| `:fg` | IdRef | ✗ |
-| `:wait` | IdRef | ✗ |
-| `:send` | Text (`J<n> <input>`) | ✗ |
-| `:cancel` | IdRef | ✗ |
+| `:run` | Chain | ✓ (cwd, wrapper, scope, pty) |
+| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, wrapper, scope) |
+| `:kill` | Job/Cron IdRef (`J<n>` or `C<n>`) | ✗ |
+| `:retry` | Job IdRef (`J<n>`) | ✗ |
+| `:out` | Job IdRef (`J<n>`) | ✗ |
+| `:tail` | Job IdRef (`J<n>`) + optional bytes | ✗ |
+| `:err` | Job IdRef (`J<n>`) | ✗ |
+| `:fg` | Job IdRef (`J<n>`) | ✗ |
+| `:wait` | Job IdRef (`J<n>`) | ✗ |
+| `:send` | Job target + raw text (`J<n> <input>`) | ✗ |
+| `:cancel` | Job IdRef (`J<n>`) | ✗ |
 | `:jobs` | Empty | ✗ |
 | `:crons` | Empty | ✗ |
 | `:scopes` | Empty | ✗ |
 | `:env` | Text (subcommand) | ✗ |
 | `:cd` | Text (path) | ✗ |
-| `:scope` | Text (subcommand) | ✓ |
+| `:scope` | Text (`list`; other subcommands not implemented) | ✗ |
 | `:help` | Empty or Text | ✗ |
-| `:pause` | IdRef | ✗ |
-| `:resume` | IdRef | ✗ |
+| `:pause` | Cron IdRef (`C<n>`) | ✗ |
+| `:resume` | Cron IdRef (`C<n>`) | ✗ |
 | `:config` | Text | ✗ |
 | `:wrap` | Text (`on`, `off`, `status`) | ✗ |
-| `:log` | IdRef or Empty | ✗ |
+| `:log` | Job/Cron IdRef (`J<n>` or `C<n>`) or Empty | ✗ |
 | `:clear` | Empty | ✗ |
 | `:quit` | Empty | ✗ |
 | `:exit` | Empty | ✗ |

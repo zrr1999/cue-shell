@@ -1,5 +1,4 @@
 use std::fmt;
-use std::time::Duration;
 
 /// Fine-grained token types produced by the Tokenizer.
 #[derive(Debug, Clone, PartialEq)]
@@ -15,8 +14,6 @@ pub enum Token {
     ModeParenOpen,
     /// `)` in mode-params context.
     ModeParenClose,
-    /// Parameter key in mode-params, e.g. `cwd`, `retry`.
-    ParamKey(String),
     /// `=` in mode-params.
     ParamEq,
     /// Parameter value in mode-params.
@@ -55,7 +52,7 @@ pub enum Token {
     // Content
     /// A word (command argument, filename, flag, etc.)
     Word(String),
-    /// An entity ID reference like J1, C3, S0.
+    /// An entity ID reference like J1 or C3.
     IdRef(IdKind, u32),
 
     // Whitespace (preserved for highlighting, skipped during parsing)
@@ -71,14 +68,11 @@ pub enum Token {
 pub enum IdKind {
     Job,
     Cron,
-    Scope,
 }
 
 /// Typed value in mode-params.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
-    Int(i64),
-    Duration(Duration),
     Str(String),
     Bool(bool),
 }
@@ -108,7 +102,6 @@ impl fmt::Display for IdKind {
         f.write_str(match self {
             Self::Job => "J",
             Self::Cron => "C",
-            Self::Scope => "S",
         })
     }
 }
@@ -120,7 +113,6 @@ impl fmt::Display for Token {
             Self::Command(s) => write!(f, "{s}"),
             Self::ModeParenOpen | Self::GroupOpen => f.write_str("("),
             Self::ModeParenClose | Self::GroupClose => f.write_str(")"),
-            Self::ParamKey(s) => write!(f, "{s}"),
             Self::ParamEq => f.write_str("="),
             Self::ParamValue(v) => write!(f, "{v:?}"),
             Self::Comma => f.write_str(","),

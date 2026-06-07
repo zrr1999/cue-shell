@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{error::Error, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,9 +18,24 @@ pub struct ChainId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScriptId(pub u32);
 
-/// Content-addressed scope hash (blake3), displayed as S0@a3f1...
+/// Content-addressed scope hash (blake3), displayed as S@a3f1...
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScopeHash(pub [u8; 32]);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseIdError {
+    kind: &'static str,
+    input: String,
+}
+
+impl ParseIdError {
+    fn new(kind: &'static str, input: &str) -> Self {
+        Self {
+            kind,
+            input: input.to_owned(),
+        }
+    }
+}
 
 /// Unified entity reference for commands like :fg, :kill, :out
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +95,56 @@ impl fmt::Display for EntityRef {
     }
 }
 
+impl fmt::Display for ParseIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid {} id {}", self.kind, self.input)
+    }
+}
+
+impl Error for ParseIdError {}
+
+impl FromStr for JobId {
+    type Err = ParseIdError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        parse_prefixed_id(input, "J", "job").map(Self)
+    }
+}
+
+impl FromStr for CronId {
+    type Err = ParseIdError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        parse_prefixed_id(input, "C", "cron").map(Self)
+    }
+}
+
+impl FromStr for ChainId {
+    type Err = ParseIdError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        parse_prefixed_id(input, "CH", "chain").map(Self)
+    }
+}
+
+impl FromStr for ScriptId {
+    type Err = ParseIdError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        parse_prefixed_id(input, "R", "script").map(Self)
+    }
+}
+
+fn parse_prefixed_id(input: &str, prefix: &str, kind: &'static str) -> Result<u32, ParseIdError> {
+    let digits = input
+        .strip_prefix(prefix)
+        .ok_or_else(|| ParseIdError::new(kind, input))?;
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(ParseIdError::new(kind, input));
+    }
+    digits.parse().map_err(|_| ParseIdError::new(kind, input))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +155,22 @@ mod tests {
         assert_eq!(CronId(3).to_string(), "C3");
         assert_eq!(ChainId(7).to_string(), "CH7");
         assert_eq!(ScriptId(9).to_string(), "R9");
+    }
+
+    #[test]
+    fn parse_ids() {
+        assert_eq!("J1".parse::<JobId>(), Ok(JobId(1)));
+        assert_eq!("C3".parse::<CronId>(), Ok(CronId(3)));
+        assert_eq!("CH7".parse::<ChainId>(), Ok(ChainId(7)));
+        assert_eq!("R9".parse::<ScriptId>(), Ok(ScriptId(9)));
+    }
+
+    #[test]
+    fn parse_ids_reject_wrong_prefixes_and_non_digits() {
+        assert!("C1".parse::<JobId>().is_err());
+        assert!("C+1".parse::<CronId>().is_err());
+        assert!("CH".parse::<ChainId>().is_err());
+        assert!("Rabc".parse::<ScriptId>().is_err());
     }
 
     #[test]

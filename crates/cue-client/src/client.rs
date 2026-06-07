@@ -10,11 +10,11 @@ use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use cue_core::Mode;
 use cue_core::ipc::{
     EventPayload, MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload, ResponsePayload,
     encode_message,
 };
+use cue_core::{EventChannel, Mode};
 
 /// Client handle for a single connection to the cued daemon.
 pub struct CuedClient {
@@ -61,13 +61,24 @@ impl CuedClient {
         .await
     }
 
-    /// Convenience: subscribe to event channels.
-    pub async fn subscribe(&mut self, channels: &[&str]) -> Result<()> {
-        self.send(RequestPayload::Subscribe {
-            channels: channels.iter().map(|s| (*s).to_string()).collect(),
+    /// Convenience: send a file-script request.
+    pub async fn run_script(&mut self, path: &str, input: &str, mode: Mode) -> Result<u32> {
+        self.send(RequestPayload::RunScript {
+            path: path.to_string(),
+            input: input.to_string(),
+            mode,
         })
-        .await?;
-        Ok(())
+        .await
+    }
+
+    /// Convenience: send a Subscribe request and return its request ID.
+    pub async fn subscribe(&mut self, channels: &[EventChannel]) -> Result<u32> {
+        self.send(RequestPayload::subscribe(channels)).await
+    }
+
+    /// Convenience: send an Unsubscribe request and return its request ID.
+    pub async fn unsubscribe(&mut self, channels: &[EventChannel]) -> Result<u32> {
+        self.send(RequestPayload::unsubscribe(channels)).await
     }
 
     /// Convenience: send a Ping request.
@@ -77,12 +88,20 @@ impl CuedClient {
 
     /// Validate that the daemon speaks the expected IPC protocol.
     pub async fn ping_roundtrip(&mut self) -> Result<()> {
+        self.ping_for_version().await.map(|_| ())
+    }
+
+    /// Send a `Ping` and return the daemon-reported version, if any.
+    ///
+    /// Pre-version-reporting daemons reply with an empty `Pong {}` payload
+    /// and yield `Ok(None)`; current daemons return `Ok(Some(version))`.
+    pub async fn ping_for_version(&mut self) -> Result<Option<String>> {
         let ping_id = self.ping().await?;
         match self.recv().await? {
             Message::Response {
                 id,
-                payload: ResponsePayload::Ok(OkPayload::Pong {}),
-            } if id == ping_id => Ok(()),
+                payload: ResponsePayload::Ok(OkPayload::Pong { version }),
+            } if id == ping_id => Ok(version),
             message => bail!("unexpected message while validating daemon transport: {message:?}"),
         }
     }
@@ -158,7 +177,7 @@ impl std::error::Error for WriterSendError {}
 impl WriterHandle {
     /// Enqueue a request payload to be sent to the daemon (non-blocking).
     ///
-    /// Returns `Ok(())` if the message was enqueued, or `Err` if the
+    /// Returns `Ok(id)` if the message was enqueued, or `Err` if the
     /// writer task has exited or the channel is full.
     pub fn try_send(&self, payload: RequestPayload) -> Result<u32, WriterSendError> {
         let request = self.next_request(payload);
@@ -170,15 +189,9 @@ impl WriterHandle {
         Ok(id)
     }
 
-    /// Enqueue a request asynchronously, waiting for buffer space if needed.
-    pub fn send(&self, payload: RequestPayload) -> u32 {
-        let request = self.next_request(payload);
-        let id = request.id;
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(request).await;
-        });
-        id
+    /// Enqueue a request from synchronous UI code.
+    pub fn send(&self, payload: RequestPayload) -> Result<u32, WriterSendError> {
+        self.try_send(payload)
     }
 
     /// Enqueue a request asynchronously, returning an error if the writer task
@@ -283,6 +296,21 @@ impl MultiplexedClient {
         .await
     }
 
+    /// Convenience: send a file-script request and wait for its response.
+    pub async fn run_script(
+        &self,
+        path: impl Into<String>,
+        input: impl Into<String>,
+        mode: Mode,
+    ) -> Result<ResponsePayload> {
+        self.call(RequestPayload::RunScript {
+            path: path.into(),
+            input: input.into(),
+            mode,
+        })
+        .await
+    }
+
     /// List jobs with optional server-side limit and pagination metadata.
     pub async fn list_jobs(&self, limit: Option<usize>) -> Result<ResponsePayload> {
         self.call(RequestPayload::ListJobs { limit }).await
@@ -347,6 +375,16 @@ impl MultiplexedClient {
     /// Show cue-shell config with an optional byte tail.
     pub async fn show_config(&self, tail_bytes: Option<usize>) -> Result<ResponsePayload> {
         self.call(RequestPayload::ShowConfig { tail_bytes }).await
+    }
+
+    /// Subscribe to pushed event channels and wait for the daemon response.
+    pub async fn subscribe(&self, channels: &[EventChannel]) -> Result<ResponsePayload> {
+        self.call(RequestPayload::subscribe(channels)).await
+    }
+
+    /// Unsubscribe from pushed event channels and wait for the daemon response.
+    pub async fn unsubscribe(&self, channels: &[EventChannel]) -> Result<ResponsePayload> {
+        self.call(RequestPayload::unsubscribe(channels)).await
     }
 
     /// Receive the next pushed event from the daemon.
@@ -515,6 +553,7 @@ mod tests {
     use std::collections::HashSet;
 
     use cue_core::ipc::{OkPayload, encode_message};
+    use cue_core::{EventChannel, JobId};
     use tokio::io::duplex;
     use tokio::time::{Duration, timeout};
 
@@ -545,6 +584,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cued_client_subscribe_uses_typed_channels_and_returns_request_id() {
+        let (client_stream, mut server_stream) = duplex(4096);
+        let mut client = CuedClient::from_stream(client_stream);
+
+        let request_id = client
+            .subscribe(&[EventChannel::Jobs, EventChannel::Output(JobId(7))])
+            .await
+            .expect("send subscribe request");
+
+        assert_eq!(request_id, 1);
+        match read_message(&mut server_stream).await.unwrap() {
+            Message::Request {
+                id,
+                payload: RequestPayload::Subscribe { channels },
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(channels, vec!["jobs", "output:J7"]);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cued_client_unsubscribe_uses_typed_channels_and_returns_request_id() {
+        let (client_stream, mut server_stream) = duplex(4096);
+        let mut client = CuedClient::from_stream(client_stream);
+
+        let request_id = client
+            .unsubscribe(&[EventChannel::System])
+            .await
+            .expect("send unsubscribe request");
+
+        assert_eq!(request_id, 1);
+        match read_message(&mut server_stream).await.unwrap() {
+            Message::Request {
+                id,
+                payload: RequestPayload::Unsubscribe { channels },
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(channels, vec!["system"]);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn writer_handle_send_async_reports_closed_writer() {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
@@ -557,6 +642,19 @@ mod tests {
             .send_async(RequestPayload::Ping {})
             .await
             .unwrap_err();
+        assert_eq!(error, WriterSendError::Closed);
+    }
+
+    #[test]
+    fn writer_handle_send_reports_closed_writer() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let writer = WriterHandle {
+            tx,
+            next_id: Arc::new(AtomicU32::new(1)),
+        };
+
+        let error = writer.send(RequestPayload::Ping {}).unwrap_err();
         assert_eq!(error, WriterSendError::Closed);
     }
 
@@ -633,6 +731,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiplexed_client_subscribe_waits_for_daemon_response() {
+        let (client_stream, mut server_stream) = duplex(4096);
+        let client = CuedClient::from_stream(client_stream);
+        let (reader, writer) = client.into_split();
+        let client = Arc::new(MultiplexedClient::new(reader, spawn_writer_task(writer)));
+
+        let response_task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .subscribe(&[EventChannel::Crons, EventChannel::System])
+                    .await
+            }
+        });
+
+        let request_id = match read_message(&mut server_stream).await.unwrap() {
+            Message::Request {
+                id,
+                payload: RequestPayload::Subscribe { channels },
+            } => {
+                assert_eq!(channels, vec!["crons", "system"]);
+                id
+            }
+            other => panic!("unexpected request: {other:?}"),
+        };
+        write_message(
+            &mut server_stream,
+            &Message::Response {
+                id: request_id,
+                payload: ResponsePayload::Ok(OkPayload::Ack {}),
+            },
+        )
+        .await;
+
+        match response_task.await.unwrap().unwrap() {
+            ResponsePayload::Ok(OkPayload::Ack {}) => {}
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multiplexed_client_unsubscribe_waits_for_daemon_response() {
+        let (client_stream, mut server_stream) = duplex(4096);
+        let client = CuedClient::from_stream(client_stream);
+        let (reader, writer) = client.into_split();
+        let client = Arc::new(MultiplexedClient::new(reader, spawn_writer_task(writer)));
+
+        let response_task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.unsubscribe(&[EventChannel::Output(JobId(3))]).await }
+        });
+
+        let request_id = match read_message(&mut server_stream).await.unwrap() {
+            Message::Request {
+                id,
+                payload: RequestPayload::Unsubscribe { channels },
+            } => {
+                assert_eq!(channels, vec!["output:J3"]);
+                id
+            }
+            other => panic!("unexpected request: {other:?}"),
+        };
+        write_message(
+            &mut server_stream,
+            &Message::Response {
+                id: request_id,
+                payload: ResponsePayload::Ok(OkPayload::Ack {}),
+            },
+        )
+        .await;
+
+        match response_task.await.unwrap().unwrap() {
+            ResponsePayload::Ok(OkPayload::Ack {}) => {}
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn multiplexed_client_reports_disconnect_to_pending_callers() {
         let (client_stream, mut server_stream) = duplex(4096);
         let client = CuedClient::from_stream(client_stream);
@@ -698,7 +874,9 @@ mod tests {
         write_message(
             &mut server_stream,
             &Message::Event {
-                payload: EventPayload::DaemonReady {},
+                payload: EventPayload::ShuttingDown {
+                    reason: "test".into(),
+                },
             },
         )
         .await;
@@ -706,18 +884,20 @@ mod tests {
             &mut server_stream,
             &Message::Response {
                 id: request_id,
-                payload: ResponsePayload::Ok(OkPayload::Pong {}),
+                payload: ResponsePayload::Ok(OkPayload::Pong { version: None }),
             },
         )
         .await;
 
         match response_task.await.unwrap().unwrap() {
-            ResponsePayload::Ok(OkPayload::Pong {}) => {}
+            ResponsePayload::Ok(OkPayload::Pong { version: None }) => {}
             other => panic!("unexpected response: {other:?}"),
         }
 
         match client.next_event().await {
-            Some(EventPayload::DaemonReady {}) => {}
+            Some(EventPayload::ShuttingDown { reason }) => {
+                assert_eq!(reason, "test");
+            }
             other => panic!("unexpected event: {other:?}"),
         }
     }

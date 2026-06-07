@@ -303,6 +303,7 @@ name = "cue-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "cue-client",
  "cue-core",
  "cue-daemon",
@@ -322,8 +323,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cue-core",
+ "serde",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -343,6 +346,7 @@ name = "cue-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bpaf",
  "chrono",
  "cue-core",

@@ -1,13 +1,10 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 /// A typed parameter value used in mode params `()`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ParamValue {
-    Int(i64),
-    Duration(Duration),
     Str(String),
     Bool(bool),
 }
@@ -37,30 +34,6 @@ impl ModeParams {
         self.params.insert(key.into(), value);
     }
 
-    /// Get retry count, if specified.
-    pub fn retry(&self) -> Option<u32> {
-        match self.get("retry") {
-            Some(ParamValue::Int(n)) => u32::try_from(*n).ok(),
-            _ => None,
-        }
-    }
-
-    /// Get retry delay, if specified.
-    pub fn retry_delay(&self) -> Option<Duration> {
-        match self.get("retry_delay") {
-            Some(ParamValue::Duration(d)) => Some(*d),
-            _ => None,
-        }
-    }
-
-    /// Get timeout duration, if specified.
-    pub fn timeout(&self) -> Option<Duration> {
-        match self.get("timeout") {
-            Some(ParamValue::Duration(d)) => Some(*d),
-            _ => None,
-        }
-    }
-
     /// Get explicit working directory override, if specified.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
         match self.get("cwd") {
@@ -78,8 +51,8 @@ impl ModeParams {
         }
     }
 
-    /// Whether `:run` may apply scope-transform leaves (`cd`, `env set`) to
-    /// the chain scope. Defaults to false when unspecified.
+    /// Whether the submitted chain may apply scope-transform leaves (`cd`,
+    /// `env set`) to its chain scope. Defaults to false when unspecified.
     pub fn scope(&self) -> Option<bool> {
         match self.get("scope") {
             Some(ParamValue::Bool(b)) => Some(*b),
@@ -95,20 +68,5 @@ impl ModeParams {
             Some(ParamValue::Bool(b)) => *b,
             _ => true, // default: PTY on
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn retry_param_is_natural_number() {
-        let mut params = ModeParams::new();
-        params.insert("retry", ParamValue::Int(3));
-        assert_eq!(params.retry(), Some(3));
-
-        params.insert("retry", ParamValue::Int(-1));
-        assert_eq!(params.retry(), None);
     }
 }

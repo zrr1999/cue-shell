@@ -4,8 +4,6 @@
 //! - `(` immediately after a `Command` token → `ModeParenOpen`
 //! - `(` elsewhere → `GroupOpen`
 
-use std::time::Duration;
-
 use super::token::{IdKind, Span, Spanned, Token, Value};
 
 /// Tokenizer state machine.
@@ -165,11 +163,14 @@ impl<'a> Tokenizer<'a> {
 
             b')' => {
                 self.pos += 1;
-                if self.in_mode_params {
+                let token = if self.in_mode_params {
                     self.in_mode_params = false;
-                }
+                    Token::ModeParenClose
+                } else {
+                    Token::GroupClose
+                };
                 self.last_significant = Some(TokenClass::Other);
-                Token::GroupClose
+                token
             }
 
             b'-' if self.peek_at(1) == Some(b'>')
@@ -215,24 +216,13 @@ impl<'a> Tokenizer<'a> {
         })
     }
 
-    /// Tokenize after `(` when in mode-params context.
-    /// Returns a sequence of param tokens, consuming up to and including `)`.
+    /// Return the already-consumed mode-param opening paren.
+    /// Subsequent calls continue in mode-param state until `ModeParenClose`.
     fn tokenize_mode_params(
         &mut self,
         paren_start: usize,
         open_tok: Token,
     ) -> Result<Spanned, TokenizeError> {
-        // We've already consumed `(`. We need to return ModeParenOpen first,
-        // then subsequent calls will read key=value pairs.
-        // But our tokenizer is single-token-at-a-time, so we store the open token
-        // and let subsequent next_token calls handle the interior.
-
-        // Actually, for simplicity in a single-pass tokenizer, let's collect
-        // all mode params inline and return them as individual tokens.
-        // We'll switch to a "mode params" sub-state.
-
-        // For now, return just the ModeParenOpen. The parser will know to
-        // expect params until ModeParenClose.
         Ok(Spanned {
             token: open_tok,
             span: Span::new(paren_start, self.pos),
@@ -294,7 +284,8 @@ impl<'a> Tokenizer<'a> {
     fn tokenize_word(&mut self) -> Result<Token, TokenizeError> {
         let start = self.pos;
 
-        // Check for ID ref: J1, C3, S0
+        // Check for job/cron ID refs. Scopes are content-addressed hashes, not
+        // numeric parser IDs.
         if let Some(kind) = self.try_id_kind() {
             let prefix_pos = self.pos;
             self.pos += 1; // skip prefix letter
@@ -304,8 +295,9 @@ impl<'a> Tokenizer<'a> {
             }
             if self.pos > num_start {
                 // Make sure next char is not alphanumeric (otherwise it's a regular word)
-                if self.pos >= self.bytes.len() || !is_ident_char(self.bytes[self.pos]) {
-                    let n: u32 = self.slice(num_start, self.pos).parse().unwrap_or(0);
+                if (self.pos >= self.bytes.len() || !is_ident_char(self.bytes[self.pos]))
+                    && let Ok(n) = self.slice(num_start, self.pos).parse::<u32>()
+                {
                     self.last_significant = Some(TokenClass::Other);
                     return Ok(Token::IdRef(kind, n));
                 }
@@ -382,7 +374,6 @@ impl<'a> Tokenizer<'a> {
         match self.peek()? {
             b'J' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Job),
             b'C' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Cron),
-            b'S' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Scope),
             _ => None,
         }
     }
@@ -561,43 +552,11 @@ fn is_delimiter(b: u8) -> bool {
 
 /// Try to parse a word as a typed value (for mode params).
 fn try_parse_value(s: &str) -> Option<Value> {
-    // Bool
     if s == "true" {
         return Some(Value::Bool(true));
     }
     if s == "false" {
         return Some(Value::Bool(false));
-    }
-
-    // Duration: 30s, 5m, 1h, 500ms
-    if let Some(d) = try_parse_duration(s) {
-        return Some(Value::Duration(d));
-    }
-
-    // Integer
-    if let Ok(n) = s.parse::<i64>() {
-        return Some(Value::Int(n));
-    }
-
-    None
-}
-
-fn try_parse_duration(s: &str) -> Option<Duration> {
-    if s.ends_with("ms") {
-        let n: u64 = s.strip_suffix("ms")?.parse().ok()?;
-        return Some(Duration::from_millis(n));
-    }
-    if s.ends_with('s') {
-        let n: u64 = s.strip_suffix('s')?.parse().ok()?;
-        return Some(Duration::from_secs(n));
-    }
-    if s.ends_with('m') {
-        let n: u64 = s.strip_suffix('m')?.parse().ok()?;
-        return Some(Duration::from_secs(n * 60));
-    }
-    if s.ends_with('h') {
-        let n: u64 = s.strip_suffix('h')?.parse().ok()?;
-        return Some(Duration::from_secs(n * 3600));
     }
     None
 }
@@ -646,16 +605,16 @@ mod tests {
 
     #[test]
     fn command_with_mode_params() {
-        let toks = tokens(":run(retry=3) cargo test");
+        let toks = tokens(":run(pty=false) cargo test");
         assert_eq!(
             toks,
             vec![
                 Token::Command("run".into()),
                 Token::ModeParenOpen,
-                Token::Word("retry".into()),
+                Token::Word("pty".into()),
                 Token::ParamEq,
-                Token::ParamValue(Value::Int(3)),
-                Token::GroupClose, // Will be ModeParenClose after parser context
+                Token::ParamValue(Value::Bool(false)),
+                Token::ModeParenClose,
                 Token::Word("cargo".into()),
                 Token::Word("test".into()),
                 Token::Eof,
@@ -729,6 +688,32 @@ mod tests {
     }
 
     #[test]
+    fn numeric_scope_labels_stay_words() {
+        let toks = tokens("echo S1");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("S1".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn oversized_id_refs_stay_words_instead_of_wrapping_to_zero() {
+        let toks = tokens("echo J4294967296");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("J4294967296".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
     fn grouping_parens() {
         let toks = tokens("(a -> b) ||| c");
         assert_eq!(
@@ -743,17 +728,6 @@ mod tests {
                 Token::Word("c".into()),
                 Token::Eof,
             ]
-        );
-    }
-
-    #[test]
-    fn duration_values() {
-        assert_eq!(try_parse_duration("30s"), Some(Duration::from_secs(30)));
-        assert_eq!(try_parse_duration("5m"), Some(Duration::from_secs(300)));
-        assert_eq!(try_parse_duration("1h"), Some(Duration::from_secs(3600)));
-        assert_eq!(
-            try_parse_duration("500ms"),
-            Some(Duration::from_millis(500))
         );
     }
 
@@ -1031,20 +1005,20 @@ mod tests {
     #[test]
     fn comma_in_mode_params_still_separates() {
         // Inside mode params, commas should still separate key=val pairs.
-        let toks = tokens(":run(retry=3,timeout=30s) cargo test");
+        let toks = tokens(":run(cwd=/tmp,pty=false) cargo test");
         assert_eq!(
             toks,
             vec![
                 Token::Command("run".into()),
                 Token::ModeParenOpen,
-                Token::Word("retry".into()),
+                Token::Word("cwd".into()),
                 Token::ParamEq,
-                Token::ParamValue(Value::Int(3)),
+                Token::Word("/tmp".into()),
                 Token::Comma,
-                Token::Word("timeout".into()),
+                Token::Word("pty".into()),
                 Token::ParamEq,
-                Token::ParamValue(Value::Duration(std::time::Duration::from_secs(30))),
-                Token::GroupClose,
+                Token::ParamValue(Value::Bool(false)),
+                Token::ModeParenClose,
                 Token::Word("cargo".into()),
                 Token::Word("test".into()),
                 Token::Eof,

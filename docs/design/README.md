@@ -33,10 +33,10 @@ the tool surface stays “atomic”, see [conceptual-model.md](conceptual-model.
 
 | Crate | Role |
 |---|---|
-| **cue-core** | Shared types, parser, protocol definitions |
+| **cue-core** | Shared domain types, command metadata, protocol definitions, pure scheduling primitives |
 | **cued** | Background daemon — process substrate, scheduler, process manager, scope store |
 | **cue-tui** | Interactive TUI client (ratatui + crossterm) |
-| **cue-cli** | Headless CLI client for scripting |
+| **cue-cli** | Headless CLI client for `cue run <file.cue>` and extension dispatch |
 
 ## Core Primitives
 
@@ -44,7 +44,7 @@ the tool surface stays “atomic”, see [conceptual-model.md](conceptual-model.
 |---|---|---|
 | **Job** | J1, J2, ... | OS child process (or pipeline of processes) |
 | **Cron** | C1, C2, ... | Scheduled/delayed task that spawns Jobs |
-| **Scope** | S0@a3f1 | Immutable environment snapshot (content-addressed, blake3) |
+| **Scope** | S@a3f1 | Immutable environment snapshot (content-addressed, blake3) |
 | **Chain** | — | Job orchestration graph (serial/parallel) |
 | **Pipeline** | — | Process pipe chain within a single Job |
 
@@ -72,13 +72,14 @@ Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless o
 ## Mode Params
 
 ```
-:run(cwd=/repo, retry=3, retry_delay=5s) cargo test
+:run(cwd=/repo, pty=false) cargo test
 :cron(cwd=/repo) every 5m cargo clippy
 ```
 
 Parenthesized `key=value` pairs immediately after the command name configure
 execution behavior. They override `server.toml` defaults. Only launcher-style
-commands support mode params: `:run`, `:cron`, `:scope new`.
+commands support mode params: `:run` and `:cron`; supported keys are declared
+per command so unsupported keys fail during parsing instead of being ignored.
 
 ## Scope Model
 
@@ -86,7 +87,7 @@ Scopes are **immutable, content-addressed environment snapshots**:
 
 - ID = blake3(env + cwd + ...) → identical environments share the same hash
 - Delta storage: `parent_hash` + `EnvDelta` (set/unset/cwd changes)
-- Display: `S0@a3f1` (human label + short hash)
+- Display: `S@a3f1` (short content hash)
 - Job holds `start_scope` and `end_scope` (None until complete)
 - Default scope = movable HEAD pointer, modified via `:env set` / `:cd`
 
@@ -115,6 +116,7 @@ Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default sc
 |---|---|
 | [conceptual-model.md](conceptual-model.md) | Formal-ish model: jobs, scopes, indexing, composition, tool atoms |
 | [commands-and-modes.md](commands-and-modes.md) | Complete command reference, modes, cron syntax |
+| [cue-script.md](cue-script.md) | `.cue` file-script mode — `cue run`, syntax, scope, exit semantics |
 | [core-types.md](core-types.md) | Rust type definitions — Scope, Job, Cron, Pipeline, Chain |
 | [tui.md](tui.md) | TUI architecture, layout, interaction design |
 | [ipc-protocol.md](ipc-protocol.md) | cued ↔ client protocol specification |

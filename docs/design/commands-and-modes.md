@@ -12,6 +12,7 @@
 ```
 :run cargo build          # 发射 job
 :kill J1                  # 终止 job
+:kill C1                  # 移除 cron
 :jobs                     # 列出所有 job
 :scope list --tree        # 列出 scope
 :env                      # 查看 env（无参数也用 :）
@@ -99,24 +100,19 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 | `:tail` | `:tail J1 [bytes]` | 打开并持续 follow job stdout | 核心 |
 | `:err` | `:err J1` | 查看 job stderr snapshot | 核心 |
 | `:send` | `:send J1 <input>` | 向 running job 写 stdin | 核心 |
-| `:kill` | `:kill J1` | 终止 running job | 核心 |
+| `:kill` | `:kill J<n>` / `:kill C<n>` | 终止 running job 或移除 cron | 核心 |
 | `:cancel` | `:cancel J3` | 取消 queued job | 核心 |
 | `:fg` | `:fg J2` | Job 进入前台 pty | 核心 |
 
 `:run` / JOB bare input 在发射前会基于当前 scope snapshot 做**显式 word expansion**：支持前导 `~`、`$VAR`、`${VAR}`；仍保持 direct exec，不隐式走 shell，也不做 glob / command substitution / field splitting。
 
-`cue-shell` 现在也支持 **multiline script**：
+`cue-shell` 的文件脚本模式使用统一的 `.cue` 后缀，并通过显式 CLI 入口运行：
 
 ```text
-cat _typos.toml |> rg files
-||| cat Cargo.toml |> rg author
+cue run path/to/file.cue
 ```
 
-- JOB 模式下，多行输入默认视为一次 script 提交；显式 `:run` 也可承载同样的多行 body
-- 一个 script 会分配新的 `R<n>`，其下每个顶层 item 继续按原有语义解析成 chain / job / cron
-- 调度是 **异步提交、按 ack 排序**：item N 创建成功后，才继续发 item N+1；但已经创建的 chain/job 仍按各自异步生命周期运行
-- 输出归属不变：脚本卡片只负责展示 `R -> C -> J` 映射，真正 stdout/stderr 仍由 `J<n>` 持有
-- 顶层换行只在 **top-level** 作为 script item 分隔；如果当前 chain 明显未结束，则换行继续作为同一条 chain 的格式化空白
+JOB 模式下的交互多行输入不再是 script 入口；需要多个顶层 item 时，应写入 `.cue` 文件后用 `cue run` 执行。脚本运行仍分配 `R<n>`，并复用 `ScriptCreated` / `script_runs` 这套运行元数据抽象。完整契约见 [cue-script.md](cue-script.md)。
 
 另外，`cue-shell` 现在把两类输入当作**原生 scope-transform job** 处理，而不是交给外部 shell：
 
@@ -135,10 +131,9 @@ cat _typos.toml |> rg files
 | 命令 | 语法 | 语义 | 定位 |
 |------|------|------|------|
 | `:scope list` | `:scope list [--tree]` | 列出所有 scope | 核心 |
-| `:scope new` | `:scope new [--profile rust]` | 创建新 scope | 核心 |
-| `:scope env` | `:scope env S1` | 查看 scope env | 核心 |
-| `:scope fork` | `:scope fork S1 [--name exp]` | 从 scope 派生（delta 存储） | 核心 |
-| `:scope close` | `:scope close S1` | 归档 scope | 核心 |
+| `:scopes` | `:scopes` | 列出所有 scope（简写） | 核心 |
+
+当前实现只暴露 scope 列表和 hash；scope 是内容寻址快照（`S@...`），不是 `S1` 这类递增编号实体。`env` / `fork` / `close` 这类子命令还没有实现，不能作为当前核心命令写入用户契约。
 
 ### 3.3 Cron/定时管理
 
@@ -146,6 +141,10 @@ cat _typos.toml |> rg files
 |------|------|------|------|
 | `:cron` | `:cron <schedule> <cmd>` | 添加定时/延迟任务 | 核心 |
 | `:crons` | `:crons` | 列出所有定时任务 | 核心 |
+| `:pause` | `:pause C<n>` | 暂停定时任务 | 核心 |
+| `:resume` | `:resume C<n>` | 恢复定时任务 | 核心 |
+| `:kill` | `:kill C<n>` | 移除定时任务 | 核心 |
+| `:log` | `:log [C<n>]` | 查看 cron 历史日志 | 核心 |
 
 - `:crons` 现在展示**持久化 cron 历史**，而不只是在内存中的活跃注册项
 - one-shot cron 触发后会保留为 `completed`；daemon 重启时已错过的 one-shot 会保留为 `expired`，都不会再补跑
@@ -248,7 +247,7 @@ max_script_runs = 100
 ```
 Active → Idle (队列空) → Persisted (TTL 到期，落盘)
                                     ↓
-                              Archived (LRU 淘汰 or :scope close)
+                              Archived (retention policy)
                                     ↓
                               Deleted (超出保留限制)
 ```
@@ -260,7 +259,7 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 > v2 新增：用括号分离内建配置与被执行命令的参数，消除歧义。
 
 ```
-:run(cwd=/repo, retry=3, retry_delay=5s) cargo test --release
+:run(cwd=/repo, pty=false) cargo test --release
 :cron(cwd=/repo) every 5m cargo clippy
 ```
 
@@ -273,9 +272,8 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 | 命令 | 可用参数 |
 |------|---------|
-| `:run()` | `cwd`, `retry`, `retry_delay` |
-| `:cron()` | `cwd` |
-| `:scope new()` | `profile` |
+| `:run()` | `cwd`, `wrapper`, `scope`, `pty` |
+| `:cron()` | `cwd`, `wrapper`, `scope` |
 
 其他命令只有位置/标志参数，无 `()` 语法。
 
@@ -343,9 +341,8 @@ Pipeline 内退出码 = 最后一个进程的退出码
 
 ### 重试
 
-- `:run(retry=3) cargo test` → 失败时自动重试，最多 3 次
-- 重试成功 → ChainAborted 的后续步骤自动重启
 - `:retry J3` → 当前会用原 `start_scope` 和 pipeline 重新发射一个 fresh job
+- 自动重试尚未实现，因此不提供 `retry` / `retry_delay` mode params，避免调用时看似生效但实际被忽略
 - downstream chain 续接 / 自动重启后继 leaf 仍未完成，语义已显式收窄，避免保留模糊 stub
 
 ---
@@ -361,17 +358,13 @@ Pipeline 内退出码 = 最后一个进程的退出码
 │ :tail <id>     follow stdout               │
 │ :err <id>      查看 stderr snapshot        │
 │ :send <id>     写入 stdin                  │
-│ :kill <id>     终止 job                    │
+│ :kill <id>     终止 job / 移除 cron        │
 │ :cancel <id>   取消排队 job                │
 │ :fg <id>       前台（pty）                 │
 │ :retry <id>    重试 failed job             │
-│ :log [id]      查看 job 历史日志           │
+│ :log [id]      查看 job / cron 历史日志    │
 ├── Scope ──────────────────────────────────┤
 │ :scope list    列出 scope                  │
-│ :scope new     创建 scope                  │
-│ :scope env     查看 scope env              │
-│ :scope fork    派生 scope（delta）          │
-│ :scope close   归档 scope                  │
 │ :scopes        列出所有 scope（简写）       │
 │ :cd <path>     修改默认 scope 的 cwd       │
 ├── Control ────────────────────────────────┤
@@ -380,6 +373,10 @@ Pipeline 内退出码 = 最后一个进程的退出码
 ├── Cron ───────────────────────────────────┤
 │ :cron <sched> <cmd>  添加定时/延迟任务     │
 │ :crons         列出定时任务                │
+│ :pause C<n>    暂停定时任务                │
+│ :resume C<n>   恢复定时任务                │
+│ :kill C<n>     移除定时任务                │
+│ :log [C<n>]    查看 cron 历史日志          │
 │   内部关键字:                              │
 │   every 5m / at 9am / on weekdays         │
 │   in 5m / daily / cron */5 * * * *        │
@@ -395,5 +392,5 @@ Pipeline 内退出码 = 最后一个进程的退出码
 │ :quit          退出 TUI                    │
 └───────────────────────────────────────────┘
 
-总计：28+ 内建命令（含 scope/cron 子命令）
+当前内建命令面以 `crates/cue-core/src/command_spec.rs` 的 `COMMAND_SPECS` 为准。
 ```

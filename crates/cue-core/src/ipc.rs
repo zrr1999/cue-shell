@@ -8,6 +8,7 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 
 use crate::cron::CronStatus;
+use crate::event_channel::EventChannel;
 use crate::job::JobStatus;
 use crate::mode::Mode;
 
@@ -30,6 +31,11 @@ pub enum Message {
 pub enum RequestPayload {
     // User commands (raw string, parsed by cued)
     Eval {
+        input: String,
+        mode: Mode,
+    },
+    RunScript {
+        path: String,
         input: String,
         mode: Mode,
     },
@@ -103,6 +109,24 @@ pub enum RequestPayload {
     Shutdown {},
 }
 
+impl RequestPayload {
+    pub fn subscribe(channels: &[EventChannel]) -> Self {
+        Self::Subscribe {
+            channels: event_channel_names(channels),
+        }
+    }
+
+    pub fn unsubscribe(channels: &[EventChannel]) -> Self {
+        Self::Unsubscribe {
+            channels: event_channel_names(channels),
+        }
+    }
+}
+
+fn event_channel_names(channels: &[EventChannel]) -> Vec<String> {
+    channels.iter().map(ToString::to_string).collect()
+}
+
 // ── Responses (cued → Client) ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +140,8 @@ pub enum OkPayload {
     Ack {},
     ScriptCreated {
         script_id: String,
+        #[serde(default)]
+        source: ScriptSource,
         items: Vec<ScriptItemInfo>,
         submit_error: Option<ScriptSubmitError>,
     },
@@ -141,7 +167,6 @@ pub enum OkPayload {
     },
     ScopeCreated {
         hash: String,
-        label: Option<String>,
         summary: String,
     },
 
@@ -192,7 +217,15 @@ pub enum OkPayload {
     FgAttached {
         id: String,
     },
-    Pong {},
+    Pong {
+        /// Daemon `cued` build version reported by the running daemon.
+        ///
+        /// `None` when responding from a daemon that predates Pong-version
+        /// reporting; clients use this to detect outdated daemons and warn or
+        /// auto-restart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+    },
 }
 
 // ── Events (cued → Client, pushed) ──
@@ -217,15 +250,16 @@ pub enum EventPayload {
         chain_index: Option<usize>,
         chain_total: Option<usize>,
     },
-    ChainStarted {
-        chain: ChainInfo,
-    },
     ChainProgress {
         chain: ChainInfo,
     },
-    ChainFinished {
-        chain_id: String,
-        success: bool,
+    ScriptFinished {
+        script_id: String,
+        status: ScriptRunStatus,
+        /// Numeric process exit code, or `job::EXIT_CODE_UNAVAILABLE` when no
+        /// process-provided status exists.
+        exit_code: i32,
+        failed_item_index: Option<usize>,
     },
     JobRemoved {
         job_id: String,
@@ -256,10 +290,6 @@ pub enum EventPayload {
     },
 
     // Scopes channel
-    ScopeCreated {
-        hash: String,
-        label: Option<String>,
-    },
     HeadChanged {
         old_hash: String,
         new_hash: String,
@@ -279,7 +309,6 @@ pub enum EventPayload {
     ShuttingDown {
         reason: String,
     },
-    DaemonReady {},
 }
 
 /// Output stream type.
@@ -369,6 +398,23 @@ pub struct ScriptItemInfo {
     pub result: ScriptItemResult,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScriptSource {
+    #[default]
+    Inline,
+    File {
+        path: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptRunStatus {
+    Done,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScriptItemResult {
@@ -448,6 +494,7 @@ pub enum HighlightKind {
 /// Standard IPC error codes.
 pub mod error_code {
     pub const NOT_FOUND: &str = "NOT_FOUND";
+    pub const INVALID_REQUEST: &str = "INVALID_REQUEST";
     pub const INVALID_STATE: &str = "INVALID_STATE";
     pub const INVALID_SCOPE: &str = "INVALID_SCOPE";
     pub const INVALID_SYNTAX: &str = "INVALID_SYNTAX";
@@ -550,6 +597,30 @@ mod tests {
     }
 
     #[test]
+    fn subscription_request_constructors_use_event_channel_wire_names() {
+        let subscribe = RequestPayload::subscribe(&[
+            EventChannel::Jobs,
+            EventChannel::Crons,
+            EventChannel::Output(crate::JobId(7)),
+        ]);
+        match subscribe {
+            RequestPayload::Subscribe { channels } => {
+                assert_eq!(channels, vec!["jobs", "crons", "output:J7"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let unsubscribe =
+            RequestPayload::unsubscribe(&[EventChannel::Scopes, EventChannel::System]);
+        match unsubscribe {
+            RequestPayload::Unsubscribe { channels } => {
+                assert_eq!(channels, vec!["scopes", "system"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn roundtrip_error_response() {
         let msg = Message::Response {
             id: 1,
@@ -633,6 +704,137 @@ mod tests {
     }
 
     #[test]
+    fn run_script_request_roundtrips() {
+        let msg = Message::Request {
+            id: 9,
+            payload: RequestPayload::RunScript {
+                path: "scripts/build.cue".into(),
+                input: ":run cargo build".into(),
+                mode: Mode::Job,
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: Message = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Message::Request {
+                id,
+                payload: RequestPayload::RunScript { path, input, mode },
+            } => {
+                assert_eq!(id, 9);
+                assert_eq!(path, "scripts/build.cue");
+                assert_eq!(input, ":run cargo build");
+                assert_eq!(mode, Mode::Job);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn script_created_and_finished_payloads_roundtrip() {
+        let created = ResponsePayload::Ok(OkPayload::ScriptCreated {
+            script_id: "R7".into(),
+            source: ScriptSource::File {
+                path: "scripts/build.cue".into(),
+            },
+            items: vec![],
+            submit_error: None,
+        });
+        let json = serde_json::to_string(&created).unwrap();
+        let decoded: ResponsePayload = serde_json::from_str(&json).unwrap();
+        match decoded {
+            ResponsePayload::Ok(OkPayload::ScriptCreated { source, .. }) => {
+                assert_eq!(
+                    source,
+                    ScriptSource::File {
+                        path: "scripts/build.cue".into()
+                    }
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let finished = Message::Event {
+            payload: EventPayload::ScriptFinished {
+                script_id: "R7".into(),
+                status: ScriptRunStatus::Failed,
+                exit_code: 2,
+                failed_item_index: Some(1),
+            },
+        };
+        let json = serde_json::to_string(&finished).unwrap();
+        let decoded: Message = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Message::Event {
+                payload:
+                    EventPayload::ScriptFinished {
+                        script_id,
+                        status,
+                        exit_code,
+                        failed_item_index,
+                    },
+            } => {
+                assert_eq!(script_id, "R7");
+                assert_eq!(status, ScriptRunStatus::Failed);
+                assert_eq!(exit_code, 2);
+                assert_eq!(failed_item_index, Some(1));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn scope_created_payload_has_no_label_field() {
+        let payload = ResponsePayload::Ok(OkPayload::ScopeCreated {
+            hash: "S@abc12345".into(),
+            summary: "S@abc12345\ncwd: /old -> /tmp".into(),
+        });
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("label"));
+
+        let decoded: ResponsePayload = serde_json::from_str(&json).unwrap();
+        match decoded {
+            ResponsePayload::Ok(OkPayload::ScopeCreated { hash, summary }) => {
+                assert_eq!(hash, "S@abc12345");
+                assert!(summary.contains("cwd: /old -> /tmp"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn scope_events_roundtrip_as_head_changes() {
+        let msg = Message::Event {
+            payload: EventPayload::HeadChanged {
+                old_hash: "S@old00000".into(),
+                new_hash: "S@new00000".into(),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: Message = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Message::Event {
+                payload: EventPayload::HeadChanged { old_hash, new_hash },
+            } => {
+                assert_eq!(old_hash, "S@old00000");
+                assert_eq!(new_hash, "S@new00000");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn legacy_script_created_defaults_to_inline_source() {
+        let json = r#"{"Ok":{"ScriptCreated":{"script_id":"R1","items":[],"submit_error":null}}}"#;
+        let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
+        match decoded {
+            ResponsePayload::Ok(OkPayload::ScriptCreated { source, .. }) => {
+                assert_eq!(source, ScriptSource::Inline);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn binary_payloads_serialize_as_base64_strings() {
         let msg = Message::Event {
             payload: EventPayload::FgOutput {
@@ -653,5 +855,40 @@ mod tests {
             } => assert_eq!(data, b"ABC"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn pong_decodes_legacy_empty_payload_as_no_version() {
+        // Older `cued` builds (predating Pong version reporting) sent `"Pong":{}`
+        // with no fields. New clients must decode that as `version = None`.
+        let json = r#"{"Ok":{"Pong":{}}}"#;
+        let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
+        match decoded {
+            ResponsePayload::Ok(OkPayload::Pong { version }) => {
+                assert!(version.is_none(), "legacy Pong must decode as no version");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pong_decodes_versioned_payload() {
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0"}}}"#;
+        let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
+        match decoded {
+            ResponsePayload::Ok(OkPayload::Pong { version }) => {
+                assert_eq!(version.as_deref(), Some("0.1.0"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pong_omits_version_when_none() {
+        let payload = ResponsePayload::Ok(OkPayload::Pong { version: None });
+        let json = serde_json::to_string(&payload).unwrap();
+        // Older clients tolerate extra fields, but absent `version` keeps the
+        // wire format identical to legacy daemons that never sent the field.
+        assert_eq!(json, r#"{"Ok":{"Pong":{}}}"#);
     }
 }
