@@ -800,7 +800,7 @@ mod tests {
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn make_temp_dir() -> PathBuf {
-        let dir = PathBuf::from("/private/tmp").join(format!(
+        let dir = std::env::temp_dir().join(format!(
             "cued-test-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
