@@ -40,10 +40,10 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 ```
 crates/
 ├── cue-core/   — Core types and logic: Job, Scope, Chain, Cron
-├── cue-client/ — Client connection stack shared by frontends
-├── cue-daemon/ — Background daemon implementation library used by the `cued` CLI
-├── cue-tui/    — Optional TUI frontend library used by the `cue-tui` extension binary
-├── cue-cli/    — CLI entry crate; builds `cue`, `cued`, and the first-party `cue-tui` extension
+├── cue-client/ — Client connection stack and `cue-client` CLI for target/run commands
+├── cue-daemon/ — Background daemon library plus `cue-daemon` / `cued` CLIs
+├── cue-tui/    — Interactive TUI frontend plus `cue-tui` CLI
+├── cue-cli/    — `cue` aggregator entrypoint for explicit namespaces and extensions
 ```
 
 ## Installation
@@ -64,11 +64,18 @@ cargo build
 # Start daemon in foreground
 cued -f
 
+# Show the top-level aggregator help
+cargo run -p cue-cli --
+
 # Start TUI (auto-connect / auto-reconnect)
+cargo run -p cue-tui --bin cue-tui
+# or through the aggregator
 cargo run -p cue-cli -- tui
 
 # Restart the daemon directly
-cargo run -p cue-cli --bin cued -- restart
+cargo run -p cue-daemon --bin cue-daemon -- restart
+# `cued` remains as a daemon alias
+cargo run -p cue-daemon --bin cued -- restart
 
 # Restart from inside the TUI
 :restart
@@ -99,14 +106,16 @@ See [`docs/design/README.md`](docs/design/README.md) for the design index:
 
 cue-shell uses split config files in the platform config dir:
 
-- `client.toml` — client-side transport/profile selection used by `cue`
-- `daemon.toml` — daemon-side runtime defaults used by `cued`
+- `client.toml` — client-side transport/profile selection used by `cue-client`, `cue-tui`, and `cue client ...`
+- `daemon.toml` — daemon-side runtime defaults used by `cue-daemon` / `cued`
 
 ### `.cue` file script mode
 
-Scripts are `.cue` files executed through the explicit CLI entry:
+Scripts are `.cue` files executed through the client CLI, with a top-level shortcut retained by the aggregator:
 
 ```text
+cue-client run examples/hello.cue
+cue client run examples/hello.cue
 cue run examples/hello.cue
 ```
 
@@ -125,8 +134,9 @@ and [`examples/`](examples/).
 
 ### Client transport and extension config
 
-`cue` defaults to a local Unix socket profile, so local users do not need any
-config for the current flow. To make the split explicit:
+`cue-client` and `cue-tui` default to a local Unix socket profile, so local users do not need any config for the current flow. The top-level `cue` command is an explicit aggregator: bare `cue` prints help, `cue client ...` forwards to `cue-client ...`, `cue tui ...` forwards to `cue-tui`, and `cue daemon ...` forwards to `cue-daemon`. Target/profile commands are intentionally namespaced under the client surface; use `cue-client target ...` or `cue client target ...` rather than `cue target ...`.
+
+To make the split explicit:
 
 ```toml
 [transport]
@@ -149,10 +159,38 @@ profile name for SSH targets.
 Phase 1 uses the system OpenSSH client and runs the configured gateway command
 over SSH, so the client speaks the same IPC through `cued gateway --stdio`.
 Remote daemon startup still stays explicit: `cue` will **not** run
-`start_command` for you.
+`start_command` for you. `cue-client` owns client-side transport parsing and
+resolution, so CLI/TUI frontends share the same `client.toml` behavior.
 
-`cue` can also dispatch external CLI extensions from `client.toml`. This is
-enabled by the default `cue-cli` `extensions` Cargo feature:
+When `auto_detect_ssh` is enabled, cue-shell adds implicit SSH profiles from
+`~/.ssh/config`. Additional cluster inventory can be configured generically
+without hardcoding scheduler-specific names in cue-shell:
+
+```toml
+[transport.discovery]
+# Values are host lists separated by comma, semicolon, or whitespace.
+env_hosts = ["CLUSTER_HOSTS"]
+# Values are endpoint lists; cue-shell extracts hosts from host:port or URI values.
+env_endpoints = ["CLUSTER_ENDPOINTS"]
+# Values point to files containing one host per line or host plus extra columns.
+env_hostfiles = ["CLUSTER_HOSTFILE"]
+# Values use bracket range syntax such as gpu-[01-03,08].
+env_bracket_ranges = ["CLUSTER_NODELIST"]
+```
+
+Site-specific schedulers should be wired through this config or through external
+`cue-*` extensions rather than hardcoded in the cue-shell core. Other frontends,
+including Pi cue integrations, should use the cue-client resolver if they need to honor `client.toml`:
+
+```text
+cue-client target resolve --json
+cue client target resolve --json
+cue-client target list --json
+```
+
+Direct daemon/socket integrations only see the server side and will not apply client profile selection by themselves.
+
+`cue` can also dispatch external CLI extensions from `client.toml` after checking aggregator namespaces and direct shortcuts. This is enabled by the default `cue-cli` `extensions` Cargo feature:
 
 ```toml
 [extensions.commands.foo]
@@ -161,14 +199,7 @@ description = "Foo extension"
 ```
 
 `program` is the executable path/name; extension arguments come from the `cue foo ...`
-invocation. Then `cue foo arg` runs `cue-foo arg`. Built-in subcommands such as
-`help`, `run`, and `version` take precedence, and extension names must be
-kebab-case without colliding with built-in or first-party subcommands such as
-`tui`.
-
-When `cue` is built without the `tui` feature but with `extensions`, `cue tui`
-dispatches to the first-party external `cue-tui` binary next to `cue`. Optional
-PATH lookup for other unknown `cue-<name>` binaries can be enabled explicitly:
+invocation. Then `cue foo arg` runs `cue-foo arg`. Aggregator namespaces and shortcuts such as `client`, `tui`, `daemon`, `run`, `target`, `help`, and `version` take precedence, and extension names must be kebab-case without colliding with built-in or first-party subcommands. Optional PATH lookup for unknown `cue-<name>` binaries can be enabled explicitly:
 
 ```toml
 [extensions]

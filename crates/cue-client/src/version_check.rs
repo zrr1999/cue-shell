@@ -1,26 +1,12 @@
-//! Detect mismatched `cued` versions and warn on `cue` startup.
+//! Detect mismatched `cued` versions and warn on client startup.
 //!
 //! `cue` and `cued` are versioned together as a single workspace. When the
 //! daemon binary on a host falls behind — for example when a developer
-//! upgrades their `cue` binary but leaves an older `cued` running under
+//! upgrades their frontend binary but leaves an older `cued` running under
 //! launchd/systemd — the version check detects the mismatch before startup
-//! proceeds silently. This module centralises the detection logic so the TUI entry can:
-//!
-//! 1. Ask the running `cued` for its version via `Ping`/`Pong`; the `Pong`
-//!    payload carries a required `version` field.
-//! 2. Compare against the `cue` build's `CARGO_PKG_VERSION` and emit a
-//!    one-shot stderr warning when they disagree.
-//! 3. Optionally let the TUI startup layer auto-restart the local `cued` when
-//!    `CUE_AUTO_UPDATE_CUED=1` is set.
-//!
-//! A version mismatch is warning-only. A failed `Ping` is different: it means
-//! the connected process did not complete the IPC handshake.
-//!
-//! Disable the check entirely with `CUE_NO_VERSION_CHECK=1`.
-//!
-//! See `docs/design/ipc-protocol.md` for the wire-level details of the Pong
-//! version field.
-use cue_client::CuedClient;
+//! proceeds silently.
+
+use crate::CuedClient;
 
 /// `cue` build version this binary was compiled with.
 pub fn local_version() -> &'static str {
@@ -62,7 +48,7 @@ pub fn render_warning(verdict: &VersionMatch, suggest_auto_update: bool) -> Opti
     let body = match verdict {
         VersionMatch::Match => return None,
         VersionMatch::Mismatch { daemon, local } => {
-            format!("warning: cued is running a different version (cued={daemon}, cue={local}).",)
+            format!("warning: cued is running a different version (cued={daemon}, cue={local}).")
         }
     };
     let mut lines = vec![body];

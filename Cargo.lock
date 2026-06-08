@@ -303,18 +303,13 @@ name = "cue-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "cue-client",
  "cue-core",
  "cue-daemon",
  "cue-tui",
  "libc",
  "serde",
- "serde_json",
- "tokio",
  "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -322,12 +317,14 @@ name = "cue-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "cue-core",
  "serde",
  "serde_json",
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -376,6 +373,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "tui-term",
 ]
 

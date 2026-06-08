@@ -15,8 +15,8 @@ the tool surface stays “atomic”, see [conceptual-model.md](conceptual-model.
 └─────────────┘    JSON protocol     │  │ Gateway  │            │
                                      │  └────┬────┘            │
 ┌─────────────┐                      │  ┌────▼─────┐           │
-│  cue-cli    │◄────────────────────►│  │Scheduler │           │
-│  (headless) │                      │  └────┬─────┘           │
+│ cue-client  │◄────────────────────►│  │Scheduler │           │
+│ (headless)  │                      │  └────┬─────┘           │
 └─────────────┘                      │  ┌────▼────────┐        │
                                      │  │ ProcessMgr  │        │
                                      │  └─────────────┘        │
@@ -34,9 +34,10 @@ the tool surface stays “atomic”, see [conceptual-model.md](conceptual-model.
 | Crate | Role |
 |---|---|
 | **cue-core** | Shared domain types, command metadata, protocol definitions, pure scheduling primitives |
-| **cued** | Background daemon — process substrate, scheduler, process manager, scope store |
+| **cue-daemon** / **cued** | Background daemon — process substrate, scheduler, process manager, scope store |
+| **cue-client** | Shared client connection stack plus client CLI for `run`, `target resolve`, and `target list` |
 | **cue-tui** | Interactive TUI client (ratatui + crossterm) |
-| **cue-cli** | Headless CLI client for `cue run <file.cue>` and extension dispatch |
+| **cue-cli** | `cue` aggregator entrypoint: `cue client ...`, `cue tui ...`, `cue daemon ...`, selected shortcuts such as `cue run`, and extension dispatch |
 
 ## Core Primitives
 

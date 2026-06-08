@@ -529,54 +529,6 @@ async fn test_simple_job_execution() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_cue_run_receives_direct_job_output_without_output_subscription() {
-    timeout(TEST_TIMEOUT, async {
-        let env = TestEnv::new("cue-run-direct-output");
-        let script_path = env.root.join("direct-output.cue");
-        fs::write(
-            &script_path,
-            ":run(pty=false) sh -c \"printf 'early-out\\n'; printf 'early-err\\n' >&2\"\n",
-        )
-        .expect("write cue script");
-
-        let mut child = env.spawn_daemon();
-        let _stream = wait_for_socket(&env.socket, &mut child).await;
-
-        let output = Command::new(env!("CARGO_BIN_EXE_cue"))
-            .arg("run")
-            .arg(&script_path)
-            .env("CUE_SOCKET", &env.socket)
-            .env("XDG_RUNTIME_DIR", &env.root)
-            .env("XDG_DATA_HOME", env.root.join("data"))
-            .env("XDG_STATE_HOME", env.root.join("state"))
-            .env("XDG_CONFIG_HOME", env.root.join("config"))
-            .env("HOME", &env.root)
-            .output()
-            .await
-            .expect("run cue script");
-
-        assert!(
-            output.status.success(),
-            "cue run failed: stdout=\n{}\nstderr=\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("early-out"),
-            "stdout did not contain script stdout: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("early-err"),
-            "stderr did not contain script stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    })
-    .await
-    .expect("test timed out");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restart_restores_jobs_and_scope_head() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("persist");

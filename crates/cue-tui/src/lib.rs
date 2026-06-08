@@ -7,6 +7,7 @@
 
 mod ansi;
 mod app;
+pub mod cli;
 mod client;
 mod completion;
 mod component;
