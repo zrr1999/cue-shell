@@ -57,7 +57,7 @@ uv tool install cue-shell
 ## Development
 
 ```bash
-# Prerequisites: Rust 1.90+, just
+# Prerequisites: Rust 1.95+, just
 
 # Build
 cargo build

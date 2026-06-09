@@ -144,4 +144,4 @@ Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default sc
 | tracing | Structured logging |
 | thiserror + anyhow | Error handling |
 
-MSRV: 1.90 · Edition: 2024 · License: MIT
+MSRV: 1.95 · Edition: 2024 · License: MIT

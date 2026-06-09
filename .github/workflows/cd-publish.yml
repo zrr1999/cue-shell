@@ -45,7 +45,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.90"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-wheel-${{ matrix.label }}
@@ -54,7 +54,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: v1.13.3
-          rust-toolchain: "1.90"
+          rust-toolchain: "1.95"
           command: build
           manylinux: "2014"
           args: --release --locked --compatibility pypi --out dist
@@ -98,7 +98,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.90"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-sdist
@@ -107,7 +107,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: v1.13.3
-          rust-toolchain: "1.90"
+          rust-toolchain: "1.95"
           command: sdist
           args: --out dist
 
