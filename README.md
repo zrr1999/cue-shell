@@ -2,9 +2,9 @@
 
 Durable process substrate with a TUI for managing long-lived jobs, scopes, and schedules.
 
-> ⚠️ **Pre-1.0 production candidate** — core JOB / CRON flows, `.cue` scripts,
-> real `:fg` PTY attach, and the official command set are implemented. Public
-> contracts may still change before 1.0. Agent runtime concerns live in weft.
+> ⚠️ **Pre-1.0** — core JOB / CRON flows, `.cue` scripts, real `:fg` PTY
+> attach, client target resolution, and the official command set are implemented.
+> Public contracts may still change before 1.0. Agent runtime concerns live in weft.
 
 ## Overview
 
@@ -280,13 +280,13 @@ fails immediately because file-script execution needs a live daemon.
 | Component | Status |
 |-----------|--------|
 | Design docs | ✅ Active |
-| Cargo workspace | ✅ Scaffolded |
-| CI/CD | ✅ Configured |
+| Cargo workspace | ✅ Multi-crate workspace |
+| CI/CD | ✅ Tests, package smokes, PyPI/GitHub release path |
 | cue-core | ✅ Core types / IPC / parser in place |
-| cue-client | ✅ Production candidate (pre-1.0) |
-| cue-daemon | ✅ Production candidate (pre-1.0) |
-| cue-tui | ✅ Production candidate (pre-1.0) |
-| cue-cli | ✅ Production candidate (pre-1.0) |
+| cue-client | ✅ Transport profiles / target JSON / script runner |
+| cue-daemon | ✅ Durable jobs / crons / scopes / PTY attach |
+| cue-tui | ✅ Interactive job+cron frontend / reconnect view |
+| cue-cli | ✅ Aggregator / extension dispatch / PyPI command wrappers |
 
 ## License
 
