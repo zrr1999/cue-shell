@@ -36,27 +36,20 @@ required-features = ["python-package"]
 
 [dependencies]
 anyhow.workspace = true
-cue-client = { path = "../cue-client", optional = true }
+cue-client = { path = "../cue-client" }
 cue-core = { path = "../cue-core" }
 cue-daemon = { path = "../cue-daemon", optional = true }
 cue-tui = { path = "../cue-tui", optional = true }
-serde = { workspace = true, optional = true }
-toml = { workspace = true, optional = true }
+serde.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 libc.workspace = true
 
 [features]
-default = ["extensions"]
-extensions = [
-  "dep:cue-client",
-  "dep:serde",
-  "dep:toml",
-]
 # Enabled only by pyproject/maturin so the Python wheel exposes all first-party
 # command names while Rust workspace ownership remains split across crates.
 python-package = [
-  "dep:cue-client",
   "dep:cue-daemon",
   "dep:cue-tui",
 ]

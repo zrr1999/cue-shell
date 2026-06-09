@@ -1,9 +1,10 @@
 //! `cue-tui` — interactive TUI entry point for cue-shell.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::RunOptions;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use cue_client::daemon_lifecycle::{
     check_local_daemon_version, ensure_daemon_running, restart_handle_for_transport,
     version_from_ping, warn_on_remote_version_mismatch,
@@ -12,7 +13,58 @@ use cue_client::{
     ResolvedTransport, connect_ssh_transport, load_transport_config, transport_connector,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TuiCommand {
+    Help,
+    Version,
+    Run,
+}
+
 pub fn run() -> anyhow::Result<()> {
+    match parse_command(std::env::args_os().skip(1))? {
+        TuiCommand::Help => {
+            print_help();
+            Ok(())
+        }
+        TuiCommand::Version => {
+            println!("cue-tui {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        TuiCommand::Run => run_interactive(),
+    }
+}
+
+fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<TuiCommand> {
+    let mut args = args.into_iter();
+    let command = args.next();
+    let command = match command.as_deref() {
+        Some(command) => Some(
+            command
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("cue-tui command must be valid UTF-8"))?,
+        ),
+        None => None,
+    };
+
+    match command {
+        None => Ok(TuiCommand::Run),
+        Some("-h" | "--help" | "help") => {
+            if args.next().is_some() {
+                bail!("`cue-tui help` does not accept extra arguments");
+            }
+            Ok(TuiCommand::Help)
+        }
+        Some("-V" | "--version" | "version") => {
+            if args.next().is_some() {
+                bail!("`cue-tui version` does not accept extra arguments");
+            }
+            Ok(TuiCommand::Version)
+        }
+        Some(other) => bail!("unknown cue-tui command `{other}`; supported: help, version"),
+    }
+}
+
+fn run_interactive() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -27,6 +79,13 @@ pub fn run() -> anyhow::Result<()> {
         .context("build tokio runtime")?;
 
     rt.block_on(async_main())
+}
+
+fn print_help() {
+    println!(
+        "cue-tui {}\n\nUsage:\n  cue-tui\n  cue-tui --help\n  cue-tui --version\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 async fn async_main() -> Result<()> {

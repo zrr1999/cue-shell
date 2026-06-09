@@ -65,7 +65,19 @@ jobs:
           repo_root="$PWD"
           wheel_path="$repo_root/dist/$(basename dist/*.whl)"
           uv tool run --from "$wheel_path" cue --version
+          uv tool run --from "$wheel_path" cue --help
+          uv tool run --from "$wheel_path" cue-client --version
+          uv tool run --from "$wheel_path" cue-client target resolve --json
+          uv tool run --from "$wheel_path" cue-client target list --json
+          uv tool run --from "$wheel_path" cue-tui --version
+          uv tool run --from "$wheel_path" cue-daemon --version
           uv tool run --from "$wheel_path" cued --version
+          uv tool run --from "$wheel_path" cue client target resolve --json
+          uv tool run --from "$wheel_path" cue daemon --version
+          if uv tool run --from "$wheel_path" cue target resolve --json; then
+            echo "cue target unexpectedly succeeded" >&2
+            exit 1
+          fi
           uv tool run --from "$wheel_path" cued status
 
       - name: Upload wheel artifact
@@ -105,7 +117,19 @@ jobs:
           repo_root="$PWD"
           sdist_path="$repo_root/dist/$(basename dist/*.tar.gz)"
           uv tool run --from "$sdist_path" cue --version
+          uv tool run --from "$sdist_path" cue --help
+          uv tool run --from "$sdist_path" cue-client --version
+          uv tool run --from "$sdist_path" cue-client target resolve --json
+          uv tool run --from "$sdist_path" cue-client target list --json
+          uv tool run --from "$sdist_path" cue-tui --version
+          uv tool run --from "$sdist_path" cue-daemon --version
           uv tool run --from "$sdist_path" cued --version
+          uv tool run --from "$sdist_path" cue client target resolve --json
+          uv tool run --from "$sdist_path" cue daemon --version
+          if uv tool run --from "$sdist_path" cue target resolve --json; then
+            echo "cue target unexpectedly succeeded" >&2
+            exit 1
+          fi
           uv tool run --from "$sdist_path" cued status
 
       - name: Upload sdist artifact

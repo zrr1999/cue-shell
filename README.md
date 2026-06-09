@@ -49,7 +49,8 @@ crates/
 ## Installation
 
 ```bash
-# Install both `cue` and `cued` from PyPI
+# Install the official command set from PyPI:
+# `cue`, `cue-client`, `cue-tui`, `cue-daemon`, and `cued`.
 uv tool install cue-shell
 ```
 
@@ -190,7 +191,7 @@ cue-client target list --json
 
 Direct daemon/socket integrations only see the server side and will not apply client profile selection by themselves.
 
-`cue` can also dispatch external CLI extensions from `client.toml` after checking aggregator namespaces and direct shortcuts. This is enabled by the default `cue-cli` `extensions` Cargo feature:
+`cue` can also dispatch external CLI extensions from `client.toml` after checking aggregator namespaces and direct shortcuts:
 
 ```toml
 [extensions.commands.foo]
@@ -281,6 +282,7 @@ fails immediately because file-script execution needs a live daemon.
 | Cargo workspace | ✅ Scaffolded |
 | CI/CD | ✅ Configured |
 | cue-core | ✅ Core types / IPC / parser in place |
+| cue-client | 🚧 Functional prototype |
 | cue-daemon | 🚧 Functional prototype |
 | cue-tui | 🚧 Functional prototype |
 | cue-cli | 🚧 Functional prototype |

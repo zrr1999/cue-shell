@@ -16,7 +16,7 @@ This note summarizes the current repository state, implementation complexity, de
 
 ### CLI / TUI extension shape
 
-`cue-tui` is an optional Cargo dependency of `cue-cli` behind the `tui` feature. When that feature is enabled, `cue` and `cue tui` enter the TUI in-process. When `cue` is built without `tui` but with `extensions`, `cue tui` dispatches to the first-party external `cue-tui` companion binary next to `cue`.
+`cue-tui` is owned by the `cue-tui` crate. The top-level `cue` aggregator dispatches `cue tui` to the first-party external `cue-tui` companion binary next to `cue` or on PATH; it does not embed the TUI behind a feature flag.
 
 A near-term external CLI extension registry now exists:
 
@@ -72,11 +72,7 @@ It depends heavily on which level of extension is meant.
 
 ### Level 0 — static feature subcommands
 
-Still supported for `cue tui` when `cue-cli` is built with the `tui` feature.
-
-- Complexity: already present.
-- Good for first-party compiled modules.
-- Bad for third-party / local extension discovery.
+Retired for the aggregator surface. First-party commands are owned by their own crates and reached through explicit dispatch (`cue client ...`, `cue tui`, `cue daemon ...`) rather than in-process `cue-cli` feature subcommands.
 
 ### Level 1 — external subcommand dispatch (`cue-foo`)
 
@@ -209,7 +205,7 @@ Implemented near-term behavior:
 - configured `[extensions.commands.<name>]` entries for non-reserved names are
   checked before PATH;
 - PATH lookup is gated by `[extensions] path_lookup = true`;
-- `cue tui` can fall through to the first-party external `cue-tui` companion binary next to `cue` when the in-process `tui` feature is not compiled in;
+- `cue tui` dispatches to the first-party external `cue-tui` companion binary next to `cue` or on PATH;
 - unknown extensions receive forwarded args and environment.
 
 TODO:

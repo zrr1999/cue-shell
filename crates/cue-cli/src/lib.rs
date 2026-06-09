@@ -1,13 +1,8 @@
-#[cfg(feature = "extensions")]
 mod companion_binary;
-#[cfg(feature = "extensions")]
 mod config;
-#[cfg(feature = "extensions")]
 mod extension_dispatch;
-#[cfg(feature = "extensions")]
 mod path_lookup;
 
-#[cfg(feature = "extensions")]
 pub fn run_extension(
     name: &str,
     args: &[std::ffi::OsString],

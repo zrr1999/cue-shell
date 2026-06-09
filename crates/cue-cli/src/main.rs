@@ -169,18 +169,9 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-#[cfg(feature = "extensions")]
 fn run_extension(name: &str, args: &[OsString]) -> anyhow::Result<()> {
     let code = cue_cli::run_extension(name, args, supported_subcommands())?;
     std::process::exit(process_exit_code(code));
-}
-
-#[cfg(not(feature = "extensions"))]
-fn run_extension(name: &str, _args: &[OsString]) -> anyhow::Result<()> {
-    bail!(
-        "unknown cue namespace `{name}`; supported: {} (external extensions unavailable in this build)",
-        supported_subcommands()
-    )
 }
 
 fn process_exit_code(code: i32) -> i32 {
@@ -192,29 +183,14 @@ fn print_help() {
 }
 
 fn help_text() -> String {
-    let extension_usage = if cfg!(feature = "extensions") {
-        "\n  cue <extension> [args...]"
-    } else {
-        ""
-    };
-    let extension_help = if cfg!(feature = "extensions") {
-        "\n  <extension>  Run a configured external command, or cue-<extension> when enabled"
-    } else {
-        ""
-    };
-
     format!(
-        "cue {}\n\nUsage:\n  cue <namespace> [args...]\n  cue run <file.cue>\n  cue --help\n  cue --version{extension_usage}\n\nNamespaces:\n  client      Client-side commands: target profiles, run, IPC utilities\n  tui         Interactive terminal UI\n  daemon      Daemon lifecycle and gateway commands{extension_help}\n\nShortcuts:\n  run         Alias for `cue client run`\n\nExamples:\n  cue client target list\n  cue client target resolve --json\n  cue client run script.cue\n  cue tui\n  cue daemon status\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
+        "cue {}\n\nUsage:\n  cue <namespace> [args...]\n  cue run <file.cue>\n  cue --help\n  cue --version\n  cue <extension> [args...]\n\nNamespaces:\n  client      Client-side commands: target profiles, run, IPC utilities\n  tui         Interactive terminal UI\n  daemon      Daemon lifecycle and gateway commands\n  <extension>  Run a configured external command, or cue-<extension> when enabled\n\nShortcuts:\n  run         Alias for `cue client run`\n\nExamples:\n  cue client target list\n  cue client target resolve --json\n  cue client run script.cue\n  cue tui\n  cue daemon status\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
         env!("CARGO_PKG_VERSION"),
     )
 }
 
 fn supported_subcommands() -> &'static str {
-    if cfg!(feature = "extensions") {
-        "client, tui, daemon, run, help, version, <extension>"
-    } else {
-        "client, tui, daemon, run, help, version"
-    }
+    "client, tui, daemon, run, help, version, <extension>"
 }
 
 #[cfg(test)]
@@ -359,12 +335,14 @@ mod tests {
     }
 
     #[test]
-    fn help_text_mentions_aggregator_namespaces() {
+    fn help_text_mentions_aggregator_namespaces_and_extensions() {
         let text = help_text();
         assert!(text.contains("cue <namespace> [args...]"));
+        assert!(text.contains("cue <extension> [args...]"));
         assert!(text.contains("client"));
         assert!(text.contains("tui"));
         assert!(text.contains("daemon"));
+        assert!(text.contains("<extension>  Run a configured external command"));
         assert!(text.contains("Alias for `cue client run`"));
         assert!(text.contains("cue client target resolve --json"));
     }
