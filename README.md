@@ -2,8 +2,9 @@
 
 Durable process substrate with a TUI for managing long-lived jobs, scopes, and schedules.
 
-> ⚠️ **Prototype stage** — core JOB / CRON flows are implemented, including
-> real `:fg` PTY attach. Agent runtime concerns live in weft.
+> ⚠️ **Pre-1.0 production candidate** — core JOB / CRON flows, `.cue` scripts,
+> real `:fg` PTY attach, and the official command set are implemented. Public
+> contracts may still change before 1.0. Agent runtime concerns live in weft.
 
 ## Overview
 
@@ -282,10 +283,10 @@ fails immediately because file-script execution needs a live daemon.
 | Cargo workspace | ✅ Scaffolded |
 | CI/CD | ✅ Configured |
 | cue-core | ✅ Core types / IPC / parser in place |
-| cue-client | 🚧 Functional prototype |
-| cue-daemon | 🚧 Functional prototype |
-| cue-tui | 🚧 Functional prototype |
-| cue-cli | 🚧 Functional prototype |
+| cue-client | ✅ Production candidate (pre-1.0) |
+| cue-daemon | ✅ Production candidate (pre-1.0) |
+| cue-tui | ✅ Production candidate (pre-1.0) |
+| cue-cli | ✅ Production candidate (pre-1.0) |
 
 ## License
 
