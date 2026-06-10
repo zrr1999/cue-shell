@@ -352,6 +352,8 @@ pub struct JobInfo {
     pub chain_id: Option<String>,
     pub chain_index: Option<usize>,
     pub chain_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

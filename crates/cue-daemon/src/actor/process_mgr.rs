@@ -2255,6 +2255,7 @@ mod tests {
             scope_store: scope_tx,
             event_bus: event_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
 
         emit_output(&sys, JobId(7), OutputStream::Stdout, b"\xffbin\n", None).await;
@@ -2290,6 +2291,7 @@ mod tests {
             scope_store: scope_tx,
             event_bus: event_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
 
         emit_output(&sys, JobId(7), OutputStream::Stdout, b"script\n", Some(42)).await;
@@ -2336,6 +2338,7 @@ mod tests {
             scope_store: scope_tx,
             event_bus: event_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
 
         emit_output_eof(&sys, JobId(7), Some(42)).await;
@@ -2475,6 +2478,7 @@ mod tests {
             scope_store: scope_tx,
             event_bus: event_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
 
         spawn(process_rx, sys);
@@ -2544,6 +2548,7 @@ mod tests {
             scope_store: scope_tx,
             event_bus: event_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
 
         spawn(process_rx, sys);

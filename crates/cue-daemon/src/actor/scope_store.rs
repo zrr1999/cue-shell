@@ -377,6 +377,7 @@ mod tests {
             scope_store: scope_tx.clone(),
             event_bus: event_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
         spawn(scope_rx, conn, sys).await.expect("spawn scope store");
 
@@ -448,6 +449,7 @@ mod tests {
             scope_store: scope_tx.clone(),
             event_bus: event_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
         spawn(scope_rx, conn, sys).await.expect("spawn scope store");
 
@@ -504,6 +506,7 @@ mod tests {
             scope_store: scope_tx.clone(),
             event_bus: event_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
         spawn(scope_rx, conn, sys).await.expect("spawn scope store");
 
@@ -582,6 +585,7 @@ mod tests {
             scope_store: scope_tx.clone(),
             event_bus: event_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
         spawn(scope_rx, conn, sys).await.expect("spawn scope store");
 
@@ -640,6 +644,7 @@ mod tests {
             scope_store: scope_tx.clone(),
             event_bus: event_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
         spawn(scope_rx, conn, sys).await.expect("spawn scope store");
 
@@ -677,6 +682,7 @@ mod tests {
             scope_store: scope_tx.clone(),
             event_bus: event_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
         spawn(scope_rx, conn, sys).await.expect("spawn scope store");
 

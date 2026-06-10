@@ -20,11 +20,13 @@ use cue_core::ipc::{
 use cue_core::job::{CancelReason, EXIT_CODE_UNAVAILABLE, JobStatus};
 use cue_core::mode::Mode;
 use cue_core::pipeline::{ChainNode, ParallelOp, SerialOp, command_prefers_foreground};
-use cue_core::scope::EnvSnapshot;
+use cue_core::resource::Need;
+use cue_core::scope::{EnvDelta, EnvSnapshot};
 use cue_core::{ChainId, CronId, EventChannel, JobId, ScopeHash, ScriptId};
 
 use crate::config::{BlockDecision, Config};
 use crate::parser::{ResolvedCommand, ResolvedScriptItem, Token, Tokenizer, parse_command};
+use crate::resource::RejectGroup;
 use crate::storage;
 use crate::word_expansion::expand_command_line;
 
@@ -85,6 +87,10 @@ struct ChainState {
     pty_enabled: bool,
     /// Client that should receive output for spawned leaves directly.
     direct_output_client: Option<u64>,
+    /// Resource needs declared via `:run(need.X=Y)` mode params. Reserved
+    /// per-leaf at admission time and released on each leaf's terminal
+    /// transition. Empty `Need` short-circuits the registry path entirely.
+    needs: Need,
 }
 
 /// Flattened representation of a chain leaf for easy lookup.
@@ -118,6 +124,11 @@ struct JobEntry {
     chain_id: Option<ChainId>,
     chain_index: Option<usize>,
     chain_total: Option<usize>,
+    /// Human-readable reason a job is held in `Pending` status — currently
+    /// used by resource admission to surface why a `:run(need.X=Y)` chain
+    /// was rejected by `ProviderRegistry::try_reserve`. `None` for jobs
+    /// that are running or already terminal.
+    pending_reason: Option<String>,
 }
 
 // ── Cron entry ──────────────────────────────────────────────────────────────
@@ -137,6 +148,10 @@ struct CronEntry {
     scope_enabled: bool,
     /// Whether the wrapper binary is enabled for jobs spawned by this cron.
     wrapper_enabled: bool,
+    /// Resource needs applied to each job spawned by this cron while the
+    /// daemon stays alive. Restored crons currently default to empty needs
+    /// because persisted cron records store command text only.
+    needs: Need,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -170,6 +185,14 @@ struct ChainCompletion {
     end_scope: Option<ScopeHash>,
 }
 
+#[derive(Clone)]
+struct PendingResourceAdmission {
+    plan: cue_core::pipeline::JobPlan,
+    base_scope: ScopeHash,
+    options: ProcessJobOptions,
+    needs: Need,
+}
+
 // ── Scheduler state (all mutable state lives here) ──────────────────────────
 
 struct SchedulerState {
@@ -196,6 +219,10 @@ struct SchedulerState {
     completed_chains: HashMap<ChainId, ChainCompletion>,
     /// Runtime wrapper toggle set by `:wrap on` / `:wrap off`.
     wrapper_enabled: Option<bool>,
+    /// Jobs waiting for resource admission, preserved in FIFO retry order.
+    pending_resource_jobs: VecDeque<JobId>,
+    /// Spawn context for each resource-pending job.
+    pending_resource: HashMap<JobId, PendingResourceAdmission>,
 }
 
 #[derive(Clone, Copy)]
@@ -242,6 +269,8 @@ impl SchedulerState {
             pending_script_chains: HashMap::new(),
             completed_chains: HashMap::new(),
             wrapper_enabled: None,
+            pending_resource_jobs: VecDeque::new(),
+            pending_resource: HashMap::new(),
         }
     }
 
@@ -520,6 +549,7 @@ async fn restore_jobs(
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                pending_reason: None,
             },
         );
     }
@@ -624,6 +654,7 @@ async fn restore_crons(
                 cwd_override: cron.cwd_override,
                 scope_enabled: cron.scope_enabled,
                 wrapper_enabled: cron.wrapper_enabled,
+                needs: Need::new(),
             },
         );
     }
@@ -1553,6 +1584,192 @@ async fn spawn_process_job(
         .map_err(|_| "process_mgr unreachable".to_string())
 }
 
+enum ResourceAdmission {
+    Granted(ScopeHash),
+    Pending(String),
+}
+
+fn pending_reason_from_reject(reject: RejectGroup) -> String {
+    if reject.provider_id.as_str() == "core" {
+        reject.reject.reason
+    } else {
+        reject.to_string()
+    }
+}
+
+async fn admit_resource_scope(
+    sys: &ActorSystem,
+    job_id: JobId,
+    base_scope: ScopeHash,
+    needs: &Need,
+) -> Result<ResourceAdmission, String> {
+    if needs.is_empty() {
+        return Ok(ResourceAdmission::Granted(base_scope));
+    }
+
+    let grants = match sys.resources.try_reserve(job_id, needs) {
+        Ok(grants) => grants,
+        Err(reject) => {
+            return Ok(ResourceAdmission::Pending(pending_reason_from_reject(
+                reject,
+            )));
+        }
+    };
+
+    let mut set = std::collections::BTreeMap::new();
+    for grant in grants {
+        set.extend(grant.env);
+    }
+    if set.is_empty() {
+        return Ok(ResourceAdmission::Granted(base_scope));
+    }
+
+    match derive_scope(
+        sys,
+        base_scope,
+        EnvDelta {
+            set,
+            unset: Vec::new(),
+            cwd: None,
+        },
+    )
+    .await
+    {
+        Ok(scope) => Ok(ResourceAdmission::Granted(scope)),
+        Err(error) => {
+            let released = sys.resources.release(job_id);
+            warn!(%job_id, released, "scheduler: released resource grants after scope derive failure");
+            Err(format!("derive resource scope: {error}"))
+        }
+    }
+}
+
+fn record_resource_pending(
+    state: &mut SchedulerState,
+    job_id: JobId,
+    reason: String,
+    pending: PendingResourceAdmission,
+) {
+    if let Some(entry) = state.jobs.get_mut(&job_id) {
+        entry.status = JobStatus::Pending;
+        entry.pending_reason = Some(reason);
+    }
+    state.pending_resource.insert(job_id, pending);
+    if !state.pending_resource_jobs.contains(&job_id) {
+        state.pending_resource_jobs.push_back(job_id);
+    }
+}
+
+fn forget_resource_pending(state: &mut SchedulerState, job_id: JobId) {
+    state.pending_resource.remove(&job_id);
+    state
+        .pending_resource_jobs
+        .retain(|queued| *queued != job_id);
+}
+
+async fn retry_pending_resource_admissions(state: &mut SchedulerState, io: SchedulerIo<'_>) {
+    let retry_len = state.pending_resource_jobs.len();
+    for _ in 0..retry_len {
+        let Some(job_id) = state.pending_resource_jobs.pop_front() else {
+            break;
+        };
+        let Some(pending) = state.pending_resource.get(&job_id).cloned() else {
+            continue;
+        };
+        if !state
+            .jobs
+            .get(&job_id)
+            .is_some_and(|entry| entry.status == JobStatus::Pending)
+        {
+            state.pending_resource.remove(&job_id);
+            continue;
+        }
+
+        match admit_resource_scope(io.sys, job_id, pending.base_scope, &pending.needs).await {
+            Ok(ResourceAdmission::Pending(reason)) => {
+                if let Some(entry) = state.jobs.get_mut(&job_id) {
+                    entry.pending_reason = Some(reason);
+                }
+                state.pending_resource_jobs.push_back(job_id);
+            }
+            Ok(ResourceAdmission::Granted(spawn_scope)) => {
+                state.pending_resource.remove(&job_id);
+                let (old_state, chain_id) = match state.jobs.get_mut(&job_id) {
+                    Some(entry) => {
+                        let old_state = entry.status.clone();
+                        entry.status = JobStatus::Running;
+                        entry.pending_reason = None;
+                        entry.start_scope = Some(spawn_scope);
+                        (old_state, entry.chain_id)
+                    }
+                    None => continue,
+                };
+                if let Some((cid, idx)) = state.job_to_chain.get(&job_id).copied()
+                    && let Some(chain) = state.chains.get_mut(&cid)
+                {
+                    chain.leaf_status.insert(idx, LeafStatus::Running);
+                }
+                publish_job_state_changed(
+                    io.sys,
+                    state,
+                    job_id,
+                    old_state,
+                    JobStatus::Running,
+                    None,
+                )
+                .await;
+                if let Some(chain_id) = chain_id {
+                    publish_chain_progress(io.sys, state, chain_id).await;
+                }
+                if let Err(error) =
+                    spawn_process_job(io.sys, job_id, pending.plan, spawn_scope, pending.options)
+                        .await
+                {
+                    warn!(%job_id, "scheduler: failed to spawn resource-admitted job: {error}");
+                    let terminal = set_job_terminal_state(
+                        job_id,
+                        TerminalStateUpdate {
+                            status: JobStatus::Failed,
+                            exit_code: EXIT_CODE_UNAVAILABLE,
+                            end_scope: Some(spawn_scope),
+                            advance_chain: true,
+                        },
+                        state,
+                        io.db,
+                        io.sys,
+                    )
+                    .await;
+                    if let Some(error) = terminal.persist_error {
+                        warn!(%job_id, "scheduler: failed to persist spawn failure after resource admission: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                state.pending_resource.remove(&job_id);
+                if let Some(entry) = state.jobs.get_mut(&job_id) {
+                    entry.pending_reason = Some(error.clone());
+                }
+                let terminal = set_job_terminal_state(
+                    job_id,
+                    TerminalStateUpdate {
+                        status: JobStatus::Failed,
+                        exit_code: EXIT_CODE_UNAVAILABLE,
+                        end_scope: Some(pending.base_scope),
+                        advance_chain: true,
+                    },
+                    state,
+                    io.db,
+                    io.sys,
+                )
+                .await;
+                if let Some(error) = terminal.persist_error {
+                    warn!(%job_id, "scheduler: failed to persist resource admission internal failure: {error}");
+                }
+            }
+        }
+    }
+}
+
 fn process_job_options(
     cwd_override: Option<std::path::PathBuf>,
     wrapper_enabled: bool,
@@ -1590,6 +1807,7 @@ struct ChainSpawnOptions {
     wrapper_enabled: bool,
     pty_enabled: bool,
     direct_output_client: Option<u64>,
+    needs: Need,
 }
 
 impl ChainSpawnOptions {
@@ -1716,6 +1934,14 @@ async fn set_job_terminal_state(
         };
     };
 
+    if new_status.is_terminal() {
+        forget_resource_pending(state, job_id);
+        let released = sys.resources.release(job_id);
+        if released > 0 {
+            debug!(%job_id, released, "scheduler: released resource reservations for terminal job");
+        }
+    }
+
     publish_job_state_changed(
         sys,
         state,
@@ -1793,6 +2019,7 @@ fn job_info_from_entry(entry: &JobEntry) -> JobInfo {
         chain_id: entry.chain_id.map(|id| id.to_string()),
         chain_index: entry.chain_index,
         chain_total: entry.chain_total,
+        pending_reason: entry.pending_reason.clone(),
     }
 }
 
@@ -1884,6 +2111,7 @@ async fn fire_due_crons(
         let cwd_override = entry.cwd_override.clone();
         let scope_enabled = entry.scope_enabled;
         let wrapper_enabled = entry.wrapper_enabled;
+        let needs = entry.needs.clone();
 
         info!(%cron_id, "scheduler: cron triggered");
         let warnings = match check_chain_guardrails(&chain, config) {
@@ -1905,6 +2133,7 @@ async fn fire_due_crons(
                     wrapper_enabled,
                     pty_enabled: true,
                     direct_output_client: None,
+                    needs,
                 },
                 warnings,
                 retain_completed_chain: false,
@@ -2002,38 +2231,85 @@ async fn spawn_chain(
         let jid = state.alloc_job();
         let open_hint = classify_job_plan_open_hint(&leaf.plan);
 
-        state.jobs.insert(
-            jid,
-            JobEntry {
-                job_id: jid,
-                pipeline_text: leaf.pipeline_text.clone(),
-                status: JobStatus::Running,
-                exit_code: None,
-                start_scope: Some(scope_hash),
-                end_scope: None,
-                open_hint,
-                chain_id: None,
-                chain_index: None,
-                chain_total: None,
-            },
-        );
-
-        publish_job_created(
-            io.sys,
-            state,
-            jid,
-            &leaf.pipeline_text,
-            scope_hash,
-            open_hint,
-        )
-        .await;
-
-        match options
+        let scope_transform = match options
             .scope_enabled
             .then(|| scope_transform_from_command(leaf.command()))
             .transpose()
         {
-            Ok(Some(_)) => {
+            Ok(value) => value,
+            Err(message) => {
+                state.jobs.insert(
+                    jid,
+                    JobEntry {
+                        job_id: jid,
+                        pipeline_text: leaf.pipeline_text.clone(),
+                        status: JobStatus::Running,
+                        exit_code: None,
+                        start_scope: Some(scope_hash),
+                        end_scope: None,
+                        open_hint,
+                        chain_id: None,
+                        chain_index: None,
+                        chain_total: None,
+                        pending_reason: None,
+                    },
+                );
+                publish_job_created(
+                    io.sys,
+                    state,
+                    jid,
+                    &leaf.pipeline_text,
+                    scope_hash,
+                    open_hint,
+                )
+                .await;
+                let terminal = set_job_terminal_state(
+                    jid,
+                    TerminalStateUpdate {
+                        status: JobStatus::Failed,
+                        exit_code: EXIT_CODE_UNAVAILABLE,
+                        end_scope: Some(scope_hash),
+                        advance_chain: true,
+                    },
+                    state,
+                    io.db,
+                    io.sys,
+                )
+                .await;
+                if let Some(error) = terminal.persist_error {
+                    return ResponsePayload::err(error_code::INTERNAL, error);
+                }
+                return ResponsePayload::err(error_code::INVALID_SYNTAX, message);
+            }
+        };
+
+        match scope_transform {
+            Some(_) => {
+                state.jobs.insert(
+                    jid,
+                    JobEntry {
+                        job_id: jid,
+                        pipeline_text: leaf.pipeline_text.clone(),
+                        status: JobStatus::Running,
+                        exit_code: None,
+                        start_scope: Some(scope_hash),
+                        end_scope: None,
+                        open_hint,
+                        chain_id: None,
+                        chain_index: None,
+                        chain_total: None,
+                        pending_reason: None,
+                    },
+                );
+                publish_job_created(
+                    io.sys,
+                    state,
+                    jid,
+                    &leaf.pipeline_text,
+                    scope_hash,
+                    open_hint,
+                )
+                .await;
                 info!(%jid, pipeline = %leaf.pipeline_text, "scheduler: applying single scope-transform job");
                 match apply_scope_transform(io.sys, scope_hash, leaf.command()).await {
                     Ok(end_scope) => {
@@ -2074,18 +2350,158 @@ async fn spawn_chain(
                         }
                     }
                 }
+
+                return ResponsePayload::Ok(OkPayload::JobCreated {
+                    job_id: jid.to_string(),
+                    start_scope: Some(scope_hash.to_string()),
+                    open_hint,
+                    chain_id: None,
+                    chain_index: None,
+                    chain_total: None,
+                    warnings,
+                });
             }
-            Ok(None) => {
-                info!(%jid, pipeline = %leaf.pipeline_text, "scheduler: spawning single job");
-                if let Err(message) = spawn_process_job(
-                    io.sys,
-                    jid,
-                    leaf.plan.clone(),
-                    scope_hash,
-                    options.process_job_options(),
-                )
-                .await
-                {
+            None => match admit_resource_scope(io.sys, jid, scope_hash, &options.needs).await {
+                Ok(ResourceAdmission::Pending(reason)) => {
+                    state.jobs.insert(
+                        jid,
+                        JobEntry {
+                            job_id: jid,
+                            pipeline_text: leaf.pipeline_text.clone(),
+                            status: JobStatus::Pending,
+                            exit_code: None,
+                            start_scope: Some(scope_hash),
+                            end_scope: None,
+                            open_hint,
+                            chain_id: None,
+                            chain_index: None,
+                            chain_total: None,
+                            pending_reason: Some(reason.clone()),
+                        },
+                    );
+                    record_resource_pending(
+                        state,
+                        jid,
+                        reason,
+                        PendingResourceAdmission {
+                            plan: leaf.plan.clone(),
+                            base_scope: scope_hash,
+                            options: options.process_job_options(),
+                            needs: options.needs.clone(),
+                        },
+                    );
+                    publish_job_created(
+                        io.sys,
+                        state,
+                        jid,
+                        &leaf.pipeline_text,
+                        scope_hash,
+                        open_hint,
+                    )
+                    .await;
+                    return ResponsePayload::Ok(OkPayload::JobCreated {
+                        job_id: jid.to_string(),
+                        start_scope: Some(scope_hash.to_string()),
+                        open_hint,
+                        chain_id: None,
+                        chain_index: None,
+                        chain_total: None,
+                        warnings,
+                    });
+                }
+                Ok(ResourceAdmission::Granted(spawn_scope)) => {
+                    state.jobs.insert(
+                        jid,
+                        JobEntry {
+                            job_id: jid,
+                            pipeline_text: leaf.pipeline_text.clone(),
+                            status: JobStatus::Running,
+                            exit_code: None,
+                            start_scope: Some(spawn_scope),
+                            end_scope: None,
+                            open_hint,
+                            chain_id: None,
+                            chain_index: None,
+                            chain_total: None,
+                            pending_reason: None,
+                        },
+                    );
+                    publish_job_created(
+                        io.sys,
+                        state,
+                        jid,
+                        &leaf.pipeline_text,
+                        spawn_scope,
+                        open_hint,
+                    )
+                    .await;
+                    info!(%jid, pipeline = %leaf.pipeline_text, "scheduler: spawning single job");
+                    if let Err(message) = spawn_process_job(
+                        io.sys,
+                        jid,
+                        leaf.plan.clone(),
+                        spawn_scope,
+                        options.process_job_options(),
+                    )
+                    .await
+                    {
+                        let terminal = set_job_terminal_state(
+                            jid,
+                            TerminalStateUpdate {
+                                status: JobStatus::Failed,
+                                exit_code: EXIT_CODE_UNAVAILABLE,
+                                end_scope: Some(spawn_scope),
+                                advance_chain: true,
+                            },
+                            state,
+                            io.db,
+                            io.sys,
+                        )
+                        .await;
+                        if let Some(error) = terminal.persist_error {
+                            return ResponsePayload::err(
+                                error_code::INTERNAL,
+                                format!("{message}; {error}"),
+                            );
+                        }
+                        return ResponsePayload::err(error_code::INTERNAL, message);
+                    }
+                    return ResponsePayload::Ok(OkPayload::JobCreated {
+                        job_id: jid.to_string(),
+                        start_scope: Some(spawn_scope.to_string()),
+                        open_hint,
+                        chain_id: None,
+                        chain_index: None,
+                        chain_total: None,
+                        warnings,
+                    });
+                }
+                Err(message) => {
+                    state.jobs.insert(
+                        jid,
+                        JobEntry {
+                            job_id: jid,
+                            pipeline_text: leaf.pipeline_text.clone(),
+                            status: JobStatus::Running,
+                            exit_code: None,
+                            start_scope: Some(scope_hash),
+                            end_scope: None,
+                            open_hint,
+                            chain_id: None,
+                            chain_index: None,
+                            chain_total: None,
+                            pending_reason: Some(message.clone()),
+                        },
+                    );
+                    publish_job_created(
+                        io.sys,
+                        state,
+                        jid,
+                        &leaf.pipeline_text,
+                        scope_hash,
+                        open_hint,
+                    )
+                    .await;
                     let terminal = set_job_terminal_state(
                         jid,
                         TerminalStateUpdate {
@@ -2107,37 +2523,8 @@ async fn spawn_chain(
                     }
                     return ResponsePayload::err(error_code::INTERNAL, message);
                 }
-            }
-            Err(message) => {
-                let terminal = set_job_terminal_state(
-                    jid,
-                    TerminalStateUpdate {
-                        status: JobStatus::Failed,
-                        exit_code: EXIT_CODE_UNAVAILABLE,
-                        end_scope: Some(scope_hash),
-                        advance_chain: true,
-                    },
-                    state,
-                    io.db,
-                    io.sys,
-                )
-                .await;
-                if let Some(error) = terminal.persist_error {
-                    return ResponsePayload::err(error_code::INTERNAL, error);
-                }
-                return ResponsePayload::err(error_code::INVALID_SYNTAX, message);
-            }
+            },
         }
-
-        return ResponsePayload::Ok(OkPayload::JobCreated {
-            job_id: jid.to_string(),
-            start_scope: Some(scope_hash.to_string()),
-            open_hint,
-            chain_id: None,
-            chain_index: None,
-            chain_total: None,
-            warnings,
-        });
     }
 
     let chain_text = chain.to_string();
@@ -2160,6 +2547,7 @@ async fn spawn_chain(
         wrapper_enabled: options.wrapper_enabled,
         pty_enabled: options.pty_enabled,
         direct_output_client: options.direct_output_client,
+        needs: options.needs.clone(),
     };
     state.chains.insert(chain_id, chain_state);
 
@@ -2261,6 +2649,7 @@ async fn handle_job_finished(
             warn!(%chain_id, "scheduler: chain advance reported a persistence error: {error}");
         }
     }
+    retry_pending_resource_admissions(state, SchedulerIo::new(db, sys)).await;
 }
 
 async fn apply_user_terminal_job_update(
@@ -2296,6 +2685,7 @@ async fn apply_user_terminal_job_update(
             persist_error = advance.persist_error;
         }
     }
+    retry_pending_resource_admissions(state, runtime.io).await;
     advance_pending_scripts_after_terminal_job(job_id, reported_exit_code, state, runtime).await;
     persist_error
 }
@@ -2321,7 +2711,7 @@ async fn process_chain_advance(
         outcome.record_persist_error(error);
     }
 
-    let (leaves, wrapper_enabled, scope_enabled, pty_enabled, direct_output_client) = {
+    let (leaves, wrapper_enabled, scope_enabled, pty_enabled, direct_output_client, needs) = {
         let Some(chain) = state.chains.get(&chain_id) else {
             return outcome;
         };
@@ -2331,6 +2721,7 @@ async fn process_chain_advance(
             chain.scope_enabled,
             chain.pty_enabled,
             chain.direct_output_client,
+            chain.needs.clone(),
         )
     };
 
@@ -2364,6 +2755,7 @@ async fn process_chain_advance(
                 chain_id: Some(chain_id),
                 chain_index: Some(idx),
                 chain_total: Some(leaves.len()),
+                pending_reason: None,
             },
         );
 
@@ -2436,44 +2828,97 @@ async fn process_chain_advance(
                 }
             }
             Ok(None) => {
-                if let Err(error) = spawn_process_job(
-                    io.sys,
-                    jid,
-                    leaves[idx].plan.clone(),
-                    start_scope,
-                    process_job_options(
-                        cwd_override.clone(),
-                        wrapper_enabled,
-                        pty_enabled,
-                        direct_output_client,
-                    ),
-                )
-                .await
-                {
-                    warn!(%chain_id, %jid, pipeline = %leaves[idx].pipeline_text, "scheduler: failed to spawn chain leaf: {error}");
-                    outcome.spawn_error.get_or_insert_with(|| error.clone());
-                    let terminal = set_job_terminal_state(
-                        jid,
-                        TerminalStateUpdate {
-                            status: JobStatus::Failed,
-                            exit_code: EXIT_CODE_UNAVAILABLE,
-                            end_scope: Some(start_scope),
-                            advance_chain: true,
-                        },
-                        state,
-                        io.db,
-                        io.sys,
-                    )
-                    .await;
-                    apply_terminal_chain_advance(
-                        chain_id,
-                        terminal,
-                        &mut outcome,
-                        &mut queue,
-                        state,
-                        io,
-                    )
-                    .await;
+                let proc_options = process_job_options(
+                    cwd_override.clone(),
+                    wrapper_enabled,
+                    pty_enabled,
+                    direct_output_client,
+                );
+                match admit_resource_scope(io.sys, jid, start_scope, &needs).await {
+                    Ok(ResourceAdmission::Pending(reason)) => {
+                        if let Some(chain) = state.chains.get_mut(&chain_id) {
+                            chain.leaf_status.insert(idx, LeafStatus::Pending);
+                        }
+                        record_resource_pending(
+                            state,
+                            jid,
+                            reason,
+                            PendingResourceAdmission {
+                                plan: leaves[idx].plan.clone(),
+                                base_scope: start_scope,
+                                options: proc_options,
+                                needs: needs.clone(),
+                            },
+                        );
+                        debug!(%chain_id, %jid, leaf_idx = idx, "scheduler: chain leaf waiting for resources");
+                    }
+                    Ok(ResourceAdmission::Granted(spawn_scope)) => {
+                        if let Some(entry) = state.jobs.get_mut(&jid) {
+                            entry.start_scope = Some(spawn_scope);
+                        }
+                        if let Err(error) = spawn_process_job(
+                            io.sys,
+                            jid,
+                            leaves[idx].plan.clone(),
+                            spawn_scope,
+                            proc_options,
+                        )
+                        .await
+                        {
+                            warn!(%chain_id, %jid, pipeline = %leaves[idx].pipeline_text, "scheduler: failed to spawn chain leaf: {error}");
+                            outcome.spawn_error.get_or_insert_with(|| error.clone());
+                            let terminal = set_job_terminal_state(
+                                jid,
+                                TerminalStateUpdate {
+                                    status: JobStatus::Failed,
+                                    exit_code: EXIT_CODE_UNAVAILABLE,
+                                    end_scope: Some(spawn_scope),
+                                    advance_chain: true,
+                                },
+                                state,
+                                io.db,
+                                io.sys,
+                            )
+                            .await;
+                            apply_terminal_chain_advance(
+                                chain_id,
+                                terminal,
+                                &mut outcome,
+                                &mut queue,
+                                state,
+                                io,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%chain_id, %jid, pipeline = %leaves[idx].pipeline_text, "scheduler: resource admission failed internally: {error}");
+                        if let Some(entry) = state.jobs.get_mut(&jid) {
+                            entry.pending_reason = Some(error.clone());
+                        }
+                        let terminal = set_job_terminal_state(
+                            jid,
+                            TerminalStateUpdate {
+                                status: JobStatus::Failed,
+                                exit_code: EXIT_CODE_UNAVAILABLE,
+                                end_scope: Some(start_scope),
+                                advance_chain: true,
+                            },
+                            state,
+                            io.db,
+                            io.sys,
+                        )
+                        .await;
+                        apply_terminal_chain_advance(
+                            chain_id,
+                            terminal,
+                            &mut outcome,
+                            &mut queue,
+                            state,
+                            io,
+                        )
+                        .await;
+                    }
                 }
             }
             Err(error) => {
@@ -3133,6 +3578,7 @@ async fn handle_command_with_scope(
                 .wrapper_enabled()
                 .unwrap_or_else(|| state.wrapper_enabled(config));
             let pty_enabled = params.pty_enabled();
+            let needs = params.needs();
             spawn_chain(
                 SpawnChainRequest {
                     chain,
@@ -3143,6 +3589,7 @@ async fn handle_command_with_scope(
                         wrapper_enabled,
                         pty_enabled,
                         direct_output_client: context.direct_output_client,
+                        needs,
                     },
                     warnings,
                     retain_completed_chain: context.scope_override.is_some(),
@@ -3186,6 +3633,7 @@ async fn handle_command_with_scope(
                 wrapper_enabled: params
                     .wrapper_enabled()
                     .unwrap_or_else(|| state.wrapper_enabled(config)),
+                needs: params.needs(),
             };
             if let Err(error) = persist_cron_entry(db, &entry).await {
                 return ResponsePayload::err(error_code::INTERNAL, error.to_string());
@@ -3755,6 +4203,7 @@ async fn handle_command_with_scope(
                         wrapper_enabled,
                         pty_enabled: true,
                         direct_output_client: None,
+                        needs: Need::new(),
                     },
                     warnings: Vec::new(),
                     retain_completed_chain: false,
@@ -4687,6 +5136,14 @@ mod tests {
 
     /// Create an `ActorSystem` wired to test receivers.
     fn test_actor_system() -> TestActorSystem {
+        test_actor_system_with_resources(std::sync::Arc::new(
+            crate::resource::ProviderRegistry::empty(),
+        ))
+    }
+
+    fn test_actor_system_with_resources(
+        resources: std::sync::Arc<crate::resource::ProviderRegistry>,
+    ) -> TestActorSystem {
         let (gw_tx, gw_rx) = mpsc::channel(64);
         let (sched_tx, sched_rx) = mpsc::channel(64);
         let (pm_tx, pm_rx) = mpsc::channel(64);
@@ -4699,6 +5156,7 @@ mod tests {
             scope_store: ss_tx,
             event_bus: eb_tx,
             config: crate::config::Config::default(),
+            resources,
         };
         (sys, gw_rx, sched_rx, pm_rx, ss_rx, eb_rx)
     }
@@ -4727,8 +5185,19 @@ mod tests {
                 wrapper_enabled: false,
                 pty_enabled: true,
                 direct_output_client: None,
+                needs: Need::new(),
             },
         )
+    }
+
+    fn test_chain_spawn_with_needs(
+        chain: ChainNode,
+        scope_hash: ScopeHash,
+        needs: Need,
+    ) -> SpawnChainRequest {
+        let mut request = test_chain_spawn(chain, scope_hash);
+        request.options.needs = needs;
+        request
     }
 
     fn test_scope_chain_spawn(chain: ChainNode, scope_hash: ScopeHash) -> SpawnChainRequest {
@@ -4741,6 +5210,7 @@ mod tests {
                 wrapper_enabled: false,
                 pty_enabled: true,
                 direct_output_client: None,
+                needs: Need::new(),
             },
         )
     }
@@ -4928,6 +5398,7 @@ mod tests {
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                pending_reason: None,
             },
         );
     }
@@ -4979,6 +5450,7 @@ mod tests {
                     cwd_override: None,
                     scope_enabled: false,
                     wrapper_enabled: false,
+                    needs: Need::new(),
                 },
             );
         }
@@ -5068,6 +5540,157 @@ mod tests {
             }
         }
         events
+    }
+
+    #[tokio::test]
+    async fn resource_admission_grant_derives_scope_env_and_releases_on_finish() {
+        let provider = crate::resource::mock_provider("gpu", &["gpu"]);
+        provider.set_env(std::collections::BTreeMap::from([(
+            "CUDA_VISIBLE_DEVICES".to_string(),
+            "2".to_string(),
+        )]));
+        let registry = crate::resource::ProviderRegistry::from_providers(vec![
+            provider.clone() as std::sync::Arc<dyn crate::resource::Provider>
+        ])
+        .expect("resource registry");
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, mut ss_rx, _eb_rx) =
+            test_actor_system_with_resources(std::sync::Arc::new(registry));
+
+        let (delta_tx, mut delta_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            while let Some(msg) = ss_rx.recv().await {
+                match msg {
+                    ScopeStoreMsg::Derive { base, delta, reply } => {
+                        assert_eq!(base, ScopeHash([0; 32]));
+                        delta_tx.send(delta).await.expect("capture resource delta");
+                        reply.send(Ok(ScopeHash([9; 32]))).expect("derive reply");
+                    }
+                    ScopeStoreMsg::GetHead { reply } => {
+                        let _ = reply.send(ScopeHash([0; 32]));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let conn = test_db();
+        let mut state = SchedulerState::new();
+        let needs = Need::from_pairs([("gpu", cue_core::resource::ResourceQuantity::Count(1))]);
+        let resp = spawn_chain(
+            test_chain_spawn_with_needs(leaf("echo gpu"), ScopeHash([0; 32]), needs),
+            &mut state,
+            SchedulerIo::new(&conn, &sys),
+        )
+        .await;
+
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::JobCreated { .. })
+        ));
+        let delta = delta_rx.recv().await.expect("resource env delta");
+        assert_eq!(
+            delta.set.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
+            Some("2")
+        );
+        let scopes = drain_spawn_scopes(&mut pm_rx).await;
+        assert_eq!(scopes, vec![ScopeHash([9; 32])]);
+        assert_eq!(provider.reserve_calls(), 1);
+        assert_eq!(provider.release_calls(), 0);
+
+        handle_job_finished(JobId(1), 0, &mut state, &conn, &sys).await;
+        assert_eq!(provider.release_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn resource_admission_reject_keeps_job_pending_with_reason() {
+        let provider = std::sync::Arc::new(crate::resource::MockProvider::with_behaviour(
+            "gpu",
+            &["gpu"],
+            crate::resource::MockBehaviour::AlwaysReject(cue_core::resource::Reject::new(
+                "gpu unavailable",
+            )),
+        ));
+        let registry = crate::resource::ProviderRegistry::from_providers(vec![
+            provider.clone() as std::sync::Arc<dyn crate::resource::Provider>
+        ])
+        .expect("resource registry");
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, _ss_rx, _eb_rx) =
+            test_actor_system_with_resources(std::sync::Arc::new(registry));
+
+        let conn = test_db();
+        let mut state = SchedulerState::new();
+        let needs = Need::from_pairs([("gpu", cue_core::resource::ResourceQuantity::Count(1))]);
+        let resp = spawn_chain(
+            test_chain_spawn_with_needs(leaf("echo gpu"), ScopeHash([0; 32]), needs),
+            &mut state,
+            SchedulerIo::new(&conn, &sys),
+        )
+        .await;
+
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::JobCreated { .. })
+        ));
+        assert!(drain_spawn_jobs(&mut pm_rx).await.is_empty());
+        let entry = state.jobs.get(&JobId(1)).expect("pending job");
+        assert_eq!(entry.status, JobStatus::Pending);
+        assert_eq!(
+            entry.pending_reason.as_deref(),
+            Some("gpu: gpu unavailable")
+        );
+        let list = sorted_job_list(&state);
+        assert_eq!(
+            list[0].pending_reason.as_deref(),
+            Some("gpu: gpu unavailable")
+        );
+        assert_eq!(provider.reserve_calls(), 1);
+        assert_eq!(provider.release_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn resource_pending_job_retries_after_any_job_finishes() {
+        let provider = std::sync::Arc::new(crate::resource::MockProvider::with_behaviour(
+            "gpu",
+            &["gpu"],
+            crate::resource::MockBehaviour::Scripted(vec![
+                Err(cue_core::resource::Reject::new("busy")),
+                Ok(()),
+            ]),
+        ));
+        let registry = crate::resource::ProviderRegistry::from_providers(vec![
+            provider.clone() as std::sync::Arc<dyn crate::resource::Provider>
+        ])
+        .expect("resource registry");
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) =
+            test_actor_system_with_resources(std::sync::Arc::new(registry));
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut state = SchedulerState::new();
+        let needs = Need::from_pairs([("gpu", cue_core::resource::ResourceQuantity::Count(1))]);
+        let _ = spawn_chain(
+            test_chain_spawn_with_needs(leaf("echo waits"), ScopeHash([0; 32]), needs),
+            &mut state,
+            SchedulerIo::new(&conn, &sys),
+        )
+        .await;
+        assert!(drain_spawn_jobs(&mut pm_rx).await.is_empty());
+        assert_eq!(state.jobs[&JobId(1)].status, JobStatus::Pending);
+
+        let _ = spawn_chain(
+            test_chain_spawn(leaf("echo trigger"), ScopeHash([0; 32])),
+            &mut state,
+            SchedulerIo::new(&conn, &sys),
+        )
+        .await;
+        assert_eq!(drain_spawn_jobs(&mut pm_rx).await, vec![JobId(2)]);
+
+        handle_job_finished(JobId(2), 0, &mut state, &conn, &sys).await;
+        assert_eq!(drain_spawn_jobs(&mut pm_rx).await, vec![JobId(1)]);
+        let entry = state.jobs.get(&JobId(1)).expect("retried job");
+        assert_eq!(entry.status, JobStatus::Running);
+        assert_eq!(entry.pending_reason, None);
+        assert_eq!(provider.reserve_calls(), 2);
     }
 
     #[test]
@@ -6261,6 +6884,7 @@ mod tests {
                 cwd_override: None,
                 scope_enabled: false,
                 wrapper_enabled: false,
+                needs: Need::new(),
             },
         );
 
@@ -6291,6 +6915,7 @@ mod tests {
                 cwd_override: None,
                 scope_enabled: false,
                 wrapper_enabled: false,
+                needs: Need::new(),
             },
         );
 

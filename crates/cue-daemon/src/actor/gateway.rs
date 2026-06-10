@@ -925,6 +925,7 @@ mod tests {
             scope_store,
             event_bus,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         }
     }
 
@@ -1077,6 +1078,7 @@ mod tests {
             scope_store,
             event_bus: event_bus_tx,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
         let (evt_tx, _evt_rx) = mpsc::channel(1);
 
