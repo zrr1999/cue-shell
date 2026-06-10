@@ -341,6 +341,8 @@ pub(crate) async fn spawn_all(
     let (ss_tx, ss_rx) = mpsc::channel::<ScopeStoreMsg>(ACTOR_CHANNEL_CAP);
     let (eb_tx, eb_rx) = mpsc::channel::<EventBusMsg>(ACTOR_CHANNEL_CAP);
 
+    let resources = Arc::new(crate::resource::registry_from_config(&config.resources)?);
+
     let sys = ActorSystem {
         gateway: gw_tx,
         scheduler: sched_tx,
@@ -348,7 +350,7 @@ pub(crate) async fn spawn_all(
         scope_store: ss_tx,
         event_bus: eb_tx,
         config,
-        resources: Arc::new(ProviderRegistry::empty()),
+        resources,
     };
 
     // ScopeStore restores persisted state before the daemon is considered ready.

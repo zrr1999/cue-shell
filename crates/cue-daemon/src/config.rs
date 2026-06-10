@@ -8,7 +8,15 @@ use toml::Value;
 use crate::dirs;
 
 const DAEMON_CONFIG_FILE: &str = "daemon.toml";
-const DAEMON_ROOT_SECTIONS: &[&str] = &["aliases", "block", "retention", "warn", "weft", "wrapper"];
+const DAEMON_ROOT_SECTIONS: &[&str] = &[
+    "aliases",
+    "block",
+    "resources",
+    "retention",
+    "warn",
+    "weft",
+    "wrapper",
+];
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -17,6 +25,8 @@ pub struct Config {
     pub warn: WarnConfig,
     #[serde(default)]
     pub aliases: AliasConfig,
+    #[serde(default)]
+    pub resources: ResourceConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
     #[serde(default)]
@@ -252,6 +262,93 @@ pub enum BlockDecision {
     Warn(String),
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceConfig {
+    #[serde(default)]
+    pub cli: BTreeMap<String, CliResourceProviderConfig>,
+}
+
+impl ResourceConfig {
+    fn validate(&self, path: &Path) -> Result<()> {
+        for (id, provider) in &self.cli {
+            if id.trim() != id || id.is_empty() {
+                bail!(
+                    "resources.cli provider id `{id}` in {} must be non-empty and must not have leading or trailing whitespace",
+                    path.display()
+                );
+            }
+            provider.validate(path, id)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliResourceProviderConfig {
+    pub keys: Vec<String>,
+    pub probe: Vec<String>,
+    pub reserve: Vec<String>,
+    pub release: Vec<String>,
+    #[serde(default = "default_resource_cli_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_resource_cli_timeout_ms() -> u64 {
+    5_000
+}
+
+impl CliResourceProviderConfig {
+    fn validate(&self, path: &Path, id: &str) -> Result<()> {
+        if self.keys.is_empty() {
+            bail!(
+                "resources.cli.{id}.keys in {} must contain at least one resource key",
+                path.display()
+            );
+        }
+        for key in &self.keys {
+            if key.trim() != key || key.is_empty() {
+                bail!(
+                    "resources.cli.{id}.keys in {} contains an empty or whitespace-padded key",
+                    path.display()
+                );
+            }
+        }
+        validate_resource_cli_command(path, id, "probe", &self.probe)?;
+        validate_resource_cli_command(path, id, "reserve", &self.reserve)?;
+        validate_resource_cli_command(path, id, "release", &self.release)?;
+        if self.timeout_ms == 0 {
+            bail!(
+                "resources.cli.{id}.timeout_ms in {} must be greater than zero",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_resource_cli_command(
+    path: &Path,
+    id: &str,
+    field: &str,
+    argv: &[String],
+) -> Result<()> {
+    let Some(program) = argv.first() else {
+        bail!(
+            "resources.cli.{id}.{field} in {} must be a non-empty argv array",
+            path.display()
+        );
+    };
+    if program.trim() != program || program.is_empty() {
+        bail!(
+            "resources.cli.{id}.{field}[0] in {} must be non-empty and must not have leading or trailing whitespace",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
@@ -306,7 +403,9 @@ impl Config {
     }
 
     fn validate(&self, path: &Path) -> Result<()> {
-        self.wrapper.validate(path)
+        self.wrapper.validate(path)?;
+        self.resources.validate(path)?;
+        Ok(())
     }
 
     /// Check whether `command_line` is blocked or should warn before running.
@@ -653,6 +752,53 @@ pip = "uv pip"
         assert_eq!(
             config.aliases.apply("pip install foo"),
             "uv pip install foo"
+        );
+    }
+
+    #[test]
+    fn resources_cli_provider_parsed_from_daemon_toml() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[resources.cli.license]
+keys = ["license", "license_mem"]
+probe = ["license-helper", "probe"]
+reserve = ["license-helper", "reserve"]
+release = ["license-helper", "release"]
+timeout_ms = 250
+"#,
+        )))
+        .expect("load config");
+
+        let provider = config
+            .resources
+            .cli
+            .get("license")
+            .expect("license provider");
+        assert_eq!(provider.keys, vec!["license", "license_mem"]);
+        assert_eq!(provider.probe, vec!["license-helper", "probe"]);
+        assert_eq!(provider.timeout_ms, 250);
+    }
+
+    #[test]
+    fn resources_cli_provider_requires_non_empty_commands() {
+        let error = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[resources.cli.license]
+keys = ["license"]
+probe = []
+reserve = ["license-helper", "reserve"]
+release = ["license-helper", "release"]
+"#,
+        )))
+        .expect_err("empty probe argv should fail");
+
+        assert!(
+            error.to_string().contains(
+                "resources.cli.license.probe in daemon.toml must be a non-empty argv array"
+            ),
+            "{error:#}"
         );
     }
 

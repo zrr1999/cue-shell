@@ -17,13 +17,62 @@
 //! `providers/` and are introduced by later tasks. The registry itself
 //! has no GPU/NVML/TPU knowledge.
 
+use std::sync::Arc;
+
+use anyhow::Result;
+
+use crate::config::ResourceConfig;
+
+pub mod cli;
 pub mod mock;
 pub mod provider;
 pub mod registry;
 
 #[cfg(test)]
 pub(crate) use mock::{MockBehaviour, MockProvider, mock_provider};
-#[cfg(test)]
-pub(crate) use provider::Provider;
-pub(crate) use provider::RejectGroup;
+pub(crate) use provider::{Provider, RejectGroup};
 pub(crate) use registry::ProviderRegistry;
+
+pub(crate) fn registry_from_config(config: &ResourceConfig) -> Result<ProviderRegistry> {
+    let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
+    for (id, provider_config) in &config.cli {
+        providers.push(Arc::new(cli::CliProvider::from_config(id, provider_config)));
+    }
+    ProviderRegistry::from_providers(providers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CliResourceProviderConfig, ResourceConfig};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn registry_from_config_adds_cli_provider_routes() {
+        let config = ResourceConfig {
+            cli: BTreeMap::from([(
+                "license".to_string(),
+                CliResourceProviderConfig {
+                    keys: vec!["license".into()],
+                    probe: vec!["license-helper".into(), "probe".into()],
+                    reserve: vec!["license-helper".into(), "reserve".into()],
+                    release: vec!["license-helper".into(), "release".into()],
+                    timeout_ms: 123,
+                },
+            )]),
+        };
+
+        let registry = registry_from_config(&config).expect("registry");
+        assert_eq!(
+            registry.provider_ids(),
+            vec![cue_core::resource::ProviderId::new("license")]
+        );
+        assert_eq!(
+            registry.key_routes(),
+            vec![(
+                "license".to_string(),
+                cue_core::resource::ProviderId::new("license")
+            )]
+        );
+    }
+}
