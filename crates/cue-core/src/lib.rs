@@ -14,9 +14,14 @@ pub mod job;
 pub mod mode;
 pub mod pipeline;
 pub mod process_status;
+pub mod resource;
 pub mod scope;
 
 // Re-export commonly used types at crate root.
 pub use event_channel::EventChannel;
 pub use id::{ChainId, CronId, EntityRef, JobId, ScopeHash, ScriptId};
 pub use mode::Mode;
+pub use resource::{
+    Grant, Need, ParseQuantityError, ParseQuantityReason, ProviderId, Reject, Reservation,
+    ReservationId, ResourceQuantity, ResourceUnit, Snapshot,
+};

@@ -296,6 +296,60 @@ impl<'a> Parser<'a> {
                         }
                     };
                     let key_span = self.tokens[self.pos - 1].span;
+
+                    // `need.<X>` is a namespace key: parser skips the static
+                    // mode_param_spec whitelist and only validates that the
+                    // suffix is non-empty and the value is a string. The
+                    // daemon's ProviderRegistry is responsible for the
+                    // semantic validation of `<X>`.
+                    if let Some(suffix) = key.strip_prefix("need.") {
+                        if suffix.is_empty() {
+                            return Err(ParseError {
+                                span: key_span,
+                                message:
+                                    "`need.` requires a key suffix (e.g. `need.gpu_mem=24GiB`)"
+                                        .into(),
+                                kind: ParseErrorKind::InvalidModeParam,
+                                suggestions: vec!["need.gpu=1".into(), "need.gpu_mem=24GiB".into()],
+                            });
+                        }
+                        self.expect(&Token::ParamEq)?;
+                        let value_span = self.peek_span();
+                        let value = match self.peek().clone() {
+                            Token::ParamValue(v) => {
+                                self.advance();
+                                v
+                            }
+                            Token::Word(s) => {
+                                self.advance();
+                                Value::Str(s)
+                            }
+                            _ => {
+                                return Err(ParseError {
+                                    span: self.peek_span(),
+                                    message: format!(
+                                        "expected parameter value, found {}",
+                                        self.peek()
+                                    ),
+                                    kind: ParseErrorKind::InvalidModeParam,
+                                    suggestions: vec![],
+                                });
+                            }
+                        };
+                        if !matches!(value, Value::Str(_)) {
+                            return Err(ParseError {
+                                span: value_span,
+                                message: format!(
+                                    "resource need `{key}` expects a string quantity (e.g. 1 or 24GiB), got a boolean"
+                                ),
+                                kind: ParseErrorKind::InvalidModeParam,
+                                suggestions: vec![format!("{key}=1"), format!("{key}=24GiB")],
+                            });
+                        }
+                        params.push((key, value));
+                        continue;
+                    }
+
                     let Some(global_spec) = mode_param_spec(&key) else {
                         return Err(ParseError {
                             span: key_span,
@@ -1178,6 +1232,52 @@ mod tests {
             .expect_err("timeout is not an implemented mode parameter");
         assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
         assert!(err.message.contains("unknown mode parameter `timeout`"));
+    }
+
+    #[test]
+    fn mode_params_accept_need_namespace() {
+        let ast = Parser::parse(":run(need.gpu=1,need.gpu_mem=24GiB) cargo test").unwrap();
+        match ast {
+            Ast::Command { mode_params, .. } => {
+                let map: std::collections::BTreeMap<_, _> = mode_params
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.clone()))
+                    .collect();
+                assert_eq!(map.get("need.gpu"), Some(&Value::Str("1".into())));
+                assert_eq!(map.get("need.gpu_mem"), Some(&Value::Str("24GiB".into())),);
+            }
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn mode_params_need_empty_suffix_is_rejected() {
+        let err =
+            Parser::parse(":run(need.=1) cargo test").expect_err("empty key suffix should fail");
+        assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
+        assert!(err.message.contains("need."));
+    }
+
+    #[test]
+    fn mode_params_need_rejects_bool_value() {
+        let err = Parser::parse(":run(need.gpu=true) cargo test")
+            .expect_err("need.* requires string quantity, not bool");
+        assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
+        assert!(err.message.contains("resource need"));
+        assert!(err.message.contains("need.gpu"));
+    }
+
+    #[test]
+    fn mode_params_unknown_non_need_key_still_rejected() {
+        // Sanity: only `need.<X>` is whitelisted; other unknown keys must
+        // continue to be rejected.
+        let err = Parser::parse(":run(unrecognized=1) cargo test")
+            .expect_err("non-need unknown keys still fail");
+        assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
+        assert!(
+            err.message
+                .contains("unknown mode parameter `unrecognized`")
+        );
     }
 
     #[test]
