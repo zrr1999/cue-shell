@@ -1,3 +1,3 @@
 fn main() -> anyhow::Result<()> {
-    cue_tui::cli::run()
+    cue_client::cli::run()
 }

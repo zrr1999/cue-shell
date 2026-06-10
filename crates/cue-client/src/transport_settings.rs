@@ -7,10 +7,10 @@ use toml::map::Map;
 
 use crate::client::default_socket_path;
 use crate::config_paths::{client_config_paths, read_client_config_sources, read_config_source};
-use crate::ssh_config::detected_ssh_hosts;
+use crate::host_discovery::HostDiscoveryConfig;
 use crate::transport_config::{
-    default_gateway_command, default_profile_name, default_start_command,
-    validate_default_profile_name, validate_profile_name,
+    default_gateway_command, default_profile_name, default_start_command, detected_transport_hosts,
+    validate_client_config_root_sections, validate_default_profile_name, validate_profile_name,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,28 +55,53 @@ impl TransportSettingsSnapshot {
 pub fn load_transport_settings_snapshot() -> Result<TransportSettingsSnapshot> {
     let paths = client_config_paths()?;
     let sources = read_client_config_sources(&paths)?;
-    let detected_hosts = detected_ssh_hosts_for_snapshot();
+    load_transport_settings_snapshot_from_sources(
+        sources
+            .primary()
+            .map(|source| (source.path(), source.text())),
+        paths.client(),
+    )
+}
 
-    if let Some(source) = sources.client() {
-        return parse_transport_snapshot(source.path(), source.text(), &detected_hosts);
+pub fn load_transport_settings_snapshot_from_sources(
+    source: Option<(&Path, &str)>,
+    default_path: &Path,
+) -> Result<TransportSettingsSnapshot> {
+    if let Some((path, text)) = source {
+        return parse_transport_snapshot_with_config_detection(path, text);
     }
 
+    let detected_hosts = detected_transport_hosts_for_snapshot(&HostDiscoveryConfig::default());
     Ok(TransportSettingsSnapshot {
-        source_path: paths.client().to_path_buf(),
+        source_path: default_path.to_path_buf(),
         auto_detect_ssh: true,
         default_profile: default_profile_name(),
         profiles: merged_profile_summaries(None, &detected_hosts),
     })
 }
 
-fn parse_transport_snapshot(
+pub fn parse_transport_snapshot(
     path: &Path,
     text: &str,
     detected_hosts: &BTreeSet<String>,
 ) -> Result<TransportSettingsSnapshot> {
+    validate_client_config_root_sections(text, path)?;
     let document: Value =
         toml::from_str(text).with_context(|| format!("parse config {}", path.display()))?;
     snapshot_from_value(path.to_path_buf(), &document, detected_hosts)
+        .with_context(|| format!("parse transport settings {}", path.display()))
+}
+
+fn parse_transport_snapshot_with_config_detection(
+    path: &Path,
+    text: &str,
+) -> Result<TransportSettingsSnapshot> {
+    validate_client_config_root_sections(text, path)?;
+    let document: Value =
+        toml::from_str(text).with_context(|| format!("parse config {}", path.display()))?;
+    let discovery = transport_discovery_config(&document)?;
+    let detected_hosts = detected_transport_hosts_for_snapshot(&discovery);
+    snapshot_from_value(path.to_path_buf(), &document, &detected_hosts)
         .with_context(|| format!("parse transport settings {}", path.display()))
 }
 
@@ -119,14 +144,14 @@ pub fn save_default_transport_profile(
 
     let text = std::fs::read_to_string(&write_path)
         .with_context(|| format!("read config {}", write_path.display()))?;
-    parse_transport_snapshot(&write_path, &text, &detected_ssh_hosts_for_snapshot())
+    parse_transport_snapshot_with_config_detection(&write_path, &text)
 }
 
-fn detected_ssh_hosts_for_snapshot() -> BTreeSet<String> {
-    match detected_ssh_hosts() {
+fn detected_transport_hosts_for_snapshot(discovery: &HostDiscoveryConfig) -> BTreeSet<String> {
+    match detected_transport_hosts(discovery) {
         Ok(hosts) => hosts,
         Err(error) => {
-            tracing::warn!(%error, "failed to auto-detect SSH transport profiles");
+            tracing::warn!(%error, "failed to auto-detect transport profiles");
             BTreeSet::new()
         }
     }
@@ -414,6 +439,20 @@ fn transport_auto_detect_ssh(document: &Value) -> Result<bool> {
     value
         .as_bool()
         .ok_or_else(|| anyhow::anyhow!("transport.auto_detect_ssh must be a boolean"))
+}
+
+fn transport_discovery_config(document: &Value) -> Result<HostDiscoveryConfig> {
+    let Some(value) = transport_table(document).and_then(|transport| transport.get("discovery"))
+    else {
+        return Ok(HostDiscoveryConfig::default());
+    };
+    if !value.is_table() {
+        bail!("transport.discovery must be a table");
+    }
+    value
+        .clone()
+        .try_into()
+        .context("parse transport.discovery")
 }
 
 fn transport_default_profile(document: &Value) -> Result<String> {

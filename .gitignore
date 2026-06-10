@@ -19,6 +19,7 @@
 .cursor/
 *.iml
 .pi-lens/
+.pi/
 
 # Coverage
 lcov.info

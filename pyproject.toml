@@ -7,7 +7,7 @@ license = "MIT"
 authors = [{ name = "Zhan Rongrui" }]
 keywords = ["cli", "daemon", "shell", "terminal", "tui"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
@@ -35,5 +35,6 @@ build-backend = "maturin"
 
 [tool.maturin]
 bindings = "bin"
+features = ["python-package"]
 manifest-path = "crates/cue-cli/Cargo.toml"
 strip = true

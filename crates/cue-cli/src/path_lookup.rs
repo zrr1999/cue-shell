@@ -1,15 +1,5 @@
 use std::path::PathBuf;
 
-#[cfg(any(feature = "script", feature = "tui"))]
-pub(crate) fn command_in_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-
-    find_executable_in_paths(program, std::env::split_paths(&path)).is_some()
-}
-
-#[cfg(feature = "extensions")]
 pub(crate) fn find_executable_on_path(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     find_executable_in_paths(program, std::env::split_paths(&path))
