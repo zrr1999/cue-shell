@@ -74,6 +74,7 @@ Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless o
 
 ```
 :run(cwd=/repo, pty=false) cargo test
+:run(need.gpu=1, need.gpu_mem=24GiB) python train.py
 :cron(cwd=/repo) every 5m cargo clippy
 ```
 
@@ -81,6 +82,8 @@ Parenthesized `key=value` pairs immediately after the command name configure
 execution behavior. They override `daemon.toml` defaults. Only launcher-style
 commands support mode params: `:run` and `:cron`; supported keys are declared
 per command so unsupported keys fail during parsing instead of being ignored.
+Resource needs use the `need.<resource>=<quantity>` namespace; resource keys are
+owned by configured providers rather than hardcoded in core.
 
 ## Scope Model
 

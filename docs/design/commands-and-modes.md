@@ -199,6 +199,8 @@ JOB 模式下的交互多行输入不再是 script 入口；需要多个顶层 i
 | `:help` | `:help` / `:help run` | 帮助 | 核心 |
 | `?` | `?` | 当前 mode 的详细帮助 | 核心 |
 | `:config` | `:config` / `:config show` | 查看配置 | 核心 |
+| `:providers` | `:providers` | 查看已注册资源 provider 与 key 路由 | 核心 |
+| `:resources` | `:resources` | 查看资源 provider 的当前容量快照 | 核心 |
 | `:wrap` | `:wrap [on/off/status]` | 查看或临时覆盖 runtime wrapper | 核心 |
 | `:exit` | `:exit` | 退出 TUI | 核心 |
 
@@ -260,6 +262,7 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 ```
 :run(cwd=/repo, pty=false) cargo test --release
+:run(need.gpu=1, need.gpu_mem=24GiB) python train.py
 :cron(cwd=/repo) every 5m cargo clippy
 ```
 
@@ -272,10 +275,10 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 | 命令 | 可用参数 |
 |------|---------|
-| `:run()` | `cwd`, `wrapper`, `scope`, `pty` |
-| `:cron()` | `cwd`, `wrapper`, `scope` |
+| `:run()` | `cwd`, `wrapper`, `scope`, `pty`, `need.<resource>` |
+| `:cron()` | `cwd`, `wrapper`, `scope`, `need.<resource>` |
 
-其他命令只有位置/标志参数，无 `()` 语法。
+`need.<resource>` 的 resource key 不由 core 写死，而是由 daemon 的 provider registry 从配置/内建 provider 声明；值支持 count（如 `1`）或 bytes（如 `24GiB`）。其他命令只有位置/标志参数，无 `()` 语法。
 
 ---
 

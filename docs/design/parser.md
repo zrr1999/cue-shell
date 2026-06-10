@@ -293,8 +293,8 @@ Which argument type each command expects:
 
 | Command | Argument | Mode Params |
 |---|---|---|
-| `:run` | Chain | ✓ (cwd, wrapper, scope, pty) |
-| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, wrapper, scope) |
+| `:run` | Chain | ✓ (cwd, wrapper, scope, pty, need.<resource>) |
+| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, wrapper, scope, need.<resource>) |
 | `:kill` | Job/Cron IdRef (`J<n>` or `C<n>`) | ✗ |
 | `:retry` | Job IdRef (`J<n>`) | ✗ |
 | `:out` | Job IdRef (`J<n>`) | ✗ |
@@ -307,6 +307,8 @@ Which argument type each command expects:
 | `:jobs` | Empty | ✗ |
 | `:crons` | Empty | ✗ |
 | `:scopes` | Empty | ✗ |
+| `:providers` | Empty | ✗ |
+| `:resources` | Empty | ✗ |
 | `:env` | Text (subcommand) | ✗ |
 | `:cd` | Text (path) | ✗ |
 | `:scope` | Text (`list`; other subcommands not implemented) | ✗ |

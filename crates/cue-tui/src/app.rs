@@ -114,6 +114,7 @@ struct JobRow {
     end_scope: Option<String>,
     open_hint: JobOpenHint,
     warnings: Vec<String>,
+    pending_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1719,6 +1720,9 @@ impl AppState {
             if !warnings.is_empty() {
                 job.warnings = warnings;
             }
+            if job.status != JobStatus::Pending {
+                job.pending_reason = None;
+            }
             return;
         }
 
@@ -1730,6 +1734,7 @@ impl AppState {
             end_scope: None,
             open_hint,
             warnings,
+            pending_reason: None,
         });
     }
 
@@ -1738,6 +1743,9 @@ impl AppState {
             self.jobs[index].status = status;
             if end_scope.is_some() {
                 self.jobs[index].end_scope = end_scope;
+            }
+            if self.jobs[index].status != JobStatus::Pending {
+                self.jobs[index].pending_reason = None;
             }
             if let Some(card_index) = self.job_cards.get(id).copied() {
                 let job = self.jobs[index].clone();
@@ -1753,6 +1761,7 @@ impl AppState {
                 end_scope,
                 open_hint: JobOpenHint::Stream,
                 warnings: Vec::new(),
+                pending_reason: None,
             });
             self.refresh_cron_trigger_card(id);
         }
@@ -1786,6 +1795,7 @@ impl AppState {
                 job.start_scope.as_deref(),
                 job.end_scope.as_deref(),
                 &job.warnings,
+                job.pending_reason.as_deref(),
             ),
         );
         self.main_view
@@ -1819,6 +1829,7 @@ impl AppState {
                 end_scope: job.end_scope,
                 open_hint: job.open_hint,
                 warnings: Vec::new(),
+                pending_reason: job.pending_reason,
             })
             .collect();
     }
@@ -2464,7 +2475,7 @@ impl AppState {
                             }
                         }
                         OkPayload::JobList(list) => {
-                            let count = list.len();
+                            let body = format_job_list_snapshot(&list);
                             self.replace_jobs(list);
                             self.sync_sidebar_items();
                             if let Some(pending) = pending.as_ref()
@@ -2472,7 +2483,7 @@ impl AppState {
                             {
                                 self.show_submission_result(
                                     pending,
-                                    format!("loaded {count} job(s) into sidebar"),
+                                    body,
                                     CardStatus::Success,
                                     None,
                                 );
@@ -3405,6 +3416,7 @@ fn format_cron_trigger_record(
                 job.start_scope.as_deref(),
                 job.end_scope.as_deref(),
                 &job.warnings,
+                job.pending_reason.as_deref(),
             ));
         }
         None => {
@@ -3524,12 +3536,34 @@ fn target_profile_can_be_saved(profile: &crate::target_config::TargetProfileSumm
     profile.is_usable_target()
 }
 
+fn format_job_list_snapshot(jobs: &[JobInfo]) -> String {
+    if jobs.is_empty() {
+        return "no jobs".into();
+    }
+    jobs.iter()
+        .map(|job| {
+            let mut lines = vec![format!(
+                "{} [{}] {}",
+                job.id,
+                format_job_status(&job.status),
+                job.pipeline
+            )];
+            if let Some(reason) = &job.pending_reason {
+                lines.push(format!("  pending reason: {reason}"));
+            }
+            lines.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn format_job_record(
     job_id: &str,
     status: &JobStatus,
     start_scope: Option<&str>,
     end_scope: Option<&str>,
     warnings: &[String],
+    pending_reason: Option<&str>,
 ) -> String {
     let mut lines = Vec::new();
     lines.extend(warnings.iter().cloned());
@@ -3538,6 +3572,9 @@ fn format_job_record(
     }
     lines.push(job_id.to_string());
     lines.push(format!("status: {}", format_job_status(status)));
+    if let Some(reason) = pending_reason {
+        lines.push(format!("pending reason: {reason}"));
+    }
     if let Some(start_scope) = start_scope {
         lines.push(format!("start scope: {start_scope}"));
     }
@@ -3971,6 +4008,7 @@ mod tests {
             end_scope: None,
             open_hint: JobOpenHint::Fg,
             warnings: Vec::new(),
+            pending_reason: None,
         });
 
         state.activate_sidebar_row(0);
@@ -3990,6 +4028,7 @@ mod tests {
             end_scope: None,
             open_hint: JobOpenHint::Stream,
             warnings: Vec::new(),
+            pending_reason: None,
         });
 
         state.activate_sidebar_row(0);
@@ -4009,6 +4048,7 @@ mod tests {
             end_scope: None,
             open_hint: JobOpenHint::Fg,
             warnings: Vec::new(),
+            pending_reason: None,
         });
 
         state.activate_sidebar_row(0);
@@ -4340,6 +4380,7 @@ mod tests {
                 end_scope: None,
                 open_hint: JobOpenHint::Stream,
                 warnings: Vec::new(),
+                pending_reason: None,
             },
             JobRow {
                 id: "J2".into(),
@@ -4349,6 +4390,7 @@ mod tests {
                 end_scope: None,
                 open_hint: JobOpenHint::Stream,
                 warnings: Vec::new(),
+                pending_reason: None,
             },
         ];
 
@@ -5566,6 +5608,26 @@ destination = "devbox"
         assert_eq!(state.jobs.len(), 1);
         assert_eq!(state.jobs[0].label, "sleep 4");
         assert_eq!(state.jobs[0].start_scope.as_deref(), Some("S@abc12345"));
+    }
+
+    #[test]
+    fn job_list_snapshot_formats_pending_reason() {
+        let text = format_job_list_snapshot(&[JobInfo {
+            id: "J1".into(),
+            status: JobStatus::Pending,
+            pipeline: "train".into(),
+            exit_code: None,
+            start_scope: None,
+            end_scope: None,
+            open_hint: JobOpenHint::Stream,
+            chain_id: None,
+            chain_index: None,
+            chain_total: None,
+            pending_reason: Some("gpu: waiting GPU".into()),
+        }]);
+
+        assert!(text.contains("J1 [pending] train"));
+        assert!(text.contains("pending reason: gpu: waiting GPU"));
     }
 
     #[test]

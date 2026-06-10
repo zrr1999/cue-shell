@@ -3916,6 +3916,14 @@ async fn handle_command_with_scope(
 
         ResolvedCommand::Scopes => handle_list_scopes(sys).await,
 
+        ResolvedCommand::Providers => ResponsePayload::Ok(OkPayload::EvalText {
+            text: format_resource_providers(sys.resources.as_ref()),
+        }),
+
+        ResolvedCommand::Resources => ResponsePayload::Ok(OkPayload::EvalText {
+            text: format_resource_snapshots(sys.resources.as_ref()),
+        }),
+
         ResolvedCommand::ListScopes { limit } => handle_list_scopes_page(sys, limit).await,
 
         ResolvedCommand::Env { subcommand } => {
@@ -4622,6 +4630,69 @@ fn format_command_list<'a>(specs: impl IntoIterator<Item = &'a CommandSpec>) -> 
         .map(|spec| format!("- `{}` — {}", spec.usage, spec.detail))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_resource_providers(registry: &crate::resource::ProviderRegistry) -> String {
+    let provider_ids = registry.provider_ids();
+    if provider_ids.is_empty() {
+        return "no resource providers configured".into();
+    }
+
+    let mut keys_by_provider: HashMap<String, Vec<String>> = HashMap::new();
+    for (key, provider_id) in registry.key_routes() {
+        keys_by_provider
+            .entry(provider_id.to_string())
+            .or_default()
+            .push(key);
+    }
+
+    let mut lines = vec![format!(
+        "resource providers: {} (active reservations: {})",
+        provider_ids.len(),
+        registry.active_reservation_count()
+    )];
+    for provider_id in provider_ids {
+        let keys = keys_by_provider
+            .remove(provider_id.as_str())
+            .filter(|keys| !keys.is_empty())
+            .map(|keys| keys.join(", "))
+            .unwrap_or_else(|| "<no keys>".into());
+        lines.push(format!("- {provider_id}: {keys}"));
+    }
+    lines.join("\n")
+}
+
+fn format_resource_snapshots(registry: &crate::resource::ProviderRegistry) -> String {
+    let snapshots = registry.snapshot();
+    if snapshots.is_empty() {
+        return "no resource providers configured".into();
+    }
+
+    let mut lines = Vec::new();
+    for (provider_id, snapshot) in snapshots {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!("provider {provider_id}"));
+        if snapshot.units.is_empty() {
+            lines.push("  (no units reported)".into());
+            continue;
+        }
+        for unit in snapshot.units {
+            if unit.attrs.is_empty() {
+                lines.push(format!("  unit {}", unit.id));
+                continue;
+            }
+            let attrs = unit
+                .attrs
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("  unit {}: {attrs}", unit.id));
+        }
+    }
+    lines.join("\n")
 }
 
 fn sorted_job_list(state: &SchedulerState) -> Vec<JobInfo> {
@@ -5691,6 +5762,82 @@ mod tests {
         assert_eq!(entry.status, JobStatus::Running);
         assert_eq!(entry.pending_reason, None);
         assert_eq!(provider.reserve_calls(), 2);
+    }
+
+    #[test]
+    fn resource_provider_formatter_lists_routes_and_active_reservations() {
+        let provider = crate::resource::mock_provider("gpu", &["gpu", "gpu_mem"]);
+        let registry = crate::resource::ProviderRegistry::from_providers(vec![
+            provider as Arc<dyn crate::resource::Provider>,
+        ])
+        .expect("registry");
+
+        let text = format_resource_providers(&registry);
+        assert!(text.contains("resource providers: 1 (active reservations: 0)"));
+        assert!(text.contains("- gpu: gpu, gpu_mem"));
+    }
+
+    #[test]
+    fn resource_snapshot_formatter_lists_units_and_attrs() {
+        let provider = crate::resource::mock_provider("gpu", &["gpu_mem"]);
+        provider.set_snapshot_units(vec![cue_core::resource::ResourceUnit::new("2").with_attr(
+            "effective_free_mem",
+            cue_core::resource::ResourceQuantity::Bytes(24 * 1024 * 1024 * 1024),
+        )]);
+        let registry = crate::resource::ProviderRegistry::from_providers(vec![
+            provider as Arc<dyn crate::resource::Provider>,
+        ])
+        .expect("registry");
+
+        let text = format_resource_snapshots(&registry);
+        assert!(text.contains("provider gpu"));
+        assert!(text.contains("unit 2: effective_free_mem=24GiB"));
+    }
+
+    #[tokio::test]
+    async fn resource_commands_return_text() {
+        let provider = crate::resource::mock_provider("license", &["license"]);
+        provider.set_snapshot_units(vec![
+            cue_core::resource::ResourceUnit::new("pool")
+                .with_attr("free", cue_core::resource::ResourceQuantity::Count(3)),
+        ]);
+        let registry = crate::resource::ProviderRegistry::from_providers(vec![
+            provider as Arc<dyn crate::resource::Provider>,
+        ])
+        .expect("registry");
+        let (sys, _gw_rx, _sched_rx, _pm_rx, _ss_rx, _eb_rx) =
+            test_actor_system_with_resources(Arc::new(registry));
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+
+        let providers = handle_command(
+            ResolvedCommand::Providers,
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            providers,
+            ResponsePayload::Ok(OkPayload::EvalText { ref text }) if text.contains("- license: license")
+        ));
+
+        let resources = handle_command(
+            ResolvedCommand::Resources,
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            resources,
+            ResponsePayload::Ok(OkPayload::EvalText { ref text }) if text.contains("unit pool: free=3")
+        ));
     }
 
     #[test]
