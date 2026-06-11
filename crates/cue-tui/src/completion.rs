@@ -16,6 +16,21 @@ pub(crate) struct CompletionScope<'a> {
     pub(crate) cron_ids: &'a [String],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionErrorRecord {
+    pub(crate) input: String,
+    pub(crate) label: String,
+    pub(crate) output: String,
+}
+
+pub(crate) fn completion_error_record(error: &anyhow::Error) -> CompletionErrorRecord {
+    CompletionErrorRecord {
+        input: "completion".into(),
+        label: "completion".into(),
+        output: format!("Error [completion]: {error:#}"),
+    }
+}
+
 pub(crate) fn completion_candidates(scope: CompletionScope<'_>) -> anyhow::Result<Vec<String>> {
     let cursor = scope.cursor.min(scope.content.len());
     let line_start = scope.content[..cursor].rfind('\n').map_or(0, |idx| idx + 1);
@@ -381,6 +396,20 @@ mod tests {
 
         assert_eq!(wait_candidates, vec!["J1".to_string(), "J2".to_string()]);
         assert_eq!(kill_candidates, vec!["C1".to_string()]);
+    }
+
+    #[test]
+    fn completion_error_record_formats_visible_error_card() {
+        let error = anyhow::anyhow!("current directory was removed");
+
+        assert_eq!(
+            completion_error_record(&error),
+            CompletionErrorRecord {
+                input: "completion".into(),
+                label: "completion".into(),
+                output: "Error [completion]: current directory was removed".into(),
+            },
+        );
     }
 
     #[test]

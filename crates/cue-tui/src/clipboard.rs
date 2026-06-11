@@ -2,6 +2,27 @@ use std::io::{self, Write};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopyTarget {
+    pub(crate) label: String,
+    pub(crate) content: String,
+}
+
+impl CopyTarget {
+    pub(crate) fn new(label: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            content: content.into(),
+        }
+    }
+}
+
+pub(crate) fn first_available_target(
+    targets: impl IntoIterator<Item = Option<CopyTarget>>,
+) -> Option<CopyTarget> {
+    targets.into_iter().flatten().next()
+}
+
 pub(crate) fn copy_to_clipboard(text: &str) -> io::Result<()> {
     let mut stdout = io::stdout();
     write_osc52_sequence(&mut stdout, text)
@@ -19,6 +40,18 @@ fn osc52_sequence(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_available_target_uses_priority_order() {
+        let target = first_available_target([
+            None,
+            Some(CopyTarget::new("display", "shown")),
+            Some(CopyTarget::new("record", "older")),
+        ]);
+
+        assert_eq!(target, Some(CopyTarget::new("display", "shown")));
+        assert_eq!(first_available_target([]), None);
+    }
 
     #[test]
     fn osc52_sequence_encodes_text_as_base64_clipboard_payload() {

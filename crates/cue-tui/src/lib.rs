@@ -7,6 +7,7 @@
 
 mod ansi;
 mod app;
+mod card_action;
 pub mod cli;
 mod client;
 mod clipboard;

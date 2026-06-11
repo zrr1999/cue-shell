@@ -64,6 +64,27 @@ pub(crate) struct DisplayCopyTarget {
     pub(crate) content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DisplayPreview {
+    pub(crate) key: String,
+    pub(crate) title: String,
+    pub(crate) content: String,
+}
+
+impl DisplayPreview {
+    pub(crate) fn new(
+        key: impl Into<String>,
+        title: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            title: title.into(),
+            content: content.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisplayTabHit {
     Activate(usize),
@@ -173,17 +194,20 @@ impl DisplayPane {
         changed
     }
 
-    pub(crate) fn open_preview(&mut self, key: String, title: String, content: String) {
-        let target = DisplayTarget::Preview { key, title };
+    pub(crate) fn open_preview(&mut self, preview: DisplayPreview) {
+        let target = DisplayTarget::Preview {
+            key: preview.key,
+            title: preview.title,
+        };
         if let Some(index) = self.tabs.iter().position(|tab| tab.target == target) {
-            self.tabs[index].content = content;
+            self.tabs[index].content = preview.content;
             self.active = Some(index);
             return;
         }
 
         self.tabs.push(DisplayTab {
             target,
-            content,
+            content: preview.content,
             follow: false,
         });
         self.active = Some(self.tabs.len() - 1);
@@ -409,8 +433,8 @@ mod tests {
     #[test]
     fn preview_tab_is_reused_by_key_and_title() {
         let mut pane = DisplayPane::default();
-        pane.open_preview("card:1".into(), "record".into(), "old".into());
-        pane.open_preview("card:1".into(), "record".into(), "new".into());
+        pane.open_preview(DisplayPreview::new("card:1", "record", "old"));
+        pane.open_preview(DisplayPreview::new("card:1", "record", "new"));
 
         assert_eq!(pane.labels(), vec![" record  × ".to_string()]);
         assert_eq!(pane.content(), "new");

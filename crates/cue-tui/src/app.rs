@@ -20,8 +20,9 @@ use cue_core::{EventChannel, Mode};
 use ratatui::layout::Rect;
 use tui_term::vt100;
 
+use crate::card_action::{self, CardAction, CardJob};
 use crate::client::{ConnectionController, RestartHandle, WriterHandle};
-use crate::clipboard;
+use crate::clipboard::{self, CopyTarget};
 use crate::completion::{self, CompletionScope};
 use crate::component::Component;
 use crate::component::input_line::{InputLine, InputMsg};
@@ -31,8 +32,8 @@ use crate::component::sidebar::{
 };
 use crate::component::status_bar::{StatusBar, StatusBarMsg};
 use crate::display::{
-    DisplayPane, DisplayStream, DisplayTabHit, display_stream_from_ipc, output_channel_for_job_id,
-    plan_display_subscriptions,
+    DisplayPane, DisplayPreview, DisplayStream, DisplayTabHit, display_stream_from_ipc,
+    output_channel_for_job_id, plan_display_subscriptions,
 };
 use crate::focus::{FocusArea, is_mode_switch_key};
 use crate::footer::{self, FooterContext};
@@ -89,12 +90,6 @@ enum FgSessionKind {
 struct FgSession {
     id: String,
     kind: FgSessionKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CopyTarget {
-    label: String,
-    content: String,
 }
 
 // ── App state ──
@@ -285,38 +280,37 @@ impl AppState {
     }
 
     fn copy_target(&self) -> Option<CopyTarget> {
-        if let Some(job_id) = self.fg_id().filter(|_| self.fg_active())
-            && let Some(screen) = self.fg_screen()
-        {
-            return Some(CopyTarget {
-                label: format!("fg {job_id}"),
-                content: screen.contents().to_string(),
+        let foreground_target = self
+            .fg_id()
+            .filter(|_| self.fg_active())
+            .zip(self.fg_screen())
+            .map(|(job_id, screen)| {
+                CopyTarget::new(format!("fg {job_id}"), screen.contents().to_string())
             });
-        }
+        let target_settings = self
+            .target_settings_open()
+            .then(|| self.render_target_settings_content())
+            .flatten()
+            .map(|content| CopyTarget::new("targets", content));
+        let display_target = self
+            .display
+            .copy_target()
+            .map(|target| CopyTarget::new(target.label, target.content));
+        let latest_record = self.main_view.cards.last().map(|card| {
+            CopyTarget::new(
+                card.label
+                    .clone()
+                    .unwrap_or_else(|| "command-record".to_string()),
+                record_format::format_card_preview(card),
+            )
+        });
 
-        if self.target_settings_open()
-            && let Some(content) = self.render_target_settings_content()
-        {
-            return Some(CopyTarget {
-                label: "targets".into(),
-                content,
-            });
-        }
-
-        if let Some(target) = self.display.copy_target() {
-            return Some(CopyTarget {
-                label: target.label,
-                content: target.content,
-            });
-        }
-
-        self.main_view.cards.last().map(|card| CopyTarget {
-            label: card
-                .label
-                .clone()
-                .unwrap_or_else(|| "command-record".to_string()),
-            content: record_format::format_card_preview(card),
-        })
+        clipboard::first_available_target([
+            foreground_target,
+            target_settings,
+            display_target,
+            latest_record,
+        ])
     }
 
     pub(crate) fn job_picker_open(&self) -> bool {
@@ -443,17 +437,15 @@ impl AppState {
         status: CardStatus,
         label: Option<String>,
     ) -> usize {
-        let card_index = pending.card_index.unwrap_or_else(|| {
+        let card_index = pending.card_index().unwrap_or_else(|| {
             self.main_view
-                .push_card(pending.input.clone(), pending.mode)
+                .push_card(pending.input().to_string(), pending.mode())
         });
         if let Some(label) = label {
             self.main_view.set_card_label(card_index, label);
         }
-        self.main_view.set_card_output(
-            card_index,
-            submission::decorate_output(&pending.warnings, body),
-        );
+        self.main_view
+            .set_card_output(card_index, pending.decorated_output(body));
         self.main_view.set_card_status(card_index, status);
         card_index
     }
@@ -616,8 +608,8 @@ impl AppState {
         }
     }
 
-    fn open_preview_display(&mut self, key: String, title: String, content: String) {
-        self.display.open_preview(key, title, content);
+    fn open_preview_display(&mut self, preview: DisplayPreview) {
+        self.display.open_preview(preview);
     }
 
     fn show_output_display(
@@ -658,46 +650,31 @@ impl AppState {
     }
 
     fn inspect_card(&mut self, index: usize) {
-        let Some(card) = self.main_view.cards.get(index).cloned() else {
+        let Some(card) = self.main_view.cards.get(index) else {
             return;
         };
+        let job = self.job_for_card(index);
 
-        // For running jobs: always foreground-attach.
-        if let Some(job_id) = self
+        match card_action::inspect_card_action(index, card, job) {
+            CardAction::Foreground { job_id } => {
+                self.update(AppMsg::Submit(format!(":fg {job_id}")))
+            }
+            CardAction::Tail { job_id } => self.update(AppMsg::Submit(format!(":tail {job_id}"))),
+            CardAction::Preview(preview) => self.open_preview_display(preview),
+        }
+    }
+
+    fn job_for_card(&self, index: usize) -> Option<CardJob<'_>> {
+        let job_id = self
             .job_cards
             .iter()
             .find(|&(_, &card_idx)| card_idx == index)
-            .map(|(id, _)| id.clone())
-            && let Some(job) = self.jobs.iter().find(|j| j.id == job_id)
-            && matches!(job.status, JobStatus::Running)
-        {
-            self.update(AppMsg::Submit(format!(":fg {}", job.id)));
-            return;
-        }
-
-        // For finished jobs: open stdout.
-        if let Some(job_id) = self
-            .job_cards
-            .iter()
-            .find(|&(_, &card_idx)| card_idx == index)
-            .map(|(id, _)| id.clone())
-            && let Some(job) = self.jobs.iter().find(|j| j.id == job_id)
-            && job.status.is_terminal()
-        {
-            self.update(AppMsg::Submit(format!(":tail {}", job.id)));
-            return;
-        }
-
-        let title = card
-            .label
-            .clone()
-            .map(|label| format!("record {label}"))
-            .unwrap_or_else(|| "record".to_string());
-        self.open_preview_display(
-            format!("card:{index}"),
-            title,
-            record_format::format_card_preview(&card),
-        );
+            .map(|(id, _)| id.as_str())?;
+        let job = self.jobs.iter().find(|job| job.id == job_id)?;
+        Some(CardJob {
+            id: &job.id,
+            status: &job.status,
+        })
     }
 
     fn open_job_picker(&mut self) {
@@ -1339,11 +1316,11 @@ impl AppState {
         let Some(cron) = self.crons.get(row).cloned() else {
             return;
         };
-        self.open_preview_display(
+        self.open_preview_display(DisplayPreview::new(
             format!("cron:{}", cron.id),
             format!("cron {}", cron.id),
             record_format::format_cron_preview(&cron.id, &cron.label, cron.status),
-        );
+        ));
     }
 
     fn activate_sidebar_row(&mut self, row: usize) {
@@ -1401,13 +1378,12 @@ impl AppState {
     }
 
     fn show_completion_error(&mut self, error: anyhow::Error) {
-        let card_index = self.main_view.push_card("completion".into(), self.mode);
-        self.main_view
-            .set_card_output(card_index, format!("Error [completion]: {error:#}"));
+        let record = completion::completion_error_record(&error);
+        let card_index = self.main_view.push_card(record.input, self.mode);
+        self.main_view.set_card_output(card_index, record.output);
         self.main_view
             .set_card_status(card_index, CardStatus::Error);
-        self.main_view
-            .set_card_label(card_index, "completion".into());
+        self.main_view.set_card_label(card_index, record.label);
     }
 
     fn completion_candidates(&self) -> anyhow::Result<Vec<String>> {
@@ -1633,7 +1609,7 @@ impl AppState {
                                 if pending.is_user_visible() {
                                     self.show_submission_result(
                                         pending,
-                                        submission::format_ack_message(&pending.input),
+                                        pending.ack_message(),
                                         CardStatus::Success,
                                         None,
                                     );
@@ -1734,7 +1710,7 @@ impl AppState {
                         } => {
                             let label = pending
                                 .as_ref()
-                                .map(|pending| submission::normalize_command_label(&pending.input))
+                                .map(PendingSubmission::normalized_command_label)
                                 .unwrap_or_else(|| job_id.clone());
                             self.upsert_job(
                                 job_id.clone(),
@@ -1748,12 +1724,12 @@ impl AppState {
                             if let Some(pending) = pending.as_ref()
                                 && pending.is_user_visible()
                             {
-                                let card_index = if let Some(card_index) = pending.card_index {
+                                let card_index = if let Some(card_index) = pending.card_index() {
                                     self.main_view.set_card_label(card_index, job_id.clone());
                                     self.job_cards.insert(job_id.clone(), card_index);
                                     card_index
                                 } else {
-                                    self.ensure_job_card(&job_id, pending.input.clone())
+                                    self.ensure_job_card(&job_id, pending.input().to_string())
                                 };
                                 if let Some(job) =
                                     self.jobs.iter().find(|job| job.id == job_id).cloned()
@@ -1811,7 +1787,7 @@ impl AppState {
                         OkPayload::CronAdded { cron_id } => {
                             let label = pending
                                 .as_ref()
-                                .map(|pending| submission::normalize_command_label(&pending.input))
+                                .map(PendingSubmission::normalized_command_label)
                                 .unwrap_or_else(|| cron_id.clone());
                             self.upsert_cron(cron_id.clone(), label, CronStatus::Scheduled);
                             self.sync_sidebar_items();
@@ -1891,11 +1867,7 @@ impl AppState {
                             if let Some(pending) = pending.as_ref()
                                 && pending.is_user_visible()
                             {
-                                let request = submission::display_request_from_submission(
-                                    &pending.input,
-                                    pending.mode,
-                                )
-                                .unwrap_or(
+                                let request = pending.display_request().unwrap_or(
                                     submission::DisplayRequest {
                                         stream: Stream::Stdout,
                                         follow: false,

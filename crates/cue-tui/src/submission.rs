@@ -5,10 +5,10 @@ use cue_core::ipc::Stream;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSubmission {
-    pub(crate) card_index: Option<usize>,
-    pub(crate) input: String,
-    pub(crate) mode: Mode,
-    pub(crate) warnings: Vec<String>,
+    card_index: Option<usize>,
+    input: String,
+    mode: Mode,
+    warnings: Vec<String>,
     kind: PendingSubmissionKind,
 }
 
@@ -71,6 +71,34 @@ impl PendingSubmission {
             warnings: Vec::new(),
             kind: PendingSubmissionKind::DisplayUnsubscribe { id },
         }
+    }
+
+    pub(crate) fn card_index(&self) -> Option<usize> {
+        self.card_index
+    }
+
+    pub(crate) fn input(&self) -> &str {
+        &self.input
+    }
+
+    pub(crate) fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub(crate) fn decorated_output(&self, body: String) -> String {
+        decorate_output(&self.warnings, body)
+    }
+
+    pub(crate) fn ack_message(&self) -> String {
+        format_ack_message(&self.input)
+    }
+
+    pub(crate) fn normalized_command_label(&self) -> String {
+        normalize_command_label(&self.input)
+    }
+
+    pub(crate) fn display_request(&self) -> Option<DisplayRequest> {
+        display_request_from_submission(&self.input, self.mode)
     }
 
     pub(crate) fn is_user_visible(&self) -> bool {
