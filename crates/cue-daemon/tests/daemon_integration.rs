@@ -23,7 +23,9 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use cue_core::ipc::{self, EventPayload, Message, OkPayload, RequestPayload, ResponsePayload};
+use cue_core::ipc::{
+    self, EventPayload, JobInfo, Message, OkPayload, RequestPayload, ResponsePayload,
+};
 use cue_core::job::JobStatus;
 use cue_core::mode::Mode;
 
@@ -285,38 +287,61 @@ where
     }
 }
 
-/// Poll `:jobs` until `job_id` reaches a terminal state.
-async fn wait_for_job_terminal<S>(stream: &mut S, mut request_id: u32, job_id: &str) -> JobStatus
+async fn job_info_from_jobs<S>(stream: &mut S, request_id: u32, job_id: &str) -> Option<JobInfo>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let resp = roundtrip(
+        stream,
+        request_id,
+        RequestPayload::Eval {
+            input: ":jobs".into(),
+            mode: Mode::Job,
+        },
+    )
+    .await;
+    match resp {
+        ResponsePayload::Ok(OkPayload::JobList(list)) => {
+            list.into_iter().find(|job| job.id == job_id)
+        }
+        other => panic!("expected JobList, got {other:?}"),
+    }
+}
+
+async fn wait_for_job_status<S>(
+    stream: &mut S,
+    mut request_id: u32,
+    job_id: &str,
+    predicate: impl Fn(&JobInfo) -> bool,
+) -> JobInfo
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let resp = roundtrip(
-            stream,
-            request_id,
-            RequestPayload::Eval {
-                input: ":jobs".into(),
-                mode: Mode::Job,
-            },
-        )
-        .await;
-        request_id += 1;
-        let jobs_response = format!("{resp:?}");
-
-        if let ResponsePayload::Ok(OkPayload::JobList(list)) = resp
-            && let Some(job) = list.into_iter().find(|job| job.id == job_id)
-            && job.status.is_terminal()
+        if let Some(job) = job_info_from_jobs(stream, request_id, job_id).await
+            && predicate(&job)
         {
-            return job.status;
+            return job;
         }
+        request_id += 1;
 
         assert!(
             tokio::time::Instant::now() < deadline,
-            "job {job_id} did not become terminal in time; last :jobs response: {jobs_response}"
+            "job {job_id} did not reach expected state in time"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Poll `:jobs` until `job_id` reaches a terminal state.
+async fn wait_for_job_terminal<S>(stream: &mut S, request_id: u32, job_id: &str) -> JobStatus
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    wait_for_job_status(stream, request_id, job_id, |job| job.status.is_terminal())
+        .await
+        .status
 }
 
 /// Subscribe to a set of channels.
@@ -521,6 +546,158 @@ async fn test_simple_job_execution() {
             )
         });
         assert!(reached_done, "job never reached Done; events: {msgs:?}");
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_resource_cli_provider_admission_env_and_inspection() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("resource-cli-provider");
+        let provider_script = env.root.join("license-provider.sh");
+        let state_file = env.root.join("license-held");
+        write_executable_script(
+            &provider_script,
+            r#"#!/bin/sh
+set -eu
+command="$1"
+state="$2"
+case "$command" in
+  probe)
+    if [ -f "$state" ]; then free=0; else free=1; fi
+    printf '{"units":[{"id":"pool","attrs":{"free":{"kind":"count","value":%s}}}]}\n' "$free"
+    ;;
+  reserve)
+    cat >/dev/null
+    if [ -f "$state" ]; then
+      printf '%s\n' '{"ok":false,"reason":"license busy"}'
+    else
+      printf '%s\n' held > "$state"
+      printf '%s\n' '{"ok":true,"grant_id":"lease-1","env":{"LICENSE_TOKEN":"leased"},"info":{"license":{"kind":"count","value":1}}}'
+    fi
+    ;;
+  release)
+    cat >/dev/null
+    rm -f "$state"
+    printf '%s\n' '{}'
+    ;;
+  *)
+    echo "unknown command: $command" >&2
+    exit 64
+    ;;
+esac
+"#,
+        );
+        write_daemon_config(
+            &env,
+            &format!(
+                r#"
+[resources.cli.license]
+keys = ["license"]
+probe = ["{}", "probe", "{}"]
+reserve = ["{}", "reserve", "{}"]
+release = ["{}", "release", "{}"]
+timeout_ms = 1000
+"#,
+                provider_script.display(),
+                state_file.display(),
+                provider_script.display(),
+                state_file.display(),
+                provider_script.display(),
+                state_file.display(),
+            ),
+        );
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let providers = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":providers".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            providers,
+            ResponsePayload::Ok(OkPayload::EvalText { ref text }) if text.contains("- license: license")
+        ));
+
+        let first = roundtrip(
+            &mut stream,
+            2,
+            RequestPayload::Eval {
+                input: r#":run(pty=false, need.license=1) /bin/sh -c 'printf "%s\n" "$LICENSE_TOKEN"; sleep 2'"#.into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let first_job = job_id_from_created(first);
+
+        let second = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: r#":run(pty=false, need.license=1) /bin/sh -c 'printf "%s\n" "$LICENSE_TOKEN"'"#.into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let second_job = job_id_from_created(second);
+
+        let pending = wait_for_job_status(&mut stream, 4, &second_job, |job| {
+            job.status == JobStatus::Pending
+        })
+        .await;
+        assert_eq!(
+            pending.pending_reason.as_deref(),
+            Some("license: license busy")
+        );
+
+        let resources = roundtrip(
+            &mut stream,
+            30,
+            RequestPayload::Eval {
+                input: ":resources".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            resources,
+            ResponsePayload::Ok(OkPayload::EvalText { ref text })
+                if text.contains("provider license") && text.contains("unit pool: free=0")
+        ));
+
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 40, &first_job).await,
+            JobStatus::Done
+        );
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 60, &second_job).await,
+            JobStatus::Done
+        );
+
+        for (request_id, job_id) in [(80, &first_job), (81, &second_job)] {
+            let out = roundtrip(
+                &mut stream,
+                request_id,
+                RequestPayload::Eval {
+                    input: format!(":out {job_id}"),
+                    mode: Mode::Job,
+                },
+            )
+            .await;
+            assert!(matches!(
+                out,
+                ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.contains("leased")
+            ));
+        }
 
         shutdown_daemon(&mut stream, &mut child).await;
     })

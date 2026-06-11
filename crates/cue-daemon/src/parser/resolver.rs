@@ -90,6 +90,10 @@ pub enum ResolvedCommand {
     ListCrons { limit: Option<usize> },
     /// List scopes.
     Scopes,
+    /// List resource providers and their key routes.
+    Providers,
+    /// Show resource provider capacity snapshots.
+    Resources,
     /// List scopes with pagination metadata.
     ListScopes { limit: Option<usize> },
     /// Environment operations.
@@ -273,6 +277,8 @@ impl Resolver {
             "jobs" => ResolvedCommand::Jobs,
             "crons" => ResolvedCommand::Crons,
             "scopes" => ResolvedCommand::Scopes,
+            "providers" => ResolvedCommand::Providers,
+            "resources" => ResolvedCommand::Resources,
             "env" => ResolvedCommand::Env {
                 subcommand: extract_optional_text(argument),
             },
@@ -1050,6 +1056,14 @@ mod tests {
     fn resolve_jobs() {
         let cmd = resolve(":jobs", Mode::Job);
         assert!(matches!(cmd, ResolvedCommand::Jobs));
+    }
+
+    #[test]
+    fn resolve_resource_commands() {
+        let providers = resolve(":providers", Mode::Job);
+        assert!(matches!(providers, ResolvedCommand::Providers));
+        let resources = resolve(":resources", Mode::Job);
+        assert!(matches!(resources, ResolvedCommand::Resources));
     }
 
     #[test]

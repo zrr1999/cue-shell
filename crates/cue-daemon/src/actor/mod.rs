@@ -19,6 +19,7 @@ mod scope_store;
 mod script_record;
 
 use anyhow::Result;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -27,6 +28,7 @@ use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 use cue_core::{EventChannel, ScopeHash};
 
 use crate::parser::ResolvedCommand;
+use crate::resource::ProviderRegistry;
 
 /// Default bounded channel capacity for actor mailboxes.
 pub(crate) const ACTOR_CHANNEL_CAP: usize = 256;
@@ -287,6 +289,11 @@ pub(crate) struct ActorSystem {
     scope_store: mpsc::Sender<ScopeStoreMsg>,
     event_bus: mpsc::Sender<EventBusMsg>,
     config: crate::config::Config,
+    /// Resource provider registry for `:run(need.X=Y)` admission gating.
+    /// Defaults to an empty registry; populated from `daemon.toml` when
+    /// providers are configured. Wrapped in `Arc` so cheap clone in the
+    /// scheduler's hot path stays cheap.
+    resources: Arc<ProviderRegistry>,
 }
 
 impl ActorSystem {
@@ -334,6 +341,8 @@ pub(crate) async fn spawn_all(
     let (ss_tx, ss_rx) = mpsc::channel::<ScopeStoreMsg>(ACTOR_CHANNEL_CAP);
     let (eb_tx, eb_rx) = mpsc::channel::<EventBusMsg>(ACTOR_CHANNEL_CAP);
 
+    let resources = Arc::new(crate::resource::registry_from_config(&config.resources)?);
+
     let sys = ActorSystem {
         gateway: gw_tx,
         scheduler: sched_tx,
@@ -341,6 +350,7 @@ pub(crate) async fn spawn_all(
         scope_store: ss_tx,
         event_bus: eb_tx,
         config,
+        resources,
     };
 
     // ScopeStore restores persisted state before the daemon is considered ready.
@@ -408,6 +418,7 @@ mod tests {
             scope_store,
             event_bus,
             config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
 
         sys.shutdown_with_reason("SIGTERM").await;

@@ -8,7 +8,15 @@ use toml::Value;
 use crate::dirs;
 
 const DAEMON_CONFIG_FILE: &str = "daemon.toml";
-const DAEMON_ROOT_SECTIONS: &[&str] = &["aliases", "block", "retention", "warn", "weft", "wrapper"];
+const DAEMON_ROOT_SECTIONS: &[&str] = &[
+    "aliases",
+    "block",
+    "resources",
+    "retention",
+    "warn",
+    "weft",
+    "wrapper",
+];
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -17,6 +25,8 @@ pub struct Config {
     pub warn: WarnConfig,
     #[serde(default)]
     pub aliases: AliasConfig,
+    #[serde(default)]
+    pub resources: ResourceConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
     #[serde(default)]
@@ -252,6 +262,172 @@ pub enum BlockDecision {
     Warn(String),
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceConfig {
+    #[serde(default)]
+    pub cli: BTreeMap<String, CliResourceProviderConfig>,
+    #[serde(default)]
+    pub nvidia: NvidiaResourceConfig,
+}
+
+impl ResourceConfig {
+    fn validate(&self, path: &Path) -> Result<()> {
+        for (id, provider) in &self.cli {
+            if id.trim() != id || id.is_empty() {
+                bail!(
+                    "resources.cli provider id `{id}` in {} must be non-empty and must not have leading or trailing whitespace",
+                    path.display()
+                );
+            }
+            provider.validate(path, id)?;
+        }
+        self.nvidia.validate(path)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NvidiaResourceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_nvidia_provider_id")]
+    pub provider_id: String,
+    #[serde(default = "default_nvidia_gpu_key")]
+    pub gpu_key: String,
+    #[serde(default = "default_nvidia_gpu_mem_key")]
+    pub gpu_mem_key: String,
+    #[serde(default)]
+    pub safety_margin_bytes: u64,
+    #[serde(default = "default_nvidia_probe_ttl_ms")]
+    pub probe_ttl_ms: u64,
+}
+
+impl Default for NvidiaResourceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider_id: default_nvidia_provider_id(),
+            gpu_key: default_nvidia_gpu_key(),
+            gpu_mem_key: default_nvidia_gpu_mem_key(),
+            safety_margin_bytes: 0,
+            probe_ttl_ms: default_nvidia_probe_ttl_ms(),
+        }
+    }
+}
+
+fn default_nvidia_provider_id() -> String {
+    "nvidia".into()
+}
+
+fn default_nvidia_gpu_key() -> String {
+    "gpu".into()
+}
+
+fn default_nvidia_gpu_mem_key() -> String {
+    "gpu_mem".into()
+}
+
+fn default_nvidia_probe_ttl_ms() -> u64 {
+    1_000
+}
+
+impl NvidiaResourceConfig {
+    fn validate(&self, path: &Path) -> Result<()> {
+        for (field, value) in [
+            ("provider_id", &self.provider_id),
+            ("gpu_key", &self.gpu_key),
+            ("gpu_mem_key", &self.gpu_mem_key),
+        ] {
+            if value.trim() != value || value.is_empty() {
+                bail!(
+                    "resources.nvidia.{field} in {} must be non-empty and must not have leading or trailing whitespace",
+                    path.display()
+                );
+            }
+        }
+        if self.gpu_key == self.gpu_mem_key {
+            bail!(
+                "resources.nvidia.gpu_key and gpu_mem_key in {} must be distinct",
+                path.display()
+            );
+        }
+        if self.probe_ttl_ms == 0 {
+            bail!(
+                "resources.nvidia.probe_ttl_ms in {} must be greater than zero",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliResourceProviderConfig {
+    pub keys: Vec<String>,
+    pub probe: Vec<String>,
+    pub reserve: Vec<String>,
+    pub release: Vec<String>,
+    #[serde(default = "default_resource_cli_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_resource_cli_timeout_ms() -> u64 {
+    5_000
+}
+
+impl CliResourceProviderConfig {
+    fn validate(&self, path: &Path, id: &str) -> Result<()> {
+        if self.keys.is_empty() {
+            bail!(
+                "resources.cli.{id}.keys in {} must contain at least one resource key",
+                path.display()
+            );
+        }
+        for key in &self.keys {
+            if key.trim() != key || key.is_empty() {
+                bail!(
+                    "resources.cli.{id}.keys in {} contains an empty or whitespace-padded key",
+                    path.display()
+                );
+            }
+        }
+        validate_resource_cli_command(path, id, "probe", &self.probe)?;
+        validate_resource_cli_command(path, id, "reserve", &self.reserve)?;
+        validate_resource_cli_command(path, id, "release", &self.release)?;
+        if self.timeout_ms == 0 {
+            bail!(
+                "resources.cli.{id}.timeout_ms in {} must be greater than zero",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_resource_cli_command(
+    path: &Path,
+    id: &str,
+    field: &str,
+    argv: &[String],
+) -> Result<()> {
+    let Some(program) = argv.first() else {
+        bail!(
+            "resources.cli.{id}.{field} in {} must be a non-empty argv array",
+            path.display()
+        );
+    };
+    if program.trim() != program || program.is_empty() {
+        bail!(
+            "resources.cli.{id}.{field}[0] in {} must be non-empty and must not have leading or trailing whitespace",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
@@ -306,7 +482,9 @@ impl Config {
     }
 
     fn validate(&self, path: &Path) -> Result<()> {
-        self.wrapper.validate(path)
+        self.wrapper.validate(path)?;
+        self.resources.validate(path)?;
+        Ok(())
     }
 
     /// Check whether `command_line` is blocked or should warn before running.
@@ -653,6 +831,97 @@ pip = "uv pip"
         assert_eq!(
             config.aliases.apply("pip install foo"),
             "uv pip install foo"
+        );
+    }
+
+    #[test]
+    fn resources_nvidia_provider_parsed_from_daemon_toml() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[resources.nvidia]
+enabled = true
+provider_id = "gpu"
+gpu_key = "cuda"
+gpu_mem_key = "cuda_mem"
+safety_margin_bytes = 1048576
+probe_ttl_ms = 250
+"#,
+        )))
+        .expect("load config");
+
+        assert!(config.resources.nvidia.enabled);
+        assert_eq!(config.resources.nvidia.provider_id, "gpu");
+        assert_eq!(config.resources.nvidia.gpu_key, "cuda");
+        assert_eq!(config.resources.nvidia.gpu_mem_key, "cuda_mem");
+        assert_eq!(config.resources.nvidia.safety_margin_bytes, 1_048_576);
+        assert_eq!(config.resources.nvidia.probe_ttl_ms, 250);
+    }
+
+    #[test]
+    fn resources_nvidia_keys_must_be_distinct() {
+        let error = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[resources.nvidia]
+gpu_key = "gpu"
+gpu_mem_key = "gpu"
+"#,
+        )))
+        .expect_err("duplicate keys should fail");
+
+        assert!(
+            error.to_string().contains(
+                "resources.nvidia.gpu_key and gpu_mem_key in daemon.toml must be distinct"
+            ),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn resources_cli_provider_parsed_from_daemon_toml() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[resources.cli.license]
+keys = ["license", "license_mem"]
+probe = ["license-helper", "probe"]
+reserve = ["license-helper", "reserve"]
+release = ["license-helper", "release"]
+timeout_ms = 250
+"#,
+        )))
+        .expect("load config");
+
+        let provider = config
+            .resources
+            .cli
+            .get("license")
+            .expect("license provider");
+        assert_eq!(provider.keys, vec!["license", "license_mem"]);
+        assert_eq!(provider.probe, vec!["license-helper", "probe"]);
+        assert_eq!(provider.timeout_ms, 250);
+    }
+
+    #[test]
+    fn resources_cli_provider_requires_non_empty_commands() {
+        let error = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[resources.cli.license]
+keys = ["license"]
+probe = []
+reserve = ["license-helper", "reserve"]
+release = ["license-helper", "release"]
+"#,
+        )))
+        .expect_err("empty probe argv should fail");
+
+        assert!(
+            error.to_string().contains(
+                "resources.cli.license.probe in daemon.toml must be a non-empty argv array"
+            ),
+            "{error:#}"
         );
     }
 

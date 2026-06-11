@@ -11,6 +11,7 @@ mod dirs;
 mod gateway_stdio;
 mod parser;
 mod pty;
+mod resource;
 mod ring_buffer;
 mod runtime_env;
 mod service;

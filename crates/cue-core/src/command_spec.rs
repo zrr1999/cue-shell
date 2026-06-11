@@ -282,6 +282,22 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         documented: true,
     },
     CommandSpec {
+        name: "providers",
+        category: CommandCategory::System,
+        arg_kind: CommandArgKind::Empty,
+        usage: ":providers",
+        detail: "List registered resource providers and their keys",
+        documented: true,
+    },
+    CommandSpec {
+        name: "resources",
+        category: CommandCategory::System,
+        arg_kind: CommandArgKind::Empty,
+        usage: ":resources",
+        detail: "Show resource provider capacity snapshots",
+        documented: true,
+    },
+    CommandSpec {
         name: "env",
         category: CommandCategory::Scope,
         arg_kind: CommandArgKind::OptionalText,
